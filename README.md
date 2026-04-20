@@ -1,0 +1,162 @@
+# busybee
+
+A queued runner for resource-heavy tasks, with a live CPU + queue TUI.
+
+![busybee monitor TUI — per-core CPU gauges with a single-line queue status at the bottom](docs/images/monitor.png)
+
+## Why
+
+Running several agentic dev sessions in parallel is great — until they all fire
+off a `cmake --build`, `cargo build`, or big test suite at the same time.
+Saturating every core simultaneously means every session gets slower, agents
+time out, and the fans scream. There's no coordination between them, and yet
+the work is trivially serializable: one build finishes, the next starts.
+
+busybee is a thin tool that enforces that coordination. You prefix the heavy
+command with `busybee --`, it gets added to a shared local queue, your shell
+blocks until the queue has a slot for you, and then the command runs with full
+stdout and exit-code passthrough — as if you'd just typed it directly. Other
+busybee invocations from other sessions see you're running and wait their
+turn.
+
+Under the hood it wraps [pueue](https://github.com/Nukesor/pueue) (a mature
+Rust task queue + daemon) via its `pueue-lib` crate, so all the queue
+semantics, persistence, and daemon lifecycle come for free. The novel piece is
+the integrated TUI: a live per-core CPU monitor next to the current busybee
+queue state, so you can see at a glance what's running, what's waiting, and
+how hot the box is.
+
+## Goals
+
+- **Zero-ceremony coordination.** `busybee -- <cmd>` is the whole API for the
+  common case. No daemon to configure, no queue to name — busybee auto-starts
+  pueued and manages its own group.
+- **Faithful passthrough.** Your command sees the same cwd and env (with
+  color-forcing vars injected so compile output stays colored). busybee's exit
+  code mirrors the task's exit code. Ctrl-C cancels cleanly.
+- **Observability.** `busybee monitor` is a single-screen TUI that gives you
+  "what's the machine doing right now" at a glance, so you can tell whether
+  you're waiting because the queue is long or because one task is chewing a
+  core.
+- **Opt-in.** Only commands you prefix with `busybee` go through the queue.
+  Ad-hoc shell commands are unaffected.
+
+## Usage
+
+```bash
+busybee -- cmake --build build --target MyProject
+busybee --name "backend tests" -- cargo test --workspace
+busybee --detach -- long-running-thing     # enqueue and return immediately
+busybee monitor                             # live TUI
+```
+
+Press `q` in the monitor to quit. Press `Ctrl-C` while blocked to cancel — the
+queued or running task is killed and busybee exits 130.
+
+## Roadmap
+
+- **Hardware-cost-aware scheduling.** Today busybee is strictly
+  one-at-a-time. The point of wrapping pueue was to leave room for a smarter
+  admission policy: declare each task's rough cost — CPU cores, RAM, maybe
+  GPU — and give busybee a budget for the box it's running on. The queue
+  then admits a task only when `running_cost + task_cost ≤ budget`, which
+  lets it pack a small `cargo check` alongside a big `cmake --build`, or
+  schedule two RAM-light things together without OOMing. Same principle
+  whether the bottleneck is cores, memory, or a single shared GPU. The goal
+  is to keep hardware saturated from user-supplied estimates instead of
+  idling behind one big task. Requires a small change to pueued's
+  dispatcher — contributed upstream first, forked only if upstream declines.
+
+## Install
+
+Both channels install two executables — `busybee` (the full name) and `bzb`
+(a short alias) — and both depend on [pueue](https://github.com/Nukesor/pueue)'s
+`pueued` binary being on your `PATH`. busybee auto-starts `pueued` on demand
+if it isn't already running, but it doesn't bundle it.
+
+### End users
+
+Homebrew (macOS arm64):
+
+```bash
+brew install githappens/tap/busybee
+brew install pueue               # prerequisite
+```
+
+crates.io (any Rust target):
+
+```bash
+cargo install bzb
+```
+
+Nix profile (pueue as a prerequisite):
+
+```bash
+nix profile add nixpkgs#pueue
+```
+
+### From source
+
+Build under `nix develop` and install into your nix profile:
+
+```bash
+./scripts/buildanddeploy.sh
+```
+
+Or build directly with cargo:
+
+```bash
+nix develop --command cargo install --path crates/bzb
+```
+
+## Use with agentic dev workflows
+
+busybee exists to fix a specific problem: multiple Claude Code / Cursor /
+Windsurf sessions running against different projects on the same machine,
+each happily firing off `cargo build` or `cmake --build` whenever it feels
+like it. Without coordination you get four parallel builds fighting for the
+same cores — everyone's slower, fans max out. You don't want the agents to
+stop building, you just want them to serialise.
+
+Teach every agent session in one place by dropping a `CLAUDE.md` (or
+`AGENTS.md`, `.cursorrules`, whatever your tool looks for) at the root of
+your work tree. Mine lives at `~/Work/CLAUDE.md` and looks roughly like
+this:
+
+    # Work-tree-wide conventions
+
+    ## Gate heavy commands through `busybee`
+
+    This machine runs multiple agentic dev sessions in parallel. Route
+    heavy commands (compilation, linking, large test suites) through
+    `busybee` — a FIFO-gated runner that lets one heavy task run at a
+    time across all sessions and blocks the rest with a friendly
+    "N ahead" message.
+
+    ### What counts as heavy
+    - `cmake --build …`, `ninja …`, `make -j …`
+    - `cargo build`, `cargo test`, `cargo check` on non-trivial crates
+    - `go build ./…`, `go test ./…` on large modules
+    - Any local Docker/image build
+    - Long test suites (`pytest`, `npm test`, slow `jest --runInBand`)
+
+    Trivial one-shots (`cargo check -p small-crate`, `cargo fmt`, `rg`,
+    `ls`, most git commands) do not need busybee.
+
+    ### Usage
+    Always use blocking mode so you wait your turn and see the command
+    finish:
+
+        busybee -- cmake --build build --target MyProject
+        busybee --name "backend tests" -- cargo test --workspace
+
+    `busybee -- <cmd>` blocks until your turn, then runs in the current
+    directory, streams stdout, and exits with the same exit code. Ctrl-C
+    while blocked cancels (exit 130).
+
+The details of *what* counts as heavy on your machine are yours to set —
+busybee just provides the gate.
+
+## License
+
+MIT OR Apache-2.0.

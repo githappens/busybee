@@ -1,0 +1,42 @@
+[package]
+name = "bzb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Queued runner for resource-heavy local tasks with a live CPU + queue TUI monitor. Wraps pueue to serialise cargo/cmake/docker builds across parallel dev sessions."
+repository = "https://github.com/githappens/busybee"
+homepage = "https://github.com/githappens/busybee"
+keywords = ["queue", "build", "scheduler", "pueue", "tui"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
+readme = "../../README.md"
+build = "build.rs"
+
+[[bin]]
+name = "busybee"
+path = "src/main.rs"
+
+[[bin]]
+name = "bzb"
+path = "src/bin/bzb.rs"
+
+[dependencies]
+bzb-core = { path = "../bzb-core", version = "0.1.0" }
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+pueue-lib.workspace = true
+futures.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mach2 = "0.4"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
+which = "6"
+libc = "0.2"
+serial_test = "3"
