@@ -1,10 +1,9 @@
 ---
 # Sortie workflow for githappens/busybee.
 #
-# Run from the repository root, inside the dev shell so the agent inherits
-# cargo/pueued/make/ninja on PATH:
-#
-#   nix develop -c env GITHUB_TOKEN="$(gh auth token)" sortie sortie/WORKFLOW.md
+# Launch with sortie/run.sh (pins this instance's port, reuses gh's token,
+# checks the ssh alias, runs inside the dev shell so the agent inherits
+# cargo/pueued/make/ninja on PATH). `sortie/run.sh --dry-run` polls once.
 #
 # Issues are selected by the `sortie` marker label and moved through
 # sortie:ready -> sortie:working -> sortie:review -> sortie:done by sortie
