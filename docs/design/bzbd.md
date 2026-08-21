@@ -1,0 +1,185 @@
+# bzbd: shared CPU token pool and cost-aware admission
+
+Design specification for busybee's next iteration. Tracking issue: githappens/busybee#2
+(parent of the task issues; milestone "bzbd: shared CPU token pool").
+
+**This document is the specification.** Task issues describe scope and acceptance
+criteria; semantics come from here. A pull request that changes behaviour described
+in this document updates the relevant section in the same PR. Amendments that change
+a decision are also announced as a comment on #2 so the decisions log stays findable.
+
+## Problem
+
+busybee today is strictly one-task-at-a-time (`pueue` group `busybee`, `parallel_tasks = 1`). That stops four parallel agent sessions from running four `cmake --build`s at once, but it also leaves the machine idle whenever the one running task cannot use every core, and it serialises things that could safely share. The README roadmap proposed cost-aware admission inside pueue; upstream has explicitly declined that scope (Nukesor/pueue#325: "perfectly suited for a big brother of Pueue"). busybee is that big brother.
+
+Goal: **one task alone gets the whole machine; N tasks share it; nothing is ever over-subscribed** — with zero ceremony for callers (`busybee -- <cmd>` stays the whole API) and no silent degradation.
+
+## Key insight: the jobserver already solves dynamic sharing
+
+GNU make's jobserver protocol (fifo style, make ≥ 4.4) is a pool of tokens in a named pipe. A participating build reads one token before starting each compile job and writes it back when the job exits. Clients on a typical native toolchain today:
+
+| tool | jobserver client? | how it joins |
+|---|---|---|
+| GNU make ≥ 4.4 | yes | `MAKEFLAGS=--jobserver-auth=fifo:PATH` |
+| ninja ≥ 1.13 | yes | same env var; **only when no explicit `-j`** on its command line |
+| `cmake --build` (Make/Ninja generators) | yes, via the generator | same; must not set `CMAKE_BUILD_PARALLEL_LEVEL` |
+| cargo + rustc | yes (`jobserver` crate parses `fifo:PATH`) | `MAKEFLAGS` / `CARGO_MAKEFLAGS` |
+| clang / gcc / ld | transparent | driven by the above |
+| xcodebuild | **no** | `-jobs N` argv only; no env knob |
+| go toolchain | no | `GOMAXPROCS=N` (bounds `-p`) |
+| ctest | no | `CTEST_PARALLEL_LEVEL=N` |
+| pytest (+xdist) | no | `PYTEST_ADDOPTS=-n N` |
+
+So: one machine-wide fifo with `pool_size` tokens (default = logical cores). Every jobserver-aware build busybee runs gets `MAKEFLAGS` pointing at it and self-balances at compile-job granularity. Alone it drains all tokens; when a second build starts the two interleave token by token; when one finishes the other grows back within one compile unit's time. No daemon decision is involved in that rebalancing.
+
+Tools that cannot speak jobserver get **static** treatment: busybee pulls `n` tokens out of the same fifo on the task's behalf, holds them for the task's lifetime, and tells the tool `n` (env or argv). One pool, one accounting. Static tasks are locked at `n` until they exit (their tools read the number once); jobserver tasks grow and shrink. That asymmetry is the documented reason to prefer jobserver-aware tools.
+
+## Components
+
+```
+busybee (client)  ──unix socket──▶  bzbd (broker)  ──pueue-lib──▶  pueued (supervisor, logs)
+                                      │ owns: fifo token pool, queue, leases, admission
+                                      │ submits admitted tasks with start_immediately
+                                      └ group `busybee` now parallel_tasks = 0
+```
+
+**bzbd** (new crate `crates/bzbd`) is the only thing clients talk to and the only thing that talks to pueued. Auto-started by the client on demand, exactly as pueued is today (`bzb-core/src/client.rs::connect_or_spawn`). State dir: `$XDG_STATE_HOME/busybee/` (default `~/.local/state/busybee/`): `bzbd.sock`, `jobserver-<pid>` fifo, `leases.json`.
+
+**pueued** keeps what it is good at: spawning, process groups, log capture, persistence. Its dispatcher is bypassed (`parallel_tasks = 0` + `start_immediately`).
+
+**busybee / bzb** (client) keeps its contract: blocks, streams the task's combined output, mirrors the exit code, Ctrl-C cancels with exit 130. `--detach` returns immediately.
+
+## Lease model
+
+Every `busybee -- cmd` is a lease request:
+
+```
+LeaseRequest { argv: Vec<String>, cwd, env, label: Option<String>,
+               class_override: Option<Class>, cores_wanted: Option<u32> }
+```
+
+Lifecycle: `Queued` → `Admitted { pueue_task_id, class, cores }` → `Finished { exit_code }`. A lease ends when pueued reports the task `Done`, or when the requesting client's connection drops (before admission: dropped from the queue; after: task killed, tokens returned). The client holds its socket open for the lease's whole life; connection = lease.
+
+## Admission policy (pure state machine, no IO)
+
+Queue is FIFO. A lease at the head is admitted when:
+
+1. `admitted_count < max_concurrent` (default 4). Needed because make/ninja/cargo each run one job *without* a token (the implicit token), so unbounded admission would add one uncounted job per task.
+2. Class-specific:
+   - **jobserver**: admitted as soon as (1) holds; takes no tokens up front.
+   - **static**: target `n = clamp(cores_wanted, 1, ceil(pool_size / (admitted_count + 1)))` — fair share at the moment of admission. bzbd blocking-reads up to `n` tokens from the fifo within `drain_deadline_ms` (default 2000), then starts the task with whatever it collected (minimum 1, the implicit token). Because jobserver clients return tokens after every job, the drain normally completes in well under a second and throttles the running jobserver builds to `pool − n`.
+   - **none**: static with `cores_wanted = pool_size`. This is today's exclusive behaviour and the default for anything unrecognised.
+
+Head-of-line blocking is intentional: a `none` lease waits for the pool to be fully free, and everything behind it waits too. Priorities, preemption and reordering are out of scope.
+
+## Classification (`classify(argv) -> Plan`)
+
+Operates on the argv the client received (the shell has already handled `|`, `&&`, redirects outside busybee). Steps:
+
+1. **Unwrap wrappers** until the first non-wrapper token: `nix develop [args] -c|--command`, `nix shell [args] -c`, `env [VAR=val...]`, `caffeinate [-flags]`, `nice [-n N]`. A shell string (`sh -c '...'`, `bash -lc '...'`) is opaque: class **none**.
+2. Look up the basename of the tool:
+
+| tool | class | injection | notes |
+|---|---|---|---|
+| `make`, `gmake` | jobserver | `MAKEFLAGS` | notice if argv has `-j` |
+| `ninja` | jobserver | `MAKEFLAGS` | notice if argv has `-j` (ninja then ignores the pool) |
+| `cmake` with `--build` | jobserver | `MAKEFLAGS`; remove `CMAKE_BUILD_PARALLEL_LEVEL` | notice if `--parallel`/`-j` |
+| `cargo` | jobserver | `MAKEFLAGS`, `CARGO_MAKEFLAGS`; plus `RUST_TEST_THREADS=<fair share>` | test threads are not token-accounted |
+| `xcodebuild` | static | argv `-jobs max(1, n−1)` | measured: `-jobs N` yields N+1 concurrent `clang -cc1` in steady state on a large legacy project; skip if argv already has `-jobs` |
+| `go` | static | `GOMAXPROCS=n` | |
+| `ctest` | static | `CTEST_PARALLEL_LEVEL=n` | |
+| `pytest` | static | `PYTEST_ADDOPTS` += `-n n` | effective only with xdist; harmless otherwise |
+| `docker` with `build` | none | — | the VM has its own CPU cap |
+| everything else | none | — | |
+
+3. Overrides: `--class jobserver|static|none`, `--cores N` (static target; ignored with a notice for jobserver class). A user-supplied parallelism flag always wins over injection and produces a one-line notice.
+4. Every task additionally gets `BUSYBEE_CLASS=<class>` and `BUSYBEE_CORES=<n or pool_size>` in its env so opaque scripts can cooperate (`xcodebuild ... -jobs "${BUSYBEE_CORES:-8}"`). This is the only remedy for argv-only tools hidden inside scripts.
+
+The `Plan` is data: `{ class, env_set: Vec<(String,String)>, env_unset: Vec<String>, argv: Vec<String>, notices: Vec<String> }`. Executing it is a separate concern.
+
+## Client output contract
+
+Lines the client prints to **stderr** (stdout is reserved for the task's output), so agents can read what they got:
+
+```
+busybee: queued (2 ahead)
+busybee: running — cmake, jobserver, sharing 18-token pool with 1 other task
+busybee: running — xcodebuild, static, holding 9/18 cores (2 other tasks active)
+busybee: note: you passed -j8; ninja will ignore the shared pool
+busybee: command exited 0 (elapsed 2m14s)
+```
+
+Exit-code mapping is unchanged (`bzb-core/src/exit_code.rs`).
+
+## Failure and recovery
+
+No silent fallbacks anywhere: if bzbd cannot create its fifo or socket it refuses to start and the client exits non-zero with the reason, rather than running the command ungoverned.
+
+| event | behaviour |
+|---|---|
+| client disconnects while queued | lease dropped |
+| client disconnects while running | pueue task killed (SIGINT → SIGKILL escalation as today), tokens returned |
+| task exits | observed by polling pueue status (1 s); tokens returned; client gets exit code |
+| pueued dies | running leases marked lost; clients exit non-zero with a clear message; bzbd keeps serving and re-spawns pueued on next submit |
+| bzbd dies | running tasks continue (pueued's children; they hold the old fifo open). On restart bzbd creates a new pid-suffixed fifo, reloads `leases.json`, cross-checks against pueue status, and seeds `pool_size − Σ(static tokens still held by live tasks)` tokens. Orphaned jobserver tasks finish on the old pipe. |
+| fifo accounting drift | bzbd periodically checks `FIONREAD + Σ held ≤ pool_size`; excess tokens (a tool wrote extra bytes) are drained; a deficit is logged and corrected when the holding lease ends |
+
+## Configuration
+
+`~/.config/busybee/config.toml`, every key optional:
+
+```toml
+pool_size = 18            # default: logical cores
+max_concurrent = 4
+drain_deadline_ms = 2000
+[defaults]                # per-class cores_wanted
+static = "fair"           # or an integer
+
+[overrides]               # extend/replace classification rows without a release
+"./build.sh" = { class = "jobserver" }
+"my-bench"   = { class = "none" }
+```
+
+## Observability
+
+`busybee status [--json]`: free tokens, held tokens, each lease (id, label, class, cores, state, elapsed, ahead-count). The monitor TUI reads the same data: pool gauge plus one row per lease. Jobserver tasks show an *estimated* "using ~N" (`pool − FIONREAD − Σ held`, attributed by counting compiler processes in each task's process group), labelled approximate and never used for scheduling.
+
+## Module layout (so issues can be worked in parallel without collisions)
+
+```
+crates/bzb-core/src/classify.rs    tool table, wrapper unwrap, Plan        (#3)
+crates/bzb-core/src/scheduler.rs   admission state machine                 (#4)
+crates/bzb-core/src/jobserver.rs   fifo create/seed/acquire/release/FIONREAD (#5)
+crates/bzb-core/src/protocol.rs    client<->bzbd messages (serde, JSON lines) (#6)
+crates/bzb-core/src/config.rs      config file + overrides                 (#11)
+crates/bzbd/                       daemon binary: server, leases, submit, inject, recovery
+crates/bzb/src/enqueue.rs          client on the bzbd protocol             (#9)
+crates/bzb/src/status.rs           `busybee status`                        (#10)
+crates/bzb/src/monitor/            TUI on bzbd data                        (#19)
+```
+
+## Testing strategy
+
+| unit | style |
+|---|---|
+| classify | table-driven; synthetic fixture of invocation shapes (wrappers, opaque shell strings, explicit `-j`, scripts, `$VAR`-expanded binaries) |
+| scheduler | pure state machine tests, no IO (same style as `bzb-core/src/wait.rs`) |
+| jobserver | integration tests running real GNU make 4.4 from the dev shell on a Makefile of `sleep` targets; assert peak concurrency ≤ pool via a counter file; two makes sharing one fifo; FIONREAD accounting |
+| bzbd + pueue | isolated `pueued` + `bzbd` in a temp dir, extending `crates/bzb/tests/common/pueued.rs` |
+| client | `crates/bzb/tests/smoke.rs` extended: exit codes, Ctrl-C, detach, preamble lines |
+| recovery | kill bzbd mid-task; kill client mid-task; kill pueued |
+
+Dev shell gains `gnumake` and `ninja`. CI (#14) runs the full suite on macOS and Linux.
+
+## Decisions log
+
+- **Keep pueue, add a broker** rather than replacing pueue: the broker is the novel part; pueue's supervision/logging stays useful; busybee keeps working during the transition. Replacing pueue later is a contained follow-up (give bzbd spawn duties).
+- **Opt-in join** (only `busybee --`-wrapped commands see the fifo) rather than exporting `MAKEFLAGS` globally: no always-on daemon, nothing breaks when bzbd is down. Ambient mode is parked (#15).
+- **Unknown → none**: every unrecognised command seen in practice was a benchmark, render, or opaque script — all of which want exclusivity. The override table and `--class` are the escape hatches.
+- **CPU only** for this iteration. RAM admission (#16) reuses the lease/admission machinery later.
+- **Static tasks are locked in**: accepted; the alternatives (restarting xcodebuild with a bigger `-jobs`) are parked (#18).
+
+## Task issues
+
+Groundwork: #13, #14. Core: #3, #4, #5. Daemon: #6, #7, #8, #9, #10, #11, #12. Monitor: #19. Verification: #21. Docs: #20. Parked: #15, #16, #17, #18.
+
