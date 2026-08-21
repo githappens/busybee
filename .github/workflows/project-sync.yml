@@ -1,0 +1,57 @@
+# Mirror sortie's label-driven issue states onto the project board's Status
+# column. Sortie (the agent orchestrator) moves issues through
+# sortie:ready -> sortie:working -> sortie:review -> sortie:done by label;
+# GitHub Projects can only show columns from a single-select field, so this
+# workflow keeps the two in step.
+#
+# Requires a repository secret PROJECT_TOKEN: a fine-grained PAT with
+# "Projects: read and write" on the project owner (the default GITHUB_TOKEN
+# cannot access user-owned Projects v2).
+name: project-sync
+
+on:
+  issues:
+    types: [opened, labeled, unlabeled, closed, reopened]
+
+permissions:
+  issues: read
+
+env:
+  PROJECT_OWNER: githappens
+  PROJECT_NUMBER: 2
+  MARKER_LABEL: sortie
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    if: contains(github.event.issue.labels.*.name, 'sortie')
+    steps:
+      - name: Map labels to Status and update the board
+        env:
+          GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          ISSUE_URL: ${{ github.event.issue.html_url }}
+          LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
+          STATE: ${{ github.event.issue.state }}
+        run: |
+          set -euo pipefail
+          has() { case ",$LABELS," in *",$1,"*) return 0;; *) return 1;; esac; }
+          if   has needs-human;     then status=Blocked
+          elif has sortie:done;     then status=Done
+          elif [ "$STATE" = closed ]; then status=Done
+          elif has sortie:review;   then status=Review
+          elif has sortie:working;  then status=Working
+          elif has sortie:ready;    then status=Ready
+          else echo "no sortie state label; leaving Status unchanged"; exit 0
+          fi
+          echo "target status: $status"
+
+          project_id=$(gh project view "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --format json --jq .id)
+          fields=$(gh project field-list "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --format json)
+          field_id=$(echo "$fields" | jq -r '.fields[] | select(.name=="Status") | .id')
+          option_id=$(echo "$fields" | jq -r --arg s "$status" '.fields[] | select(.name=="Status") | .options[] | select(.name==$s) | .id')
+          if [ -z "$option_id" ]; then echo "Status option '$status' not found on the project" >&2; exit 1; fi
+
+          # item-add is idempotent: it returns the existing item if already present.
+          item_id=$(gh project item-add "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --url "$ISSUE_URL" --format json --jq .id)
+          gh project item-edit --project-id "$project_id" --id "$item_id" --field-id "$field_id" --single-select-option-id "$option_id"
+          echo "$ISSUE_URL -> $status"
