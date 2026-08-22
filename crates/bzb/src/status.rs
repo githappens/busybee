@@ -167,8 +167,8 @@ fn printable(text: &str) -> String {
     out
 }
 
-/// What the lease is doing with the pool: waiting for it, sharing it, or
-/// holding a slice of it.
+/// What the lease is doing with the pool: waiting for it, sharing it, holding
+/// a slice of it, or owning the whole machine.
 fn cores(lease: &LeaseView) -> String {
     match lease.ahead {
         Some(ahead) => format!("{ahead} ahead"),
@@ -176,6 +176,12 @@ fn cores(lease: &LeaseView) -> String {
         // and go, so its count is an estimate the daemon made and is marked as
         // one. A static task holds exactly what it drained.
         None if lease.class == "jobserver" => format!("using ~{}", lease.cores),
+        // A `none` lease is admitted only when nothing else is
+        // (`docs/design/bzbd.md` §Admission policy), so what it holds is the
+        // machine, not a token count. Today it drains nothing, and printing
+        // the resulting "holding 0" beside a pool line counting every token
+        // free would read as a task using none of it.
+        None if lease.class == "none" => "exclusive".to_string(),
         None => format!("holding {}", lease.cores),
     }
 }
@@ -243,6 +249,23 @@ mod tests {
             rendered.contains(r"xcode\nbuild\u{1b}[2K"),
             "rendered {rendered:?}"
         );
+    }
+
+    /// An exclusive lease owns the machine whether or not it drained a token,
+    /// and today it drains none: reporting it as "holding 0" beside a pool line
+    /// that counts every token free reads as a task using nothing.
+    #[test]
+    fn an_exclusive_lease_is_reported_as_exclusive_not_as_holding_zero() {
+        let mut reply = reply();
+        reply.free = 18;
+        reply.held = 0;
+        reply.leases[0].class = "none".into();
+        reply.leases[0].cores = 0;
+
+        let rendered = render(&reply);
+
+        assert!(rendered.contains("exclusive"), "rendered {rendered:?}");
+        assert!(!rendered.contains("holding"), "rendered {rendered:?}");
     }
 
     /// The pool and the fifo are sampled separately, so the three numbers can

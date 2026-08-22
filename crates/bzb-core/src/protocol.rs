@@ -153,8 +153,11 @@ pub struct LeaseView {
     pub id: u64,
     pub label: String,
     /// Basename of the tool [`crate::classify`] recognised, which is what
-    /// decided the class. Separate from `label`, which is the caller's
-    /// `--name` when there is one.
+    /// decides the class once the injection work lands. Until it does,
+    /// admission gives every lease `none` (see `docs/design/bzbd.md`
+    /// §Observability), so this field reports what was recognised and `class`
+    /// does not follow from it yet. Separate from `label`, which is the
+    /// caller's `--name` when there is one.
     pub tool: String,
     pub class: String,
     pub cores: u32,
