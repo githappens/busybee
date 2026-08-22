@@ -29,18 +29,25 @@ const WIDTHS: [Constraint; 7] = [
     Constraint::Min(0),
 ];
 
-/// `WIDTHS` with the id column widened to the ids actually on screen. bzbd's
-/// counter climbs for as long as the daemon lives, and a clipped id is one the
-/// operator would pass to `busybee cancel` wrong.
-fn widths(leases: &[LeaseView]) -> [Constraint; 7] {
+/// `WIDTHS` with the two columns that hold an unbounded number widened to what
+/// is actually on screen: bzbd's lease counter climbs for as long as the daemon
+/// lives, and a lease runs for as long as its command does. A clipped id is one
+/// the operator would pass to `busybee cancel` wrong, and a clipped duration is
+/// a different duration rather than a shorter one.
+fn widths(leases: &[&LeaseView]) -> [Constraint; 7] {
     let mut widths = WIDTHS;
+    widths[0] = fit(leases, 5, id);
+    widths[2] = fit(leases, 7, |lease| elapsed(lease.elapsed_ms));
+    widths
+}
+
+fn fit(leases: &[&LeaseView], least: u16, cell: impl Fn(&LeaseView) -> String) -> Constraint {
     let widest = leases
         .iter()
-        .map(|lease| id(lease).len() as u16)
+        .map(|lease| cell(lease).chars().count() as u16)
         .max()
         .unwrap_or(0);
-    widths[0] = Constraint::Length(widest.max(5));
-    widths
+    Constraint::Length(widest.max(least))
 }
 
 fn id(lease: &LeaseView) -> String {
@@ -49,12 +56,41 @@ fn id(lease: &LeaseView) -> String {
 
 impl Widget for LeaseTable<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        if area.height == 0 {
+            return;
+        }
         let (running, queued): (Vec<_>, Vec<_>) = self
             .leases
             .iter()
             .partition(|lease| lease.state == "running");
-        let rows: Vec<Row> = running.into_iter().chain(queued).map(row).collect();
-        Table::new(rows, widths(self.leases)).render(area, buf);
+        let ordered: Vec<&LeaseView> = running.into_iter().chain(queued).collect();
+
+        // The queue is not bounded by the pool size, so it can hold more leases
+        // than the panel has rows. The table would drop the ones past the last
+        // row without a word; the last row instead says how many it stands for.
+        let overflows = ordered.len() > area.height as usize;
+        let shown = if overflows {
+            area.height as usize - 1
+        } else {
+            ordered.len()
+        };
+        let rows: Vec<Row> = ordered[..shown].iter().copied().map(row).collect();
+        Table::new(rows, widths(&ordered[..shown])).render(
+            Rect {
+                height: shown as u16,
+                ..area
+            },
+            buf,
+        );
+        if overflows {
+            buf.set_stringn(
+                area.x,
+                area.y + area.height - 1,
+                format!("… {} more", ordered.len() - shown),
+                area.width as usize,
+                Style::default().fg(Color::DarkGray),
+            );
+        }
     }
 }
 
@@ -189,6 +225,43 @@ mod tests {
         let lines = draw(&leases, 90, 1);
         assert!(lines[0].starts_with("#10000"), "row was {:?}", lines[0]);
         assert!(lines[0].contains("xcodebuild") || lines[0].contains("cargo"));
+    }
+
+    /// A lease can run for hours, and the elapsed time is the column the
+    /// observability contract names: `1000m00s` clipped to `1000m0` is a
+    /// different duration, not a shorter one.
+    #[test]
+    fn an_elapsed_time_wider_than_the_column_widens_it() {
+        let mut leases = vec![lease(1, "running", "static")];
+        leases[0].elapsed_ms = 60_000_000;
+
+        let lines = draw(&leases, 90, 1);
+
+        assert!(lines[0].contains("1000m00s"), "row was {:?}", lines[0]);
+    }
+
+    /// The queue is not bounded by the pool, so it can be longer than the panel
+    /// is tall. Rows that do not fit are dropped by the table itself; saying how
+    /// many keeps the count on screen honest.
+    #[test]
+    fn leases_that_do_not_fit_are_counted_in_a_final_row() {
+        let leases: Vec<LeaseView> = (1..=20).map(|id| lease(id, "queued", "static")).collect();
+
+        let lines = draw(&leases, 90, 4);
+
+        assert!(lines[0].contains("#1 "), "rows were {lines:?}");
+        assert!(lines[2].contains("#3 "), "rows were {lines:?}");
+        assert!(lines[3].contains("17 more"), "rows were {lines:?}");
+    }
+
+    /// Every lease fits, so there is nothing to say.
+    #[test]
+    fn leases_that_all_fit_get_no_overflow_row() {
+        let lines = draw(&three(), 90, 5);
+        assert!(
+            !lines.iter().any(|line| line.contains("more")),
+            "rows were {lines:?}"
+        );
     }
 
     #[test]

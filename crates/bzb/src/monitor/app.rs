@@ -241,11 +241,19 @@ fn draw<B: ratatui::backend::Backend>(
             PoolView::Pending | PoolView::Absent | PoolView::Unreachable(_) => &[],
         };
         // The pool panel is the bar, its legend and the two borders; the lease
-        // table takes a row per lease and the CPU gauges keep the rest.
+        // table takes a row per lease and the CPU gauges keep the rest. The
+        // queue bzbd reports is not bounded by the pool size, so the table is
+        // capped at what is left once the gauges have their own two borders and
+        // one row of full-size cells: a long queue must not push the other half
+        // of the monitor off the screen. `LeaseTable` counts what it drops.
+        const CPU_MIN: u16 = 8;
+        const POOL: u16 = 4;
+        let leases_height =
+            (leases.len() as u16 + 2).min(frame.size().height.saturating_sub(CPU_MIN + POOL));
         let chunks = Layout::vertical([
             Constraint::Min(0),
-            Constraint::Length(4),
-            Constraint::Length(leases.len() as u16 + 2),
+            Constraint::Length(POOL),
+            Constraint::Length(leases_height),
         ])
         .split(frame.size());
 
@@ -280,6 +288,7 @@ mod screenshot;
 mod tests {
     use super::*;
     use crate::monitor::widgets::tests::render;
+    use bzb_core::protocol::LeaseView;
     use ratatui::widgets::Widget;
 
     fn reply() -> StatusReply {
@@ -403,6 +412,53 @@ mod tests {
         let pool = Pool::default();
 
         assert!(matches!(pool.view(Instant::now()), PoolView::Pending));
+    }
+
+    /// The queue bzbd reports is not bounded by the pool size, so a busy
+    /// machine can hold more leases than the terminal has rows. The CPU gauges
+    /// are the other half of what the monitor is for; a long queue must not
+    /// push them off the screen.
+    #[test]
+    fn a_queue_longer_than_the_terminal_leaves_the_cpu_gauges_on_screen() {
+        let leases: Vec<LeaseView> = (1..=20)
+            .map(|id| LeaseView {
+                id,
+                label: format!("lease {id}"),
+                tool: "cargo".into(),
+                class: "static".into(),
+                cores: 1,
+                state: "queued".into(),
+                elapsed_ms: 1_000,
+                ahead: Some(id as usize),
+                pueue_task_id: None,
+            })
+            .collect();
+        let reply = StatusReply { leases, ..reply() };
+
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(102, 23)).expect("test terminal");
+        draw(
+            &mut terminal,
+            &[42; 8],
+            &PoolView::Known {
+                reply: &reply,
+                stale: None,
+            },
+        )
+        .expect("draw");
+
+        let buffer = terminal.backend().buffer().clone();
+        let screen: Vec<String> = (0..23)
+            .map(|y| (0..102).map(|x| buffer.get(x, y).symbol()).collect())
+            .collect();
+        assert!(
+            screen.iter().any(|line| line.contains("42")),
+            "no CPU gauge was drawn: {screen:?}"
+        );
+        assert!(
+            screen.iter().any(|line| line.contains("more")),
+            "no overflow row was drawn: {screen:?}"
+        );
     }
 
     /// With no reply to fall back on there is nothing to mark stale, and a
