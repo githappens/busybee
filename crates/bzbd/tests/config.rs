@@ -130,6 +130,28 @@ fn a_malformed_file_stops_the_daemon_from_starting() {
     assert!(stderr.contains("pool_size"), "stderr was {stderr:?}");
 }
 
+/// The refusal is the would-be daemon's, not every invocation's. A second
+/// `bzbd` launched while one is already serving starts nothing, so a file that
+/// has gone bad since the first one read it is none of its business: it reports
+/// the running daemon and exits zero, and that daemon stays on the
+/// configuration it started with.
+#[tokio::test]
+async fn a_malformed_file_leaves_the_already_running_path_alone() {
+    let daemon = Fixture::start_on("pool_size = 4\n");
+    daemon.write_config("pool_size = 0\n");
+
+    let second = daemon.run_second_instance();
+
+    assert!(
+        second.status.success(),
+        "second instance exited {}",
+        second.status
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(stderr.contains("already running"), "stderr was {stderr:?}");
+    assert_eq!(status(&daemon).await.pool_size, 4);
+}
+
 /// Waits up to 3 s for `needle` to show up in the daemon's log.
 fn wait_for_log(daemon: &Fixture, needle: &str) {
     let deadline = Instant::now() + Duration::from_secs(3);

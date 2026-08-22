@@ -53,10 +53,6 @@ pub fn run() -> Result<()> {
     // socket, and none of them wants an execute bit.
     restrict_umask(FILE_UMASK);
     let log = log_path()?;
-    // Before the fork, so a file the user cannot have meant reaches their
-    // terminal rather than only `bzbd.log`. Running the machine's builds under
-    // a configuration nobody wrote is worse than not running them.
-    let config = Config::load()?;
 
     // Fork before the runtime exists: a forked child inherits no threads.
     // Under `--foreground` there is no parent waiting for a report.
@@ -71,7 +67,7 @@ pub fn run() -> Result<()> {
         daemonize(&log)?
     };
 
-    let result = start(&mut ready, &log, config);
+    let result = start(&mut ready, &log);
     if let Err(err) = &result {
         // Our stderr is the log file by now; the parent is the only route back
         // to the terminal the user is looking at.
@@ -122,14 +118,8 @@ fn create_state_dir(dir: &Path) -> Result<()> {
 
 /// Everything that happens after the fork, so a failure has one place to be
 /// reported from.
-fn start(ready: &mut Ready, log: &Path, config: Config) -> Result<()> {
+fn start(ready: &mut Ready, log: &Path) -> Result<()> {
     init_logging(log)?;
-    tracing::info!(
-        pool_size = config.pool_size,
-        max_concurrent = config.max_concurrent,
-        drain_deadline_ms = config.drain_deadline_ms,
-        "config loaded"
-    );
 
     let pid_file = pid_path()?;
     let Some(locked) = lock_pid_file(&pid_file)? else {
@@ -139,6 +129,22 @@ fn start(ready: &mut Ready, log: &Path, config: Config) -> Result<()> {
         tracing::info!(pid_file = %pid_file.display(), "another bzbd holds the lock; exiting");
         return Ok(());
     };
+
+    // Only now, holding the lock: this process is the one that will serve, so
+    // the file it refuses to run on is its own. A second bzbd that found the
+    // daemon already up starts nothing and has nothing to refuse, and a config
+    // that went bad after the running daemon read it must not turn that
+    // invocation into a failure. Running the machine's builds under a
+    // configuration nobody wrote is worse than not running them, so a file this
+    // process cannot read stops it here; the reason travels back up the startup
+    // pipe to the caller's terminal rather than sitting in `bzbd.log`.
+    let config = Config::load()?;
+    tracing::info!(
+        pool_size = config.pool_size,
+        max_concurrent = config.max_concurrent,
+        drain_deadline_ms = config.drain_deadline_ms,
+        "config loaded"
+    );
 
     let runtime = tokio::runtime::Runtime::new().context("cannot start the tokio runtime")?;
     let served = runtime.block_on(serve(
