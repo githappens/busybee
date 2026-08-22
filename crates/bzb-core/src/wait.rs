@@ -12,7 +12,9 @@ pub enum WaitEvent {
     /// The task entered `Running`. Caller should start streaming the log.
     Started,
     /// The task reached `Done`. Caller should exit with the mapped code.
-    Finished { result_label: String },
+    Finished {
+        result_label: String,
+    },
 }
 
 pub struct WaitState {
@@ -58,7 +60,11 @@ impl WaitState {
 
         // First tick: announce the queue position.
         if self.last_state.is_none() && state_label == "Queued" {
-            let ahead = count_ahead(tasks.iter().copied(), self.my_id, crate::group::BUSYBEE_GROUP);
+            let ahead = count_ahead(
+                tasks.iter().copied(),
+                self.my_id,
+                crate::group::BUSYBEE_GROUP,
+            );
             self.last_ahead = Some(ahead);
             events.push(WaitEvent::Line(format!(
                 "Task queued: {}. {} ahead.",
@@ -68,7 +74,11 @@ impl WaitState {
 
         // Ahead-count change while still queued.
         if state_label == "Queued" {
-            let ahead = count_ahead(tasks.iter().copied(), self.my_id, crate::group::BUSYBEE_GROUP);
+            let ahead = count_ahead(
+                tasks.iter().copied(),
+                self.my_id,
+                crate::group::BUSYBEE_GROUP,
+            );
             if Some(ahead) != self.last_ahead {
                 let mut s = String::new();
                 let _ = write!(s, "{ahead} ahead…");
@@ -91,19 +101,27 @@ impl WaitState {
                 events.push(WaitEvent::Line("Queue paused, waiting…".into()));
             }
             if state_label == "Done" {
-                let label = if let Some(Task { status: TaskStatus::Done { result, .. }, .. }) = me {
+                let label = if let Some(Task {
+                    status: TaskStatus::Done { result, .. },
+                    ..
+                }) = me
+                {
                     format!("{result:?}")
                 } else {
                     "done".into()
                 };
-                events.push(WaitEvent::Finished { result_label: label });
+                events.push(WaitEvent::Finished {
+                    result_label: label,
+                });
             }
             // Task disappeared from pueue state (e.g., `pueue clean` or `pueue remove`).
             // Only fire this once we have previously observed the task; a missing task
             // on the very first tick means pueued hasn't seen our Add yet.
             if state_label == "Unknown" && self.last_state.is_some() {
                 events.push(WaitEvent::Line("Task disappeared from queue.".into()));
-                events.push(WaitEvent::Finished { result_label: "lost".into() });
+                events.push(WaitEvent::Finished {
+                    result_label: "lost".into(),
+                });
             }
             self.last_state = Some(state_label);
         }
@@ -154,7 +172,10 @@ mod tests {
             mk(2, TaskStatus::Queued { enqueued_at: now }, "busybee"),
         ];
         let events = s.observe(0, tasks.iter());
-        assert_eq!(events[0], WaitEvent::Line("Task queued: my build. 1 ahead.".into()));
+        assert_eq!(
+            events[0],
+            WaitEvent::Line("Task queued: my build. 1 ahead.".into())
+        );
     }
 
     #[test]
@@ -167,11 +188,20 @@ mod tests {
         ];
         let _ = s.observe(0, before.iter());
         let after = [
-            mk(1, TaskStatus::Running { enqueued_at: now, start: now }, "busybee"),
+            mk(
+                1,
+                TaskStatus::Running {
+                    enqueued_at: now,
+                    start: now,
+                },
+                "busybee",
+            ),
             mk(2, TaskStatus::Queued { enqueued_at: now }, "busybee"),
         ];
         let events = s.observe(1, after.iter());
-        assert!(events.iter().any(|e| matches!(e, WaitEvent::Line(s) if s == "0 ahead…")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WaitEvent::Line(s) if s == "0 ahead…")));
     }
 
     #[test]
@@ -180,34 +210,68 @@ mod tests {
         let now = Local::now();
         let queued = [mk(1, TaskStatus::Queued { enqueued_at: now }, "busybee")];
         let _ = s.observe(0, queued.iter());
-        let running = [mk(1, TaskStatus::Running { enqueued_at: now, start: now }, "busybee")];
+        let running = [mk(
+            1,
+            TaskStatus::Running {
+                enqueued_at: now,
+                start: now,
+            },
+            "busybee",
+        )];
         let events = s.observe(1, running.iter());
         assert!(events.iter().any(|e| matches!(e, WaitEvent::Started)));
-        assert!(events.iter().any(|e| matches!(e, WaitEvent::Line(s) if s == "Running.")));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WaitEvent::Line(s) if s == "Running.")));
     }
 
     #[test]
     fn transition_to_done_emits_finished() {
         let mut s = WaitState::new(1, "x".into());
         let now = Local::now();
-        let running = [mk(1, TaskStatus::Running { enqueued_at: now, start: now }, "busybee")];
+        let running = [mk(
+            1,
+            TaskStatus::Running {
+                enqueued_at: now,
+                start: now,
+            },
+            "busybee",
+        )];
         let _ = s.observe(0, running.iter());
-        let done = [mk(1, TaskStatus::Done {
-            enqueued_at: now, start: now, end: now, result: TaskResult::Success,
-        }, "busybee")];
+        let done = [mk(
+            1,
+            TaskStatus::Done {
+                enqueued_at: now,
+                start: now,
+                end: now,
+                result: TaskResult::Success,
+            },
+            "busybee",
+        )];
         let events = s.observe(1, done.iter());
-        assert!(events.iter().any(|e| matches!(e, WaitEvent::Finished { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WaitEvent::Finished { .. })));
     }
 
     #[test]
     fn transition_to_missing_task_emits_finished() {
         let mut s = WaitState::new(1, "x".into());
         let now = Local::now();
-        let running = [mk(1, TaskStatus::Running { enqueued_at: now, start: now }, "busybee")];
+        let running = [mk(
+            1,
+            TaskStatus::Running {
+                enqueued_at: now,
+                start: now,
+            },
+            "busybee",
+        )];
         let _ = s.observe(0, running.iter());
         // Task is now gone (e.g., `pueue clean`).
         let empty: [Task; 0] = [];
         let events = s.observe(1, empty.iter());
-        assert!(events.iter().any(|e| matches!(e, WaitEvent::Finished { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, WaitEvent::Finished { .. })));
     }
 }

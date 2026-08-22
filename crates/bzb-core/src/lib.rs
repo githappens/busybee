@@ -5,12 +5,12 @@
 //! add-requests, and pure helpers (color envs, exit-code mapping, queue
 //! snapshots).
 
-pub mod env;
-pub mod exit_code;
-pub mod status;
-pub mod errors;
 pub mod client;
-pub mod group;
 pub mod enqueue;
-pub mod wait;
+pub mod env;
+pub mod errors;
+pub mod exit_code;
+pub mod group;
 pub mod log;
+pub mod status;
+pub mod wait;

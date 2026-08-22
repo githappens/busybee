@@ -1,8 +1,8 @@
 use std::io::Read;
 
 use crate::errors::BusybeeError;
-use pueue_lib::Client;
 use pueue_lib::message::{LogRequest, Request, Response, TaskSelection};
+use pueue_lib::Client;
 
 /// Fetch the combined stdout+stderr log for `task_id` starting at plaintext
 /// byte `offset`. Returns the new plaintext bytes and the new cursor position.
@@ -87,8 +87,7 @@ mod tests {
 
     #[test]
     fn decompress_round_trips_repetitive_input() {
-        let plain: Vec<u8> = b"createWriterForAudioFileFormat\n"
-            .repeat(200);
+        let plain: Vec<u8> = b"createWriterForAudioFileFormat\n".repeat(200);
         let compressed = encode(&plain);
         assert!(compressed.windows(6).any(|w| w == b"sNaPpY"));
         assert_eq!(decompress_snappy_frames(&compressed).unwrap(), plain);

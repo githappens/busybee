@@ -35,7 +35,9 @@ mod tests {
 
     #[test]
     fn daemon_unreachable_maps_to_exit_2() {
-        let e = BusybeeError::DaemonUnreachable { context: "no socket".into() };
+        let e = BusybeeError::DaemonUnreachable {
+            context: "no socket".into(),
+        };
         assert_eq!(exit_code_for(&e), 2);
     }
 

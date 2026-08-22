@@ -186,7 +186,9 @@ mod render_tests {
         // Pick up whichever row has "42" — size 7x5 centers text on middle row.
         let mut found = false;
         for y in 0..area.height {
-            let row: String = (0..area.width).map(|x| buf.get(x, y).symbol().to_string()).collect();
+            let row: String = (0..area.width)
+                .map(|x| buf.get(x, y).symbol().to_string())
+                .collect();
             if row.contains("42") {
                 found = true;
                 break;

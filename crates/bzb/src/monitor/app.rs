@@ -4,15 +4,15 @@ use anyhow::Result;
 use bzb_core::{client, group, status::QueueSnapshot};
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEvent};
 use futures::StreamExt;
-use pueue_lib::Client;
 use pueue_lib::message::{Request, Response};
-use ratatui::Terminal;
+use pueue_lib::Client;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::Color;
 use ratatui::widgets::{Block, Borders};
+use ratatui::Terminal;
 use tokio::{select, time};
 
-use super::cpu::{self, CoreSample, usage_percent};
+use super::cpu::{self, usage_percent, CoreSample};
 use super::widgets::compact_gauge::CompactGauge;
 use super::widgets::status_panel::StatusPanel;
 
@@ -99,9 +99,13 @@ async fn run_loop<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> R
 }
 
 async fn fetch_snapshot(client: &mut Client) -> anyhow::Result<QueueSnapshot> {
-    client.send_request(Request::Status).await
+    client
+        .send_request(Request::Status)
+        .await
         .map_err(|e| anyhow::anyhow!("status request: {e}"))?;
-    let resp = client.receive_response().await
+    let resp = client
+        .receive_response()
+        .await
         .map_err(|e| anyhow::anyhow!("status response: {e}"))?;
     match resp {
         Response::Status(state) => Ok(QueueSnapshot::from_tasks(state.tasks.values(), "busybee")),
@@ -135,13 +139,7 @@ fn draw<B: ratatui::backend::Backend>(
         let bottom_block = Block::default().borders(Borders::ALL).title("Queue");
         let inner_bottom = bottom_block.inner(bottom);
         frame.render_widget(bottom_block, bottom);
-        frame.render_widget(
-            StatusPanel {
-                snapshot,
-                elapsed,
-            },
-            inner_bottom,
-        );
+        frame.render_widget(StatusPanel { snapshot, elapsed }, inner_bottom);
     })?;
     Ok(())
 }

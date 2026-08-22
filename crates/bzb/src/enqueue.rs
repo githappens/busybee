@@ -2,17 +2,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bzb_core::{
-    client,
-    enqueue as core_enqueue,
+    client, enqueue as core_enqueue,
     exit_code::task_result_to_exit_code,
     group,
     log::fetch_log_chunk,
     wait::{WaitEvent, WaitState},
 };
-use pueue_lib::Client;
 use pueue_lib::message::{KillRequest, Request, Response, Signal, TaskSelection};
 use pueue_lib::state::State;
 use pueue_lib::task::TaskStatus;
+use pueue_lib::Client;
 use tokio::{io::AsyncWriteExt, time::sleep};
 
 use crate::detach::shell_escape_join;
@@ -88,7 +87,10 @@ pub async fn run(cmd: Vec<String>, name: Option<String>) -> Result<()> {
 
 fn exit_line(code: i32, elapsed: Option<Duration>) -> String {
     match elapsed {
-        Some(d) => format!("busybee: command exited {code} (elapsed {})", format_elapsed(d)),
+        Some(d) => format!(
+            "busybee: command exited {code} (elapsed {})",
+            format_elapsed(d)
+        ),
         None => format!("busybee: command exited {code}"),
     }
 }
@@ -104,49 +106,25 @@ fn format_elapsed(d: Duration) -> String {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{exit_line, format_elapsed};
-    use std::time::Duration;
-
-    #[test]
-    fn format_elapsed_under_a_minute() {
-        assert_eq!(format_elapsed(Duration::from_secs(7)), "7s");
-        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
-    }
-
-    #[test]
-    fn format_elapsed_minutes_and_hours() {
-        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m00s");
-        assert_eq!(format_elapsed(Duration::from_secs(2 * 60 + 14)), "2m14s");
-        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1h00m");
-        assert_eq!(format_elapsed(Duration::from_secs(3600 + 23 * 60 + 5)), "1h23m");
-    }
-
-    #[test]
-    fn exit_line_includes_elapsed_when_started() {
-        let line = exit_line(0, Some(Duration::from_secs(134)));
-        assert_eq!(line, "busybee: command exited 0 (elapsed 2m14s)");
-    }
-
-    #[test]
-    fn exit_line_omits_elapsed_when_never_started() {
-        assert_eq!(exit_line(130, None), "busybee: command exited 130");
-    }
-}
-
 async fn fetch_state(client: &mut Client) -> Result<State> {
-    client.send_request(Request::Status).await
+    client
+        .send_request(Request::Status)
+        .await
         .map_err(|e| anyhow::anyhow!("status request: {e}"))?;
-    match client.receive_response().await
-        .map_err(|e| anyhow::anyhow!("status response: {e}"))? {
+    match client
+        .receive_response()
+        .await
+        .map_err(|e| anyhow::anyhow!("status response: {e}"))?
+    {
         Response::Status(state) => Ok(*state),
         other => anyhow::bail!("unexpected response to Status: {other:?}"),
     }
 }
 
 fn final_exit_code(state: &State, task_id: usize) -> i32 {
-    let Some(task) = state.tasks.get(&task_id) else { return 1 };
+    let Some(task) = state.tasks.get(&task_id) else {
+        return 1;
+    };
     match &task.status {
         TaskStatus::Done { result, .. } => task_result_to_exit_code(result),
         _ => 1,
@@ -172,4 +150,37 @@ async fn hard_kill(client: &mut Client, task_id: usize) {
         }))
         .await;
     let _ = client.receive_response().await;
+}
+#[cfg(test)]
+mod tests {
+    use super::{exit_line, format_elapsed};
+    use std::time::Duration;
+
+    #[test]
+    fn format_elapsed_under_a_minute() {
+        assert_eq!(format_elapsed(Duration::from_secs(7)), "7s");
+        assert_eq!(format_elapsed(Duration::from_secs(59)), "59s");
+    }
+
+    #[test]
+    fn format_elapsed_minutes_and_hours() {
+        assert_eq!(format_elapsed(Duration::from_secs(60)), "1m00s");
+        assert_eq!(format_elapsed(Duration::from_secs(2 * 60 + 14)), "2m14s");
+        assert_eq!(format_elapsed(Duration::from_secs(3600)), "1h00m");
+        assert_eq!(
+            format_elapsed(Duration::from_secs(3600 + 23 * 60 + 5)),
+            "1h23m"
+        );
+    }
+
+    #[test]
+    fn exit_line_includes_elapsed_when_started() {
+        let line = exit_line(0, Some(Duration::from_secs(134)));
+        assert_eq!(line, "busybee: command exited 0 (elapsed 2m14s)");
+    }
+
+    #[test]
+    fn exit_line_omits_elapsed_when_never_started() {
+        assert_eq!(exit_line(130, None), "busybee: command exited 130");
+    }
 }

@@ -34,12 +34,18 @@ mod tests {
 
     #[test]
     fn accepts_v_prefix() {
-        assert_eq!(parse_describe("v0.2.3-4-gabcdef1").as_deref(), Some("0.2.7"));
+        assert_eq!(
+            parse_describe("v0.2.3-4-gabcdef1").as_deref(),
+            Some("0.2.7")
+        );
     }
 
     #[test]
     fn preserves_nonzero_patch_from_tag() {
-        assert_eq!(parse_describe("1.4.7-3-gabcdef1").as_deref(), Some("1.4.10"));
+        assert_eq!(
+            parse_describe("1.4.7-3-gabcdef1").as_deref(),
+            Some("1.4.10")
+        );
     }
 
     #[test]

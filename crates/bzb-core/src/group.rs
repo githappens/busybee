@@ -1,6 +1,6 @@
 use crate::errors::BusybeeError;
-use pueue_lib::Client;
 use pueue_lib::message::{GroupRequest, Request, Response};
+use pueue_lib::Client;
 
 pub const BUSYBEE_GROUP: &str = "busybee";
 
