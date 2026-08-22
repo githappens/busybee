@@ -123,9 +123,23 @@ pub struct Leases {
     leases: BTreeMap<LeaseId, Lease>,
     next_id: u64,
     pueue: Pueue,
-    /// pueue tasks that have been sent SIGTERM, and when SIGKILL follows.
-    killing: BTreeMap<usize, Instant>,
+    /// pueue tasks being torn down, until pueued confirms they are gone.
+    killing: BTreeMap<usize, Kill>,
+    /// Admissions held back while [`Leases::killing`] is non-empty. The task
+    /// being killed may still be on the machine, and the admission machine has
+    /// already forgotten its lease, so starting the next one now would run two
+    /// exclusive tasks at once.
+    deferred: VecDeque<Action>,
     leases_path: PathBuf,
+}
+
+/// A teardown in flight.
+struct Kill {
+    /// When SIGKILL follows, for a task that ignores SIGTERM.
+    deadline: Instant,
+    /// Whether it already has: the escalation happens once, and then the wait
+    /// is for pueued to report the task gone.
+    escalated: bool,
 }
 
 impl Leases {
@@ -139,6 +153,7 @@ impl Leases {
             next_id: 1,
             pueue: Pueue::default(),
             killing: BTreeMap::new(),
+            deferred: VecDeque::new(),
             leases_path,
         };
         (actor, Handle(tx), rx)
@@ -241,6 +256,14 @@ impl Leases {
         let mut pending: VecDeque<Action> = actions.into();
         while let Some(action) = pending.pop_front() {
             match action {
+                // The machine sizes an admission as if the lease it replaces
+                // were already gone. While a task is being killed that is not
+                // yet true, so the admission waits for the poll that sees the
+                // task end; teardowns and queue positions carry on meanwhile.
+                Action::Admit { .. } if !self.killing.is_empty() => {
+                    tracing::debug!("holding an admission back until the killed task is gone");
+                    self.deferred.push_back(action);
+                }
                 Action::Admit { id, cores, .. } => pending.extend(self.admit(id, cores).await),
                 Action::Notify { id, ahead } => {
                     // The machine counts queue positions; a client wants to
@@ -329,13 +352,22 @@ impl Leases {
             return;
         };
         self.persist();
+        // Its admission may not have happened yet; it must not happen now.
+        self.deferred
+            .retain(|a| !matches!(a, Action::Admit { id: held, .. } if *held == id));
         if let Some(task_id) = lease.pueue_task_id {
             if let Err(err) = self.pueue.kill(task_id, Signal::SigTerm).await {
                 tracing::error!(task = task_id, "cannot stop the task: {err:#}");
             }
             // SIGKILL follows on the poll after the grace period, for a task
             // that ignores the first signal.
-            self.killing.insert(task_id, Instant::now() + KILL_GRACE);
+            self.killing.insert(
+                task_id,
+                Kill {
+                    deadline: Instant::now() + KILL_GRACE,
+                    escalated: false,
+                },
+            );
         }
         let _ = lease.conn.send(LeaseEvent::Finished {
             id: id.0,
@@ -347,7 +379,7 @@ impl Leases {
     /// ones that ended.
     async fn poll(&mut self) {
         let watching = self.leases.values().any(|l| l.pueue_task_id.is_some());
-        if !watching && self.killing.is_empty() {
+        if !watching && self.killing.is_empty() && self.deferred.is_empty() {
             return;
         }
         let state = match self.pueue.status().await {
@@ -361,20 +393,24 @@ impl Leases {
         };
         let status = |task_id: usize| state.tasks.get(&task_id).map(|t| &t.status);
 
-        for (task_id, deadline) in std::mem::take(&mut self.killing) {
+        for (task_id, mut kill) in std::mem::take(&mut self.killing) {
             match status(task_id) {
-                // Gone or done: the escalation is over either way.
-                None | Some(TaskStatus::Done { .. }) => {}
-                _ if Instant::now() >= deadline => {
+                // Gone or done: the teardown is over either way, and whatever
+                // was waiting on it may go ahead.
+                None | Some(TaskStatus::Done { .. }) => continue,
+                // Signalled but still there: SIGKILL is not sent twice, so all
+                // that is left is to wait for pueued to report it gone.
+                _ if kill.escalated => {}
+                _ if Instant::now() >= kill.deadline => {
                     tracing::warn!(task = task_id, "still running after SIGTERM; killing");
                     if let Err(err) = self.pueue.kill(task_id, Signal::SigKill).await {
                         tracing::error!(task = task_id, "cannot kill the task: {err:#}");
                     }
+                    kill.escalated = true;
                 }
-                _ => {
-                    self.killing.insert(task_id, deadline);
-                }
+                _ => {}
             }
+            self.killing.insert(task_id, kill);
         }
 
         let ended: Vec<(LeaseId, Completion)> = self
@@ -392,6 +428,15 @@ impl Leases {
             self.finish(id, completion.exit_code);
             let actions = self.scheduler.handle(Event::Finished(id));
             self.drive(actions).await;
+        }
+
+        // Every task that was being killed is gone, so the admissions that
+        // waited for them may go ahead. Only now, at the end of the tick: the
+        // task they submit is not in the `state` read above, and the scan for
+        // ended leases would take it for one that vanished.
+        if self.killing.is_empty() && !self.deferred.is_empty() {
+            let waiting = std::mem::take(&mut self.deferred);
+            self.drive(waiting.into()).await;
         }
     }
 

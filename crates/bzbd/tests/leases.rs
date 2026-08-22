@@ -235,25 +235,52 @@ async fn a_client_that_hangs_up_while_running_takes_its_task_with_it() {
     wait_for_no_leases(&daemon, Duration::from_secs(2)).await;
 }
 
+/// A task that ignores SIGTERM, so it lives until the SIGKILL escalation.
+/// pueued signals the whole process group, hence a loop of short sleeps rather
+/// than one long one: the shell is what has to survive.
+const IGNORES_SIGTERM: &[&str] = &["sh", "-c", "trap '' TERM; while :; do sleep 0.2; done"];
+
+/// A lease admitted while the task it replaces is still being killed would put
+/// two exclusive tasks on the machine at once — the thing busybee exists to
+/// prevent. The next admission waits for pueued to confirm the kill.
+#[tokio::test]
+#[serial_test::serial]
+async fn the_next_lease_waits_until_the_killed_task_is_gone() {
+    let Some(pueued) = PueuedFixture::try_start() else {
+        return;
+    };
+    let daemon = Fixture::start_with_pueue(&pueued.config_path);
+
+    let mut first = submit(&daemon, IGNORES_SIGTERM).await;
+    assert!(matches!(
+        event(&mut first).await,
+        LeaseEvent::Queued { ahead: 0, .. }
+    ));
+    let (_, stubborn) = admitted(event(&mut first).await);
+
+    let mut second = submit(&daemon, &["sh", "-c", "exit 0"]).await;
+    assert!(matches!(
+        event(&mut second).await,
+        LeaseEvent::Queued { ahead: 1, .. }
+    ));
+
+    // SIGTERM goes out at once, but the shell ignores it; the second lease may
+    // not start until the escalation has actually ended the first task.
+    drop(first);
+    admitted(event(&mut second).await);
+    let status = task_status(&pueued.config_path, stubborn).await;
+    assert!(
+        matches!(status, None | Some(TaskStatus::Done { .. })),
+        "the second lease started while pueue task {stubborn} was still {status:?}"
+    );
+}
+
 /// Polls pueued directly: the task has to be gone from the machine, not just
 /// from bzbd's books.
 async fn wait_for_task_to_end(config: &Path, task_id: usize, patience: Duration) {
-    // Process-wide, which is why the test that calls this is serial.
-    std::env::set_var("PUEUE_CONFIG_PATH", config);
-    let mut client = bzb_core::client::connect_or_spawn()
-        .await
-        .expect("connect to pueued");
     let deadline = tokio::time::Instant::now() + patience;
     loop {
-        client
-            .send_request(PueueRequest::Status)
-            .await
-            .expect("send a status request");
-        let state = match client.receive_response().await.expect("status response") {
-            PueueResponse::Status(state) => state,
-            other => panic!("expected a status response, got {other:?}"),
-        };
-        let status = state.tasks.get(&task_id).map(|t| t.status.clone());
+        let status = task_status(config, task_id).await;
         if matches!(status, None | Some(TaskStatus::Done { .. })) {
             return;
         }
@@ -263,6 +290,24 @@ async fn wait_for_task_to_end(config: &Path, task_id: usize, patience: Duration)
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// What pueued itself says a task is doing, `None` once its record is gone.
+async fn task_status(config: &Path, task_id: usize) -> Option<TaskStatus> {
+    // Process-wide, which is why the tests that call this are serial.
+    std::env::set_var("PUEUE_CONFIG_PATH", config);
+    let mut client = bzb_core::client::connect_or_spawn()
+        .await
+        .expect("connect to pueued");
+    client
+        .send_request(PueueRequest::Status)
+        .await
+        .expect("send a status request");
+    let state = match client.receive_response().await.expect("status response") {
+        PueueResponse::Status(state) => state,
+        other => panic!("expected a status response, got {other:?}"),
+    };
+    state.tasks.get(&task_id).map(|t| t.status.clone())
 }
 
 /// `leases.json` is what a restarted bzbd reads to find the tasks it left

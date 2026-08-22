@@ -126,7 +126,7 @@ No silent fallbacks anywhere: if bzbd cannot create its fifo or socket it refuse
 | event | behaviour |
 |---|---|
 | client disconnects while queued | lease dropped |
-| client disconnects while running | pueue task killed (SIGINT → SIGKILL escalation as today), tokens returned |
+| client disconnects while running | pueue task killed (SIGINT → SIGKILL escalation as today), tokens returned. The admission machine forgets the lease at once, but the next admission waits until pueued reports the task gone: a task that ignores the first signal is still on the machine, and starting its replacement meanwhile would run two exclusive tasks at once |
 | task goes live after its lease was torn down | the drain finished and the task launched while the teardown was in flight. bzbd reports `Started` regardless; the admission machine no longer tracks the lease, so it answers with a second drop and the task is killed and its tokens returned. Never swallowed: an ignored late `Started` would leak both the process and its tokens |
 | a drain comes up short, or collects nothing at all | not a failure: the task starts with what was collected, the implicit token providing the minimum of one, and `Started` reports the real count. Only a drain that cannot run at all (fifo unreadable, submission rejected) ends the lease. Treating exhaustion as a failure would stop a second static task from ever running once the first drained the pool |
 | task exits | observed by polling pueue status (1 s); tokens returned; client gets exit code |
