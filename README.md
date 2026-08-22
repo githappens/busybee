@@ -64,6 +64,53 @@ queued or running task is killed and busybee exits 130.
 client is gone. Nothing is left holding it, so `Ctrl-C` cannot reach a detached
 task: `busybee cancel <id>` is the only way to end one early.
 
+## Configuration
+
+Optional. With no file, busybee runs on the defaults below.
+
+```bash
+busybee config show      # the effective configuration (defaults merged), as TOML
+busybee config reload    # make a running bzbd re-read the file (same as SIGHUP)
+```
+
+The file lives at `$XDG_CONFIG_HOME/busybee/config.toml`, or
+`~/.config/busybee/config.toml` when `XDG_CONFIG_HOME` is unset. `BUSYBEE_CONFIG`
+names a different file outright (it must be an absolute path).
+
+```toml
+pool_size = 18            # default: logical cores
+max_concurrent = 4
+drain_deadline_ms = 2000
+
+[defaults]
+static = "fair"           # or a fixed core count
+
+[overrides]               # add or replace classification rows without a release
+"./build.sh" = { class = "jobserver" }
+"my-bench"   = { class = "none" }
+"mytool"     = { class = "static", env = { MYTOOL_THREADS = "{cores}" } }
+```
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `pool_size` | integer 1–4096 | logical cores | Tokens in the shared CPU pool. |
+| `max_concurrent` | integer ≥ 1 | 4 | Tasks admitted at once, whatever their size. |
+| `drain_deadline_ms` | integer 100–60000 | 2000 | How long a task that cannot speak the jobserver protocol waits for its tokens before starting with what it collected. |
+| `defaults.static` | `"fair"` or integer ≥ 1 | `"fair"` | Cores such a task asks for: `"fair"` is its share of the pool at the moment it starts. |
+| `overrides.<tool>` | table | none | One classification row. |
+| `overrides.<tool>.class` | `"jobserver"`, `"static"` or `"none"` | required | How the tool shares the pool: joins it dynamically, holds a fixed number of cores, or takes the machine. |
+| `overrides.<tool>.env` | table of strings | empty | Variables to set for the task. Values may contain `{cores}`, `{cores-1}` and `{fifo}`, and nothing else. |
+
+An override key is matched against the tool's basename, so `"./build.sh"` and
+`"build.sh"` name the same row (two keys that collapse to one are an error).
+The row it produces replaces the built-in one for that tool outright, class and
+injection together.
+
+A file that does not parse, names a key busybee does not read, or carries a
+value out of range is refused whole, with the line to fix: nothing is applied
+in part. `bzbd` then refuses to start, and a reload keeps the configuration it
+was already running on.
+
 ## Roadmap
 
 - **Hardware-cost-aware scheduling.** Today busybee is strictly

@@ -73,6 +73,12 @@ pub enum Command {
         known: oneshot::Sender<bool>,
     },
     Status(oneshot::Sender<StatusReply>),
+    /// A reloaded config file. Acknowledged, so a caller that has to report
+    /// the reload only does so once the scheduler is actually running on it.
+    SetParams {
+        params: Params,
+        done: oneshot::Sender<()>,
+    },
 }
 
 /// Talks to the actor. Cloneable; one per connection.
@@ -106,6 +112,15 @@ impl Handle {
         let (tx, rx) = oneshot::channel();
         self.send(Command::Status(tx)).await?;
         rx.await.context("the lease actor dropped a status request")
+    }
+
+    /// Hands the scheduler a reloaded configuration's admission parameters,
+    /// returning once it has taken them.
+    pub async fn set_params(&self, params: Params) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::SetParams { params, done: tx }).await?;
+        rx.await
+            .context("the lease actor dropped a set-params request")
     }
 
     async fn send(&self, command: Command) -> Result<()> {
@@ -236,6 +251,16 @@ impl Leases {
                 // The receiver is gone only if the connection died while we
                 // were cancelling; the lease is over either way.
                 let _ = known.send(live);
+            }
+            Command::SetParams { params, done } => {
+                self.params = params;
+                // Driven, not discarded: a raised pool or max_concurrent can
+                // make the queue head admissible right now, and nothing else
+                // is going to happen until a running task ends.
+                let actions = self.scheduler.set_params(params);
+                self.drive(actions).await;
+                // Gone only if the reloading caller stopped waiting.
+                let _ = done.send(());
             }
             Command::Status(reply) => {
                 // The receiver is gone only if the connection died while we

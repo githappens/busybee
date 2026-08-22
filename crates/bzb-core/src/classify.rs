@@ -146,6 +146,11 @@ pub struct Rule {
     /// a notice is emitted, and for [`Inject::Xcodebuild`] the injection is
     /// skipped entirely (argv injection would otherwise duplicate the flag).
     pub parallel_flags: Vec<String>,
+    /// Extra variables the row sets, on top of whatever [`Rule::inject`]
+    /// recipe applies. Empty for every built-in row: this is what carries a
+    /// config file's `[overrides]` `env` table, whose values the file cannot
+    /// express as one of the fixed recipes.
+    pub env_set: Vec<(String, String)>,
 }
 
 /// Ordered list of classification rows; the first match wins.
@@ -214,6 +219,7 @@ pub fn default_table() -> Table {
             class,
             inject,
             parallel_flags: flags.iter().map(|f| f.to_string()).collect(),
+            env_set: Vec::new(),
         }
     }
 
@@ -317,6 +323,12 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
     };
 
     apply_injection(&mut plan, inject, user_flag.is_some());
+    // A row's own variables ride along with whichever recipe it kept: they are
+    // core counts and tool-specific knobs, so they stay useful under a forced
+    // class the way an injected `GOMAXPROCS` does.
+    if let Some(rule) = rule {
+        plan.env_set.extend(rule.env_set.iter().cloned());
+    }
 
     match (class, overrides.cores) {
         (Class::Jobserver, Some(_)) => plan.notices.push(
@@ -543,7 +555,9 @@ fn unwrap_wrappers(argv: &[String]) -> (String, &[String], Vec<&str>) {
     }
 }
 
-fn basename(token: &str) -> &str {
+/// The tool a token names, which is what the table is keyed by — and what
+/// `config`'s override keys are matched on, hence the crate visibility.
+pub(crate) fn basename(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
 

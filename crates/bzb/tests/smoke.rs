@@ -490,3 +490,45 @@ fn a_daemon_that_cannot_start_stops_the_command() {
     );
     assert!(!marker.exists(), "the command ran without a daemon");
 }
+
+/// `config show` is the one command whose result is the configuration itself,
+/// so it prints to stdout — and it prints every key, not only the ones the
+/// file happens to mention.
+#[test]
+fn config_show_prints_the_effective_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    std::fs::write(&path, "pool_size = 7\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_busybee"))
+        .env("BUSYBEE_CONFIG", &path)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("pool_size = 7"), "stdout was {stdout}");
+    assert!(stdout.contains("max_concurrent = 4"), "stdout was {stdout}");
+}
+
+/// Nothing to reload without a daemon, and starting one to answer would be a
+/// surprise. Say which socket was tried instead.
+#[test]
+fn config_reload_without_a_daemon_is_an_error_that_says_why() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_busybee"))
+        .env("BUSYBEE_STATE_DIR", tmp.path())
+        .env("BUSYBEE_CONFIG", tmp.path().join("config.toml"))
+        .args(["config", "reload"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "reload succeeded with no daemon");
+    assert!(
+        stderr(&out).contains("bzbd is not running"),
+        "stderr was {:?}",
+        stderr(&out)
+    );
+}

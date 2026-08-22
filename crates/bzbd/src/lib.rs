@@ -1,9 +1,10 @@
 //! `bzbd`, busybee's broker daemon.
 //!
-//! It owns the state directory, the unix socket and the single-instance lock,
-//! and it is the only thing that submits tasks to pueued. A connection is a
-//! lease: `Submit` hands the request to the [`leases`] actor and streams that
-//! lease's events back until it finishes or the client hangs up.
+//! It owns the state directory, the unix socket, the single-instance lock and
+//! the loaded config file, and it is the only thing that submits tasks to
+//! pueued. A connection is a lease: `Submit` hands the request to the
+//! [`leases`] actor and streams that lease's events back until it finishes or
+//! the client hangs up.
 pub mod leases;
 pub mod submit;
 
@@ -17,16 +18,17 @@ use std::{
     path::Path,
     sync::{
         mpsc::{self, RecvTimeoutError, Sender},
-        Mutex,
+        Arc, Mutex,
     },
     time::Duration,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use bzb_core::{
+    config::Config,
     daemon::{log_path, pid_path, socket_path, state_dir},
     protocol::{read_line, Hello, LeaseEvent, Line, Request, Response, PROTOCOL_VERSION},
-    scheduler::{LeaseId, Params},
+    scheduler::LeaseId,
 };
 use tokio::{
     io::{AsyncWriteExt, BufReader},
@@ -51,6 +53,10 @@ pub fn run() -> Result<()> {
     // socket, and none of them wants an execute bit.
     restrict_umask(FILE_UMASK);
     let log = log_path()?;
+    // Before the fork, so a file the user cannot have meant reaches their
+    // terminal rather than only `bzbd.log`. Running the machine's builds under
+    // a configuration nobody wrote is worse than not running them.
+    let config = Config::load()?;
 
     // Fork before the runtime exists: a forked child inherits no threads.
     // Under `--foreground` there is no parent waiting for a report.
@@ -65,7 +71,7 @@ pub fn run() -> Result<()> {
         daemonize(&log)?
     };
 
-    let result = start(&mut ready, &log);
+    let result = start(&mut ready, &log, config);
     if let Err(err) = &result {
         // Our stderr is the log file by now; the parent is the only route back
         // to the terminal the user is looking at.
@@ -116,8 +122,14 @@ fn create_state_dir(dir: &Path) -> Result<()> {
 
 /// Everything that happens after the fork, so a failure has one place to be
 /// reported from.
-fn start(ready: &mut Ready, log: &Path) -> Result<()> {
+fn start(ready: &mut Ready, log: &Path, config: Config) -> Result<()> {
     init_logging(log)?;
+    tracing::info!(
+        pool_size = config.pool_size,
+        max_concurrent = config.max_concurrent,
+        drain_deadline_ms = config.drain_deadline_ms,
+        "config loaded"
+    );
 
     let pid_file = pid_path()?;
     let Some(locked) = lock_pid_file(&pid_file)? else {
@@ -129,7 +141,7 @@ fn start(ready: &mut Ready, log: &Path) -> Result<()> {
     };
 
     let runtime = tokio::runtime::Runtime::new().context("cannot start the tokio runtime")?;
-    let served = runtime.block_on(serve(&socket_path()?, ready));
+    let served = runtime.block_on(serve(&socket_path()?, ready, Arc::new(Mutex::new(config))));
     // Every connection task dies with the runtime, so this is the point at
     // which no daemon work is left. Unlinking `bzbd.pid` before it would let a
     // concurrently launched bzbd create a fresh inode, lock that instead, and
@@ -158,14 +170,18 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<bool> {
 /// Serves until SIGTERM or SIGINT, then closes the listener and unlinks the
 /// socket. The pid file is `start`'s to unlink, once the runtime this runs on
 /// is gone: while it survives, so does the daemon work its lock excludes.
-async fn serve(socket: &Path, ready: &mut Ready) -> Result<()> {
+async fn serve(socket: &Path, ready: &mut Ready, config: SharedConfig) -> Result<()> {
     // Before the socket exists: the socket is how everyone else finds us, and
     // a SIGTERM landing before these are installed kills us on the spot,
     // leaving the socket and the pid file behind.
     let mut terminate = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?;
+    let mut hangup = signal(SignalKind::hangup()).context("cannot listen for SIGHUP")?;
 
-    let (actor, leases, commands) = Leases::new(params()?, bzb_core::daemon::leases_path()?);
+    // The file the daemon refused to start without: the scheduler opens on the
+    // pool it describes, not on a hardcoded one.
+    let (actor, leases, commands) =
+        Leases::new(lock(&config).params(), bzb_core::daemon::leases_path()?);
     tokio::spawn(actor.run(commands));
 
     // Nothing else can be listening: this process holds the pid-file lock.
@@ -187,12 +203,18 @@ async fn serve(socket: &Path, ready: &mut Ready) -> Result<()> {
             accepted = listener.accept() => {
                 let (stream, _) = accepted.context("cannot accept a connection")?;
                 let leases = leases.clone();
+                let config = config.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle(stream, leases).await {
+                    if let Err(err) = handle(stream, leases, config).await {
                         tracing::warn!("connection failed: {err:#}");
                     }
                 });
             }
+            // A signal has no reply, so the log is where the outcome goes.
+            _ = hangup.recv() => match reload(&config, &leases).await {
+                Ok(()) => {}
+                Err(refusal) => tracing::warn!("{refusal}"),
+            },
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
         }
@@ -205,20 +227,57 @@ async fn serve(socket: &Path, ready: &mut Ready) -> Result<()> {
     Ok(())
 }
 
-/// Admission parameters until the config file lands: one token per logical
-/// core, and `docs/design/bzbd.md` §Admission policy's default of four
-/// concurrent leases.
-fn params() -> Result<Params> {
-    let pool_size = std::thread::available_parallelism()
-        .context("cannot count the machine's logical cores")?
-        .get();
-    Ok(Params {
-        pool_size: pool_size as u32,
-        max_concurrent: 4,
-    })
+/// The configuration a connection task shares with the accept loop. A `std`
+/// mutex, not a tokio one: every holder does a short, synchronous piece of
+/// work under it and none of them awaits.
+type SharedConfig = Arc<Mutex<Config>>;
+
+/// Re-reads the config file and hands the new admission parameters to the
+/// scheduler. A file that will not parse or validate leaves the daemon on the
+/// configuration it already had — no half-applied reload, and the scheduler is
+/// never told about a file that was refused — with the line to fix in the
+/// reason.
+///
+/// `drain_deadline_ms` is read per drain rather than pushed anywhere, so the
+/// stored [`Config`] is the whole of its application. The pool-size delta on
+/// the fifo is the other half of this and arrives with the drain (#8): bzbd
+/// owns no [`bzb_core::jobserver::Jobserver`] yet, so there are no tokens to
+/// release or acquire and nothing that could be clamped below what is held.
+async fn reload(config: &SharedConfig, leases: &Handle) -> Result<(), String> {
+    match Config::load() {
+        Ok(reloaded) => {
+            tracing::info!(
+                pool_size = reloaded.pool_size,
+                max_concurrent = reloaded.max_concurrent,
+                drain_deadline_ms = reloaded.drain_deadline_ms,
+                "config reloaded"
+            );
+            let params = reloaded.params();
+            *lock(config) = reloaded;
+            // A scheduler that cannot be reached is not a refused file: the
+            // daemon is on its way down, and saying the config was rejected
+            // would name the wrong cause.
+            leases.set_params(params).await.map_err(|err| {
+                format!("config reloaded but the scheduler did not take it: {err:#}")
+            })
+        }
+        Err(err) => Err(format!(
+            "config reload refused, keeping the running configuration \
+             (pool_size {}): {err}",
+            lock(config).pool_size
+        )),
+    }
 }
 
-async fn handle(stream: UnixStream, leases: Handle) -> Result<()> {
+/// A poisoned lock means another task panicked while holding it. Nothing here
+/// writes a [`Config`] in pieces, so what is behind the lock is still whole.
+fn lock(shared: &SharedConfig) -> std::sync::MutexGuard<'_, Config> {
+    shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+async fn handle(stream: UnixStream, leases: Handle, config: SharedConfig) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut incoming = BufReader::new(reader);
 
@@ -271,6 +330,22 @@ async fn handle(stream: UnixStream, leases: Handle) -> Result<()> {
             Ok(Request::Cancel { lease }) => match leases.cancel(LeaseId(lease)).await? {
                 true => Response::Ack,
                 false => Response::error(format!("there is no lease {lease}")),
+            },
+            Ok(Request::ConfigReload) => match reload(&config, &leases).await {
+                // Reports the configuration now in force, which the scheduler
+                // has already been given.
+                Ok(()) => {
+                    let running = lock(&config);
+                    Response::ConfigReloaded {
+                        pool_size: running.pool_size,
+                        max_concurrent: running.max_concurrent,
+                        drain_deadline_ms: running.drain_deadline_ms,
+                    }
+                }
+                Err(refusal) => {
+                    tracing::warn!("{refusal}");
+                    Response::error(refusal)
+                }
             },
             // Not echoing the request: escaping it and then JSON-encoding the
             // message quadruples it, so a line that fit within MAX_LINE_BYTES

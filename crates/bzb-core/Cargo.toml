@@ -20,6 +20,7 @@ snap.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 bzb-test-support = { path = "../bzb-test-support" }
@@ -30,4 +31,3 @@ tempfile = "3"
 # `test-util` for `#[tokio::test(start_paused = true)]`: tests that assert a
 # timeout fires do it on a paused clock rather than by waiting out the budget.
 tokio = { workspace = true, features = ["test-util"] }
-toml = "0.8"

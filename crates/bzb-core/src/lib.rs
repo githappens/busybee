@@ -7,6 +7,7 @@
 
 pub mod classify;
 pub mod client;
+pub mod config;
 pub mod daemon;
 pub mod enqueue;
 pub mod env;

@@ -61,11 +61,12 @@ crates/bzb-test-support/  fixtures shared by the crates' integration tests
 | `exit_code.rs`  | pueue `TaskResult` → process exit code |
 | `env.rs`        | force colour env vars onto the child's environment |
 | `errors.rs`     | `BusybeeError` and its error → exit-code recommendation |
+| `config.rs`     | `config.toml`: parse, validate, layer `[overrides]` onto the classification table |
 
 `crates/bzb/src/`: `cli.rs` (clap), `enqueue.rs` (blocking mode: enqueue, wait,
 stream, relay exit code), `detach.rs` (`--detach`), `signals.rs` (SIGINT
-escalation), `monitor/` (ratatui TUI plus per-OS CPU sampling),
-`version_parse.rs` (shared with `build.rs`).
+escalation), `config.rs` (`config show` / `config reload`), `monitor/` (ratatui
+TUI plus per-OS CPU sampling), `version_parse.rs` (shared with `build.rs`).
 
 `crates/bzbd/src/`: `lib.rs` (state directory, socket server, lifecycle),
 `leases.rs` (the actor owning the scheduler, the live leases and the poll of

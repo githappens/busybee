@@ -25,7 +25,12 @@ use crate::classify::Class;
 /// 3: [`LeaseRequest::detached`]. Neither direction survives the mismatch: a
 /// v2 client's `Submit` no longer decodes, and a v2 daemon ignores the field
 /// and kills a `--detach`ed lease the moment the client leaves.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// 4: [`Request::ConfigReload`] and [`Response::ConfigReloaded`], neither of
+/// which a v3 peer can decode — a `busybee config reload` against a daemon
+/// left running across the upgrade would hear "that is not a request" rather
+/// than the mismatch the handshake exists to name.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The longest line either end will read. Anyone who can open the socket could
 /// otherwise stream a newline-free message until the long-lived daemon runs out
@@ -92,7 +97,13 @@ pub enum Request {
     Ping,
     Status,
     Submit(LeaseRequest),
-    Cancel { lease: u64 },
+    Cancel {
+        lease: u64,
+    },
+    /// Re-read the config file. The daemon answers
+    /// [`Response::ConfigReloaded`] with what it now runs on, or
+    /// [`Response::Error`] with the reason it kept what it had.
+    ConfigReload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +129,12 @@ pub enum Response {
     /// The request was carried out. A cancel that changed nothing is an
     /// [`Response::Error`] instead: the caller named a lease that is not there.
     Ack,
+    /// The configuration the daemon runs on after a [`Request::ConfigReload`].
+    ConfigReloaded {
+        pool_size: u32,
+        max_concurrent: u32,
+        drain_deadline_ms: u64,
+    },
     /// Streamed on a `Submit` connection for the lifetime of the lease.
     Event(LeaseEvent),
     Error {

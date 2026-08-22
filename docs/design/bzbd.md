@@ -152,7 +152,10 @@ No silent fallbacks anywhere: if bzbd cannot create its fifo or socket it refuse
 
 ## Configuration
 
-`~/.config/busybee/config.toml`, every key optional:
+`$XDG_CONFIG_HOME/busybee/config.toml`, falling back to
+`~/.config/busybee/config.toml`; `BUSYBEE_CONFIG` names a file outright and must
+be absolute, since client and daemon run from different directories. Every key
+is optional and a missing file is the defaults.
 
 ```toml
 pool_size = 18            # default: logical cores
@@ -164,7 +167,31 @@ static = "fair"           # or an integer
 [overrides]               # extend/replace classification rows without a release
 "./build.sh" = { class = "jobserver" }
 "my-bench"   = { class = "none" }
+"mytool"     = { class = "static", env = { MYTOOL_THREADS = "{cores}" } }
 ```
+
+Ranges: `pool_size` 1..=4096 (the pipe capacity a pool has to fit in),
+`max_concurrent` ≥ 1, `drain_deadline_ms` 100..=60000, `defaults.static` `"fair"`
+or ≥ 1. An override's `class` is one of the three, and its `env` values carry
+only the placeholders §Classification lists. Nothing is applied in part: a file
+that fails any of this is refused whole, naming the line, and bzbd refuses to
+start rather than run the machine's builds under a configuration nobody wrote.
+
+An override key is matched on the tool's basename, the same string
+[`classify`](#classification) looks rows up by, so `"./build.sh"` and
+`"build.sh"` are one row and two keys that collapse to one are an error. The row
+replaces every built-in row for that tool — class, injection and mode gate
+together — and a row forced to `jobserver` gets `MAKEFLAGS` even though the
+file cannot ask for it, which is what makes `--class jobserver`'s escape hatch
+available to a config file too.
+
+Reload is SIGHUP or `busybee config reload`, which is the same reload over the
+socket so the client can report a refusal instead of leaving it in the log. New
+`Params` go to `Scheduler::set_params`; a changed `pool_size` is applied by
+releasing or acquiring the delta on the fifo, never taking it below the tokens
+currently held — a shrink that cannot complete is logged and finishes as the
+holding leases end. `busybee config show` prints the effective configuration,
+defaults merged, as TOML.
 
 ## Observability
 
