@@ -43,22 +43,37 @@ pub struct Record {
     /// Absent from records written before this field.
     #[serde(default)]
     pub fifo: Option<PathBuf>,
+    /// A teardown in flight: the lease is over and its task was signalled,
+    /// but pueued has not confirmed the task gone. It stays on record until
+    /// then, because a task that ignores the signal is still on the machine,
+    /// tokens and all, and a daemon restarted meanwhile must finish the job
+    /// rather than admit the next lease beside it. Absent from records
+    /// written before this field.
+    #[serde(default)]
+    pub killing: bool,
 }
 
 /// What the lease actor starts from.
 pub struct Recovered {
-    /// This daemon's pool, already short of what the adopted leases hold.
+    /// This daemon's pool, already short of what the adopted leases and the
+    /// teardowns in flight hold.
     pub jobserver: Jobserver,
     /// The previous daemon's leases whose tasks are still running.
     pub adopted: Vec<Record>,
+    /// The previous daemon's teardowns whose tasks are still running.
+    pub killing: Vec<Record>,
+    /// Tokens the records hold beyond what the pool has room for: the pool
+    /// shrank under running tasks. The actor swallows that many of their
+    /// releases, so the fifo never holds more than `pool_size`.
+    pub debt: u32,
 }
 
 pub async fn recover(dir: &Path, leases_path: &Path, pool_size: u32) -> Result<Recovered> {
     let records = load(leases_path)?;
     // Only a record makes pueued worth asking: a daemon with nothing to check
     // must not start a pueued just to start itself.
-    let adopted = if records.is_empty() {
-        Vec::new()
+    let (adopted, killing) = if records.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
         let state = Pueue::default().status().await.with_context(|| {
             format!(
@@ -83,10 +98,22 @@ pub async fn recover(dir: &Path, leases_path: &Path, pool_size: u32) -> Result<R
                 "adopting a lease the previous daemon left running"
             );
         }
-        reconciled.adopted
+        for record in &reconciled.killing {
+            tracing::warn!(
+                lease = record.id,
+                task = record.pueue_task_id,
+                cores_held = record.cores_held,
+                "resuming a teardown the previous daemon left in flight"
+            );
+        }
+        (reconciled.adopted, reconciled.killing)
     };
 
-    let referenced: BTreeSet<PathBuf> = adopted.iter().filter_map(|r| r.fifo.clone()).collect();
+    let referenced: BTreeSet<PathBuf> = adopted
+        .iter()
+        .chain(&killing)
+        .filter_map(|r| r.fifo.clone())
+        .collect();
     for path in sweep_fifos(dir, &referenced)? {
         tracing::info!(fifo = %path.display(), "removed a stale fifo");
     }
@@ -95,20 +122,28 @@ pub async fn recover(dir: &Path, leases_path: &Path, pool_size: u32) -> Result<R
     // part is taken straight back out.
     let jobserver =
         Jobserver::create(dir, pool_size).context("cannot create the jobserver fifo")?;
-    let held: u32 = adopted.iter().map(|r| r.cores_held).sum();
+    let held: u32 = adopted.iter().chain(&killing).map(|r| r.cores_held).sum();
     let taken = jobserver
         .acquire(held.min(pool_size), Duration::ZERO)
         .context("cannot hold back the adopted leases' tokens")?;
-    if taken < held {
+    let debt = held - taken;
+    if debt > 0 {
         // The pool shrank under running tasks. Nothing is revoked: the pool
-        // starts empty and fills as they end, the same as a reload would do.
+        // starts empty and fills as they end, the same as a reload would do,
+        // except that the first `debt` tokens they return are not put back.
         tracing::error!(
             held,
             pool_size,
+            debt,
             "the adopted leases hold more tokens than the pool has; it starts empty"
         );
     }
-    Ok(Recovered { jobserver, adopted })
+    Ok(Recovered {
+        jobserver,
+        adopted,
+        killing,
+        debt,
+    })
 }
 
 /// The records in `leases.json`; none when the file was never written.
@@ -123,26 +158,37 @@ fn load(path: &Path) -> Result<Vec<Record>> {
 
 struct Reconciled {
     adopted: Vec<Record>,
+    /// Teardowns still to be confirmed, whose tasks pueued reports running.
+    killing: Vec<Record>,
     /// What was not, and why.
     dropped: Vec<(Record, String)>,
 }
 
-/// Keeps the records whose task pueued reports running. Everything else is
-/// over: a task that finished had nobody to report to, a task pueued no longer
-/// knows about is not on the machine as far as anyone can tell, and a lease
-/// that was never admitted lost its client with the daemon.
+/// Keeps the records whose task pueued reports running: a lease is adopted, a
+/// teardown is resumed. Everything else is over: a task that finished had
+/// nobody to report to, a task pueued no longer knows about is not on the
+/// machine as far as anyone can tell, and a lease that was never admitted
+/// lost its client with the daemon.
 fn reconcile(records: Vec<Record>, tasks: &BTreeMap<usize, Task>) -> Reconciled {
     let mut reconciled = Reconciled {
         adopted: Vec::new(),
+        killing: Vec::new(),
         dropped: Vec::new(),
     };
     for record in records {
         let reason = match record.pueue_task_id {
             None => "it was never admitted, and its client went with the daemon".to_string(),
             Some(task_id) => match tasks.get(&task_id).map(|t| &t.status) {
+                Some(TaskStatus::Running { .. }) if record.killing => {
+                    reconciled.killing.push(record);
+                    continue;
+                }
                 Some(TaskStatus::Running { .. }) => {
                     reconciled.adopted.push(record);
                     continue;
+                }
+                Some(TaskStatus::Done { .. }) if record.killing => {
+                    format!("pueue task {task_id} was torn down while no daemon was watching")
                 }
                 Some(TaskStatus::Done { result, .. }) => format!(
                     "pueue task {task_id} finished ({result:?}) while no daemon was watching; \
@@ -222,6 +268,7 @@ mod tests {
             pueue_task_id,
             started_at_unix_ms: 0,
             fifo: None,
+            killing: false,
         }
     }
 
@@ -291,6 +338,34 @@ mod tests {
         assert!(dropped[2].1.contains("never admitted"), "{:?}", dropped[2]);
     }
 
+    /// A teardown the previous daemon did not see through is not a lease to
+    /// take back: the task is on its way out, not on the books. It is
+    /// resumed while pueued still reports the task, and over once it does
+    /// not.
+    #[test]
+    fn a_teardown_in_flight_is_resumed_not_adopted() {
+        let state = tasks(vec![task(1, running()), task(2, done())]);
+        let mut ignoring = record(10, Some(1));
+        ignoring.killing = true;
+        let mut finished = record(11, Some(2));
+        finished.killing = true;
+
+        let reconciled = reconcile(vec![ignoring, finished], &state);
+
+        assert!(reconciled.adopted.is_empty(), "adopted a teardown");
+        assert_eq!(
+            reconciled.killing.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![10]
+        );
+        assert_eq!(reconciled.dropped.len(), 1);
+        assert_eq!(reconciled.dropped[0].0.id, 11);
+        assert!(
+            reconciled.dropped[0].1.contains("torn down"),
+            "{:?}",
+            reconciled.dropped[0].1
+        );
+    }
+
     #[test]
     fn only_jobserver_files_carry_a_pid() {
         assert_eq!(fifo_pid(Path::new("/state/jobserver-4242")), Some(4242));
@@ -318,5 +393,6 @@ mod tests {
         let records: Vec<Record> = serde_json::from_str(old).expect("decode");
         assert_eq!(records[0].argv, Vec::<String>::new());
         assert_eq!(records[0].fifo, None);
+        assert!(!records[0].killing);
     }
 }

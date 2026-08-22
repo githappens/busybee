@@ -36,7 +36,10 @@ use chrono::{DateTime, Local};
 use pueue_lib::{message::Signal, task::Task, task::TaskStatus};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{recovery::Record, submit::Pueue};
+use crate::{
+    recovery::{Record, Recovered},
+    submit::Pueue,
+};
 
 /// How often pueued is asked what its tasks are doing. `docs/design/bzbd.md`
 /// §Failure and recovery fixes the cadence at one second — the same one the
@@ -173,6 +176,21 @@ impl Lease {
     fn tool(&self) -> String {
         classify(&self.request.argv, &Overrides::default(), &default_table()).tool
     }
+
+    /// The lease as `leases.json` records it.
+    fn record(&self, id: LeaseId, killing: bool) -> Record {
+        Record {
+            id: id.0,
+            label: self.label(),
+            argv: self.request.argv.clone(),
+            class: self.class,
+            cores_held: self.cores_held,
+            pueue_task_id: self.pueue_task_id,
+            started_at_unix_ms: unix_ms(self.started_at),
+            fifo: self.fifo.clone(),
+            killing,
+        }
+    }
 }
 
 pub struct Leases {
@@ -195,6 +213,10 @@ pub struct Leases {
     /// The admission machine has already forgotten its lease, so starting the
     /// next one now would run two exclusive tasks at once.
     deferred: VecDeque<Action>,
+    /// Tokens owed to a pool that shrank under the leases it adopted
+    /// (`Recovered::debt`): that many of their releases are swallowed, so the
+    /// fifo never holds more than the pool has.
+    debt: u32,
     leases_path: PathBuf,
 }
 
@@ -205,9 +227,19 @@ struct Kill {
     /// Whether it already has: the escalation happens once delivered, and then
     /// the wait is for pueued to report the task gone.
     escalated: bool,
-    /// The tokens the task holds, returned once pueued reports it gone: until
-    /// then it is still running at that width.
-    cores_held: u32,
+    /// The lease the task was running for, kept in `leases.json` as a
+    /// teardown until pueued reports the task gone: a daemon restarted before
+    /// then resumes it rather than admit beside a task that ignored the
+    /// signal. Its `cores_held` go back with that confirmation, since until
+    /// then the task is still running at that width. `None` for a task no
+    /// lease ever accounted for — one an unanswered submission started.
+    record: Option<Record>,
+}
+
+impl Kill {
+    fn cores_held(&self) -> u32 {
+        self.record.as_ref().map_or(0, |r| r.cores_held)
+    }
 }
 
 /// A submission whose answer never arrived. The task id comes back in that
@@ -223,16 +255,22 @@ struct Unreconciled {
 }
 
 impl Leases {
-    /// Builds the actor and the handle connections use to reach it, with the
-    /// leases a previous daemon left running already on its books
-    /// (`crate::recovery`): they hold their slots and tokens from the first
-    /// admission on, and ids carry on from after theirs.
+    /// Builds the actor and the handle connections use to reach it, with what
+    /// a previous daemon left running already on its books
+    /// (`crate::recovery`): adopted leases hold their slots and tokens from
+    /// the first admission on, teardowns in flight hold admissions back until
+    /// pueued confirms their task gone, and ids carry on from after theirs.
     pub fn new(
         params: Params,
-        jobserver: Jobserver,
+        recovered: Recovered,
         leases_path: PathBuf,
-        adopted: Vec<Record>,
     ) -> (Self, Handle, mpsc::Receiver<Command>) {
+        let Recovered {
+            jobserver,
+            adopted,
+            killing,
+            debt,
+        } = recovered;
         let (tx, rx) = mpsc::channel(64);
         let mut actor = Self {
             scheduler: Scheduler::new(params),
@@ -245,8 +283,29 @@ impl Leases {
             unreconciled: Vec::new(),
             old_fifos: BTreeSet::new(),
             deferred: VecDeque::new(),
+            debt,
             leases_path,
         };
+        for record in killing {
+            let Some(task_id) = record.pueue_task_id else {
+                // Recovery keeps only teardowns whose task pueued reports
+                // running, and a task has an id.
+                tracing::error!(lease = record.id, "a recorded teardown names no task");
+                continue;
+            };
+            actor.next_id = actor.next_id.max(record.id + 1);
+            actor.old_fifos.extend(record.fifo.clone());
+            // The previous daemon sent SIGTERM and the task is still there;
+            // the grace starts over from here and SIGKILL follows it.
+            actor.killing.insert(
+                task_id,
+                Kill {
+                    deadline: Instant::now() + KILL_GRACE,
+                    escalated: false,
+                    record: Some(record),
+                },
+            );
+        }
         for record in adopted {
             let id = LeaseId(record.id);
             actor.next_id = actor.next_id.max(record.id + 1);
@@ -556,13 +615,15 @@ impl Leases {
             tracing::warn!(lease = id.0, "asked to drop a lease that is not tracked");
             return;
         };
-        self.persist();
         // Its admission may not have happened yet; it must not happen now.
         self.deferred
             .retain(|a| !matches!(a, Action::Admit { id: held, .. } if *held == id));
         if let Some(task_id) = lease.pueue_task_id {
-            self.kill_task(task_id, lease.cores_held).await;
+            self.kill_task(task_id, Some(lease.record(id, true))).await;
         }
+        // After the teardown is on the books, not before: the record changes
+        // from a lease to a teardown, never to nothing.
+        self.persist();
         if let Some(conn) = &lease.conn {
             let _ = conn.send(LeaseEvent::Finished {
                 id: id.0,
@@ -573,9 +634,9 @@ impl Leases {
 
     /// Signals a task and waits for pueued to confirm it is gone; SIGKILL
     /// follows on the poll after the grace period, for a task that ignores the
-    /// first signal. Its `cores_held` go back to the pool with that
-    /// confirmation.
-    async fn kill_task(&mut self, task_id: usize, cores_held: u32) {
+    /// first signal. The lease's tokens go back to the pool with that
+    /// confirmation. The caller persists: the teardown is now on the books.
+    async fn kill_task(&mut self, task_id: usize, record: Option<Record>) {
         if let Err(err) = self.pueue.kill(task_id, Signal::SigTerm).await {
             tracing::error!(task = task_id, "cannot stop the task: {err:#}");
         }
@@ -584,14 +645,26 @@ impl Leases {
             Kill {
                 deadline: Instant::now() + KILL_GRACE,
                 escalated: false,
-                cores_held,
+                record,
             },
         );
     }
 
-    /// Returns tokens to the pool. Loud on failure: the pool is then short by
-    /// that many until the daemon restarts.
-    fn release(&self, tokens: u32) {
+    /// Returns tokens to the pool — after the pool's debt, if it has one
+    /// (`Recovered::debt`): those were never in this pool and must not enter
+    /// it. Loud on failure: the pool is then short by that many until the
+    /// daemon restarts.
+    fn release(&mut self, tokens: u32) {
+        let owed = tokens.min(self.debt);
+        if owed > 0 {
+            self.debt -= owed;
+            tracing::warn!(
+                withheld = owed,
+                remaining = self.debt,
+                "withholding released tokens the pool has no room for"
+            );
+        }
+        let tokens = tokens - owed;
         if tokens == 0 {
             return;
         }
@@ -623,12 +696,14 @@ impl Leases {
         };
         let status = |task_id: usize| state.tasks.get(&task_id).map(|t| &t.status);
 
+        let mut settled = false;
         for (task_id, mut kill) in std::mem::take(&mut self.killing) {
             match status(task_id) {
                 // Gone or done: the teardown is over either way, its tokens
                 // are nobody's, and whatever was waiting on it may go ahead.
                 None | Some(TaskStatus::Done { .. }) => {
-                    self.release(kill.cores_held);
+                    self.release(kill.cores_held());
+                    settled = true;
                     continue;
                 }
                 // Signalled but still there: SIGKILL is not sent twice, so all
@@ -650,6 +725,10 @@ impl Leases {
             }
             self.killing.insert(task_id, kill);
         }
+        if settled {
+            // The teardowns that ended leave the books.
+            self.persist();
+        }
 
         // A submission whose answer was lost: if pueued did start the task, it
         // is running with nothing to account for it, so it is killed like any
@@ -667,7 +746,7 @@ impl Leases {
                             task = task_id,
                             "pueued started a task whose submission failed; stopping it"
                         );
-                        self.kill_task(task_id, 0).await;
+                        self.kill_task(task_id, None).await;
                     }
                     None => tracing::info!(
                         label = pending.label,
@@ -741,15 +820,20 @@ impl Leases {
     /// exits. bzbd keeps serving, and the next submission spawns pueued again.
     async fn lose_running_leases(&mut self, err: &BusybeeError) {
         // Confirmations that will never arrive. Waiting for them would hold
-        // every remaining admission behind a task nobody can ask about.
+        // every remaining admission behind a task nobody can ask about. The
+        // tokens of a task being torn down go back like a lost lease's, and
+        // for the same reason: nothing can tell when it exits.
         if self.holding() {
             tracing::error!(
                 teardowns = self.killing.len(),
                 submissions = self.unreconciled.len(),
                 "giving up on what pueued was asked to do: it is gone"
             );
-            self.killing.clear();
+            for (_, kill) in std::mem::take(&mut self.killing) {
+                self.release(kill.cores_held());
+            }
             self.unreconciled.clear();
+            self.persist();
         }
         let running: Vec<LeaseId> = self
             .leases
@@ -847,21 +931,14 @@ impl Leases {
     }
 
     /// Rewrites `leases.json`, which is what a restarted bzbd reads to find the
-    /// tasks it left running.
+    /// tasks it left running: the leases, and the teardowns it has not seen
+    /// through.
     fn persist(&self) {
         let records: Vec<Record> = self
             .leases
             .iter()
-            .map(|(id, lease)| Record {
-                id: id.0,
-                label: lease.label(),
-                argv: lease.request.argv.clone(),
-                class: lease.class,
-                cores_held: lease.cores_held,
-                pueue_task_id: lease.pueue_task_id,
-                started_at_unix_ms: unix_ms(lease.started_at),
-                fifo: lease.fifo.clone(),
-            })
+            .map(|(id, lease)| lease.record(*id, false))
+            .chain(self.killing.values().filter_map(|k| k.record.clone()))
             .collect();
         if let Err(err) = write_json(&self.leases_path, &records) {
             // Not fatal to the leases themselves, but a restart would forget
@@ -1063,6 +1140,53 @@ mod tests {
         assert_eq!(orphan(&state, &pending, &BTreeSet::new()), None);
     }
 
+    const PARAMS: Params = Params {
+        pool_size: 4,
+        max_concurrent: 4,
+    };
+
+    /// An actor on a fresh pool in `directory`, with nothing recovered
+    /// unless `recovered` says otherwise. The caller holds the umask: the
+    /// actor creates a fifo and writes `leases.json`.
+    fn actor(
+        directory: &Path,
+        recovered: impl FnOnce(&Jobserver) -> (Vec<Record>, Vec<Record>, u32),
+    ) -> Leases {
+        let jobserver = Jobserver::create(directory, PARAMS.pool_size).expect("a fifo");
+        let (adopted, killing, debt) = recovered(&jobserver);
+        let (actor, _handle, _commands) = Leases::new(
+            PARAMS,
+            Recovered {
+                jobserver,
+                adopted,
+                killing,
+                debt,
+            },
+            directory.join("leases.json"),
+        );
+        actor
+    }
+
+    /// What a daemon with the drain (#8) records for a static lease that
+    /// pulled `cores_held` tokens.
+    fn held(id: u64, task: usize, cores_held: u32) -> Record {
+        Record {
+            id,
+            label: "make".into(),
+            argv: vec!["make".into()],
+            class: Class::Static,
+            cores_held,
+            pueue_task_id: Some(task),
+            started_at_unix_ms: 0,
+            fifo: None,
+            killing: false,
+        }
+    }
+
+    fn free(actor: &Leases) -> u32 {
+        actor.jobserver.free().expect("FIONREAD")
+    }
+
     /// An admission held back while an earlier task is torn down has no task
     /// of its own, and its client has not been told it is running. `busybee
     /// status` must not say otherwise.
@@ -1072,24 +1196,14 @@ mod tests {
         // mask the lifecycle tests have set meanwhile unless this is held.
         let _umask = crate::tests::hold_umask(0o022);
         let directory = tempfile::tempdir().expect("create a tempdir");
-        let params = Params {
-            pool_size: 8,
-            max_concurrent: 4,
-        };
-        let jobserver = Jobserver::create(directory.path(), params.pool_size).expect("a fifo");
-        let (mut actor, _handle, _commands) = Leases::new(
-            params,
-            jobserver,
-            directory.path().join("leases.json"),
-            Vec::new(),
-        );
+        let mut actor = actor(directory.path(), |_| (Vec::new(), Vec::new(), 0));
         // A teardown in flight: what holds the admission back.
         actor.killing.insert(
             9,
             Kill {
                 deadline: Instant::now() + KILL_GRACE,
                 escalated: false,
-                cores_held: 0,
+                record: None,
             },
         );
 
@@ -1116,6 +1230,114 @@ mod tests {
         assert_eq!(status.leases[0].state, "queued");
         assert_eq!(status.leases[0].pueue_task_id, None);
         assert_eq!(status.leases[0].ahead, Some(0));
+    }
+
+    /// Table row "pueued dies": a task being torn down when pueued goes is
+    /// as unaccountable as a running one, and its tokens go back the same
+    /// way. Clearing the teardown without them would leave the pool short by
+    /// that many for good.
+    #[tokio::test]
+    async fn losing_pueued_returns_the_tokens_of_a_teardown_in_flight() {
+        let _umask = crate::tests::hold_umask(0o022);
+        let directory = tempfile::tempdir().expect("create a tempdir");
+        let mut actor = actor(directory.path(), |jobserver| {
+            // The three tokens the task drained; it is still running at
+            // that width.
+            assert_eq!(jobserver.acquire(3, Duration::ZERO).expect("acquire"), 3);
+            (Vec::new(), Vec::new(), 0)
+        });
+        let mut record = held(5, 9, 3);
+        record.killing = true;
+        actor.killing.insert(
+            9,
+            Kill {
+                deadline: Instant::now() + KILL_GRACE,
+                escalated: false,
+                record: Some(record),
+            },
+        );
+        assert_eq!(free(&actor), 1);
+
+        actor
+            .lose_running_leases(&BusybeeError::Other("gone".into()))
+            .await;
+
+        assert_eq!(free(&actor), 4, "the teardown's tokens never came back");
+        assert!(actor.killing.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("leases.json")).expect("read"),
+            "[]"
+        );
+    }
+
+    /// A teardown is on the books until pueued confirms the task gone, so a
+    /// daemon restarted inside the grace period finds it and finishes it
+    /// instead of admitting beside a task that ignored SIGTERM.
+    #[test]
+    fn a_teardown_in_flight_is_recorded_until_pueued_confirms_it_gone() {
+        let _umask = crate::tests::hold_umask(0o022);
+        let directory = tempfile::tempdir().expect("create a tempdir");
+        let mut actor = actor(directory.path(), |_| (Vec::new(), Vec::new(), 0));
+        let mut record = held(5, 9, 0);
+        record.killing = true;
+        actor.killing.insert(
+            9,
+            Kill {
+                deadline: Instant::now() + KILL_GRACE,
+                escalated: false,
+                record: Some(record),
+            },
+        );
+
+        actor.persist();
+
+        let written = std::fs::read(directory.path().join("leases.json")).expect("read");
+        let records: Vec<Record> = serde_json::from_slice(&written).expect("decode");
+        assert_eq!(records.len(), 1, "records were {records:?}");
+        assert_eq!((records[0].id, records[0].pueue_task_id), (5, Some(9)));
+        assert!(records[0].killing, "the teardown was recorded as a lease");
+    }
+
+    /// A recovered teardown holds admissions back like one of this daemon's
+    /// own, and its tokens are withheld from the pool until it is confirmed.
+    #[test]
+    fn a_recovered_teardown_holds_admissions_back() {
+        let _umask = crate::tests::hold_umask(0o022);
+        let directory = tempfile::tempdir().expect("create a tempdir");
+        let actor = actor(directory.path(), |_| {
+            let mut record = held(5, 9, 0);
+            record.killing = true;
+            (Vec::new(), vec![record], 0)
+        });
+
+        assert!(actor.holding(), "the recovered teardown holds nothing back");
+        assert!(actor.killing.contains_key(&9));
+        assert_eq!(
+            actor.next_id, 6,
+            "ids must carry on from after the teardown's"
+        );
+    }
+
+    /// A pool that shrank under running tasks (table row "bzbd dies", with a
+    /// smaller `pool_size` on restart) starts empty, and what the tasks
+    /// return beyond its size is not put back: the fifo never holds more
+    /// tokens than the pool has.
+    #[test]
+    fn a_recovered_pool_never_grows_past_its_size() {
+        let _umask = crate::tests::hold_umask(0o022);
+        let directory = tempfile::tempdir().expect("create a tempdir");
+        let mut actor = actor(directory.path(), |jobserver| {
+            // What `recover` does for a lease holding 6 of a pool of 4: all
+            // four withheld, two owed.
+            assert_eq!(jobserver.acquire(4, Duration::ZERO).expect("acquire"), 4);
+            (vec![held(5, 9, 6)], Vec::new(), 2)
+        });
+        assert_eq!(free(&actor), 0);
+
+        actor.finish(LeaseId(5), 0);
+
+        assert_eq!(free(&actor), 4, "the pool grew past its size");
+        assert_eq!(actor.debt, 0);
     }
 
     #[test]

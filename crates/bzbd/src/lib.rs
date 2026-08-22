@@ -199,8 +199,7 @@ async fn serve(socket: &Path, ready: &mut Ready, config: SharedConfig) -> Result
     // than running anything ungoverned.
     let leases_path = bzb_core::daemon::leases_path()?;
     let recovered = recovery::recover(&state_dir()?, &leases_path, params.pool_size).await?;
-    let (actor, leases, commands) =
-        Leases::new(params, recovered.jobserver, leases_path, recovered.adopted);
+    let (actor, leases, commands) = Leases::new(params, recovered, leases_path);
     tokio::spawn(actor.run(commands));
 
     // Nothing else can be listening: this process holds the pid-file lock.
@@ -661,7 +660,7 @@ fn open_log(log: &Path) -> Result<File> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::leases::Command;
+    use crate::{leases::Command, recovery::Recovered};
     use bzb_core::jobserver::Jobserver;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
@@ -810,6 +809,16 @@ pub(crate) mod tests {
         );
     }
 
+    /// What a first start recovers: a full pool in `dir` and no leases.
+    fn nothing_to_recover(dir: &Path, pool_size: u32) -> Recovered {
+        Recovered {
+            jobserver: Jobserver::create(dir, pool_size).expect("a fifo"),
+            adopted: Vec::new(),
+            killing: Vec::new(),
+            debt: 0,
+        }
+    }
+
     /// A reload is finished by the scheduler, not by the parse: until the new
     /// admission parameters are in, the daemon is still running on the old
     /// ones, and anything it stores or logs saying otherwise is ahead of what
@@ -834,9 +843,8 @@ pub(crate) mod tests {
         let params = running.lock().await.params();
         let (_actor, leases, commands) = Leases::new(
             params,
-            Jobserver::create(tmp.path(), params.pool_size).expect("a fifo"),
+            nothing_to_recover(tmp.path(), params.pool_size),
             tmp.path().join("leases.json"),
-            Vec::new(),
         );
         drop(commands);
         std::fs::write(&path, "pool_size = 6\n").expect("rewrite the config");
@@ -878,9 +886,8 @@ pub(crate) mod tests {
         let params = running.lock().await.params();
         let (_actor, leases, mut commands) = Leases::new(
             params,
-            Jobserver::create(tmp.path(), params.pool_size).expect("a fifo"),
+            nothing_to_recover(tmp.path(), params.pool_size),
             tmp.path().join("leases.json"),
-            Vec::new(),
         );
 
         std::fs::write(&path, "pool_size = 6\n").expect("rewrite the config");

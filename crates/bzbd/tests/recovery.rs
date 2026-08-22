@@ -358,6 +358,97 @@ async fn a_restarted_daemon_leaves_an_orphaned_make_on_the_old_fifo() {
     );
 }
 
+/// Polls `leases.json` until a record says `killing`, or fails after
+/// `patience`: the teardown goes on record the moment the hangup is seen.
+fn wait_for_teardown_record(daemon: &Fixture, patience: Duration) {
+    let deadline = std::time::Instant::now() + patience;
+    loop {
+        let records = leases_json(daemon);
+        if records.iter().any(|r| r["killing"] == true) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no teardown was recorded within {patience:?}; records were {records:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The `Done` task's start and end as pueued recorded them.
+fn span(
+    status: &Option<TaskStatus>,
+) -> (
+    chrono::DateTime<chrono::Local>,
+    chrono::DateTime<chrono::Local>,
+) {
+    match status {
+        Some(TaskStatus::Done { start, end, .. }) => (*start, *end),
+        other => panic!("expected a Done task, got {other:?}"),
+    }
+}
+
+/// Table row "client disconnects while running", interrupted by "bzbd dies":
+/// a task that ignores SIGTERM is still on the machine, tokens and all, when
+/// the daemon is killed inside the grace period. The teardown is on record,
+/// so the restarted daemon finishes it — SIGKILL, tokens back, record gone —
+/// and only then admits the next lease, rather than running the two side by
+/// side.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_restarted_daemon_finishes_the_teardown_it_was_killed_in() {
+    let Some(pueued) = PueuedFixture::try_start() else {
+        return;
+    };
+    let mut daemon = pool_of_four(&pueued.config_path);
+    // `trap` makes the shell ignore SIGTERM, and `sleep` inherits that.
+    let (conn, _, survivor) = run(&daemon, request(&["sh", "-c", "trap '' TERM; sleep 5"])).await;
+
+    // The client hangs up; the daemon sends SIGTERM and waits for pueued to
+    // confirm the task gone, which it will not for another second.
+    drop(conn);
+    wait_for_teardown_record(&daemon, Duration::from_secs(2));
+    daemon.kill();
+    assert!(
+        matches!(
+            task_status(&pueued.config_path, survivor).await,
+            Some(TaskStatus::Running { .. })
+        ),
+        "the task did not survive SIGTERM"
+    );
+    // A daemon with the drain (#8) would have recorded the tokens the task
+    // holds; see the module comment.
+    stage_record(&daemon, |record| {
+        record["class"] = Value::from("static");
+        record["cores_held"] = Value::from(2);
+    });
+    daemon.restart();
+
+    assert_eq!(
+        fifo_tokens(&daemon.fifo_path()),
+        2,
+        "the new pool was seeded as if the task were gone"
+    );
+    let (mut conn, _, next) = run(&daemon, request(&["sh", "-c", "exit 0"])).await;
+    assert!(matches!(
+        event(&mut conn).await,
+        LeaseEvent::Finished { exit_code: 0, .. }
+    ));
+
+    let (_, survivor_ended) = span(&task_status(&pueued.config_path, survivor).await);
+    let (next_started, _) = span(&task_status(&pueued.config_path, next).await);
+    assert!(
+        survivor_ended <= next_started,
+        "the next task started at {next_started} while the survivor ran until {survivor_ended}"
+    );
+    assert_eq!(fifo_tokens(&daemon.fifo_path()), 4);
+    assert!(
+        leases_json(&daemon).is_empty(),
+        "leases.json still holds {:?}",
+        leases_json(&daemon)
+    );
+}
+
 /// Table row "pueued dies": the lease is lost rather than left waiting for a
 /// completion that cannot arrive, its client is told why and exits non-zero,
 /// the tokens go back, and the next submission brings pueued back.
