@@ -102,6 +102,14 @@ reactions:
     max_retries: 2
     escalation: label
     escalation_label: needs-human
+  # A PR that becomes unmergeable (main moved under it) gets one rebase turn
+  # per conflicting head; auto_merge defers while conflicted.
+  merge_conflicts:
+    provider: github
+    max_retries: 2
+    escalation: label
+    escalation_label: needs-human
+    poll_interval_ms: 60000
   merge_completion:
     provider: github
     target_state: sortie:done
@@ -202,6 +210,19 @@ stopped. If a PR already exists, push to the same branch.
 {{ range .review_comments }}- {{ .reviewer }}{{ if .file }} on `{{ .file }}`{{ if .start_line }}:{{ .start_line }}{{ end }}{{ end }}: {{ .body }}
 {{ end }}
 Address every point, push, and reply on the PR with what changed.
+{{ end }}
+{{ if .merge_conflict }}
+
+### Merge conflict to resolve
+
+PR #{{ .merge_conflict.pr_number }} (branch `{{ .merge_conflict.branch }}`, head
+`{{ .merge_conflict.head_sha }}`) no longer merges into `{{ .merge_conflict.base }}`.
+Rebase the branch onto the current `origin/{{ .merge_conflict.base }}`
+(`git fetch origin && git rebase origin/{{ .merge_conflict.base }}`), resolve every
+conflict so the result still satisfies the issue's acceptance criteria and the
+spec, rerun the full test suite, and `git push --force-with-lease`. Do not merge
+`{{ .merge_conflict.base }}` into the branch; history must stay linear for the
+squash merge. Keep the PR's scope unchanged.
 {{ end }}
 {{ if .bot_review_comments }}
 
