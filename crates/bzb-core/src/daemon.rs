@@ -518,17 +518,18 @@ mod tests {
     /// a daemon that had nothing to do with it.
     #[tokio::test]
     async fn a_broken_bzbd_connection_names_bzbd() {
-        let (ours, theirs) = UnixStream::pair().unwrap();
-        drop(theirs);
-        let (reader, outgoing) = ours.into_split();
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        let (reader, mut outgoing) = ours.into_split();
+        // Shutting our own end down for writing is the one way to make the
+        // next write fail on every platform: POSIX specifies `EPIPE` for it.
+        // How long writes keep succeeding to a socket whose *peer* is gone is
+        // up to the kernel's buffering, and the two CI platforms disagree.
+        outgoing.shutdown().await.unwrap();
         let mut conn = Connection {
             incoming: BufReader::new(reader),
             outgoing,
         };
 
-        // The first write can still land in the socket buffer; the second
-        // cannot, the peer's end of the pair is gone.
-        let _ = conn.send(Request::Ping).await;
         let error = conn.send(Request::Ping).await;
         let Err(BusybeeError::DaemonUnreachable { context }) = error else {
             panic!("expected a write to a closed bzbd socket to name bzbd, got {error:?}");
