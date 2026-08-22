@@ -30,18 +30,20 @@ const WIDTHS: [Constraint; 7] = [
     Constraint::Min(0),
 ];
 
-/// `WIDTHS` with the three columns whose content the monitor does not bound
+/// `WIDTHS` with the four columns whose content the monitor does not bound
 /// widened to what is actually on screen: bzbd's lease counter climbs for as
-/// long as the daemon lives, a lease runs for as long as its command does, and
-/// the tool is the basename of whatever the caller wrapped. A clipped id is one
-/// the operator would pass to `busybee cancel` wrong, a clipped duration is a
-/// different duration rather than a shorter one, and a clipped tool no longer
-/// names what is holding the pool.
+/// long as the daemon lives, a lease runs for as long as its command does, the
+/// tool is the basename of whatever the caller wrapped, and the token count is
+/// as large as the pool. A clipped id is one the operator would pass to
+/// `busybee cancel` wrong, a clipped duration is a different duration rather
+/// than a shorter one, a clipped tool no longer names what is holding the pool,
+/// and a clipped count is a smaller share of it.
 fn widths(leases: &[&LeaseView]) -> [Constraint; 7] {
     let mut widths = WIDTHS;
     widths[0] = fit(leases, 5, id);
     widths[2] = fit(leases, 7, |lease| elapsed(lease.elapsed_ms));
     widths[3] = fit(leases, 12, |lease| printable(&lease.tool));
+    widths[5] = fit(leases, 11, cores);
     widths
 }
 
@@ -282,6 +284,20 @@ mod tests {
         let lines = draw(&leases, 90, 1);
 
         assert!(lines[0].contains("1000m00s"), "row was {:?}", lines[0]);
+    }
+
+    /// The pool is as wide as the jobserver lets it be, so a lease can hold a
+    /// four-digit count: `holding 4096` clipped to `holding 409` reads as a
+    /// tenth of the pool rather than all of it.
+    #[test]
+    fn a_token_count_wider_than_the_column_widens_it() {
+        let mut leases = vec![lease(1, "running", "static")];
+        leases[0].cores = 4096;
+
+        let lines = draw(&leases, 90, 1);
+
+        assert!(lines[0].contains("holding 4096"), "row was {:?}", lines[0]);
+        assert!(lines[0].contains("lease 1"), "row was {:?}", lines[0]);
     }
 
     /// The queue is not bounded by the pool, so it can be longer than the panel
