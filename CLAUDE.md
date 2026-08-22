@@ -113,10 +113,10 @@ nix develop -c cargo test -p bzb --test smoke
   status snapshot and returns events, with no sockets or clocks inside, so it
   is testable without a daemon. New scheduling and classification logic follows
   the same shape.
-- **stdout belongs to the wrapped task.** Every message busybee emits about
-  itself goes to stderr, prefixed `busybee: `. The exception is `--detach`,
-  whose `busybee: enqueued task <id>` line is its result and so goes to stdout
-  — `crates/bzb/tests/smoke.rs` asserts that channel.
+- **stdout belongs to the wrapped task.** busybee's own messages go to stderr,
+  prefixed `busybee: `. Two commands own stdout as their result: `--detach`
+  prints `busybee: enqueued task <id>` there (`crates/bzb/tests/smoke.rs`
+  asserts that channel), and `monitor` renders its ratatui TUI to it.
 - **`exit_code.rs` is the single source of truth** for translating a task
   result into a process exit code. Do not map results anywhere else.
 
