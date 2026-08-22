@@ -107,9 +107,25 @@ impl Connection {
     /// after the connection was accepted — a dropped connection, a refused
     /// protocol version, a handshake that never arrives — is a daemon that *is*
     /// running and not answering, so it propagates.
+    ///
+    /// The handshake is bounded by [`STARTUP_TIMEOUT`]: a wedged daemon accepts
+    /// and then says nothing, and the one-shot callers of this have no deadline
+    /// of their own to fall back on.
     pub async fn connect_if_listening(socket: &Path) -> Result<Option<Self>, BusybeeError> {
         match UnixStream::connect(socket).await {
-            Ok(stream) => Self::handshake(stream).await.map(Some),
+            Ok(stream) => {
+                match tokio::time::timeout(STARTUP_TIMEOUT, Self::handshake(stream)).await {
+                    Ok(result) => result.map(Some),
+                    Err(_) => Err(BusybeeError::DaemonUnreachable {
+                        context: format!(
+                            "bzbd at {} accepted the connection but did not complete the \
+                             handshake within {} seconds",
+                            socket.display(),
+                            STARTUP_TIMEOUT.as_secs()
+                        ),
+                    }),
+                }
+            }
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
                 Ok(None)
             }
@@ -242,7 +258,9 @@ impl Events<'_> {
     }
 }
 
-/// How long `connect_or_spawn_bzbd` spends reaching a daemon, spawn included.
+/// How long a client spends reaching a handshaken daemon: the whole of
+/// `connect_or_spawn_bzbd`, spawn included, and the handshake alone when
+/// [`Connection::connect_if_listening`] is not allowed to spawn one.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Connects and handshakes, giving up at `deadline`. A daemon that accepts the
@@ -552,6 +570,29 @@ mod tests {
             panic!("a daemon that hung up mid-handshake was reported as absent");
         };
         assert!(err.to_string().contains("bzbd"), "{err}");
+    }
+
+    /// A wedged daemon accepts the connection and then says nothing. A one-shot
+    /// command has no deadline of its own, so without one here `busybee status`
+    /// would wait on the pong for as long as the daemon stays wedged.
+    ///
+    /// Time is paused: the runtime advances the clock to the timeout once every
+    /// task is blocked, so this asserts the deadline without waiting for it.
+    #[tokio::test(start_paused = true)]
+    async fn connect_if_listening_gives_up_on_a_daemon_that_never_answers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("wedged.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let _accepted = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let stalled = Connection::connect_if_listening(&socket).await.err();
+        let Some(BusybeeError::DaemonUnreachable { context }) = stalled else {
+            panic!("expected a wedged daemon to fail the handshake, got {stalled:?}");
+        };
+        assert!(context.contains("handshake"), "{context}");
     }
 
     /// A daemon that answered and refused our version is reachable: reporting
