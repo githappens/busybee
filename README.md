@@ -89,17 +89,17 @@ returns, and the task outlives the client, so `Ctrl-C` cannot reach it —
 | `xcodebuild` | static | argv `-jobs max(1, N−1)`, since `-jobs N` runs N+1 compiles; a one-token share still allows two. Your own `-jobs` is left alone, and the lease goes on holding its share, so the tool oversubscribes it |
 | `go` | static | `GOMAXPROCS=N` |
 | `ctest` | static | `CTEST_PARALLEL_LEVEL=N` |
-| `pytest` | static | `PYTEST_ADDOPTS` gains `-n N` |
+| `pytest` (+ xdist) | static | `PYTEST_ADDOPTS` gains `-n N`, which only pytest-xdist reads |
 | `docker build`, everything else | none | nothing injected — the task runs alone |
 
 **Matched, not checked.** busybee classifies on the executable name alone. The
 jobserver rows assume make ≥ 4.4, ninja ≥ 1.13 and a Make or Ninja generator
 under `cmake --build`; nothing verifies it, so an older tool is still admitted
 as jobserver, ignores the fifo and runs at its own default. Your own count wins
-too: `make -j8`, `cargo build -j8`, `cmake --build … --parallel 8` keep your
-number. busybee still points `MAKEFLAGS` at the fifo and prints a notice, but
-your flag overrides it, and a jobserver task holds no tokens either way — so
-that build runs beside the pool rather than inside it.
+too: `make -j8`, `ninja -j8`, `cargo build -j8` and `cmake --build … --parallel
+8` keep your number. busybee still points `MAKEFLAGS` at the fifo and prints a
+notice, but your flag overrides it, and a jobserver task holds no tokens either
+way — so that build runs beside the pool rather than inside it.
 
 **none** is the honest default for a command busybee cannot reason about: a
 benchmark, a render, an opaque `sh -c '…'`. It takes the whole pool and
