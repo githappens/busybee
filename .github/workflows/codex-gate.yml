@@ -56,18 +56,27 @@ jobs:
             export HEAD=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
             echo "== PR #$PR head $HEAD"
 
+            # Codex with findings: a review object pinned to the head commit.
+            # Codex with nothing to flag: no review, just an issue comment
+            # "Codex Review: Didn't find any major issues" (no commit id), so
+            # accept one dated after the head commit. A later push dismisses the
+            # gate's approval anyway (ruleset), so a stale verdict cannot carry over.
             review_id=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
               --jq '[.[] | select(.user.login==env.REVIEWER and .commit_id==env.HEAD)] | sort_by(.submitted_at) | last | .id // empty')
-            if [ -z "$review_id" ]; then
-              echo "   no Codex review for this head yet"
-              continue
+            if [ -n "$review_id" ]; then
+              findings=$(gh api "repos/$REPO/pulls/$PR/reviews/$review_id/comments" --paginate --jq 'length')
+              verdict="review $review_id"
+            else
+              export HEAD_DATE=$(gh api "repos/$REPO/commits/$HEAD" --jq .commit.committer.date)
+              clean=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                --jq '[.[] | select(.user.login==env.REVIEWER and (.body | test("Didn.t find any major issues")) and .created_at > env.HEAD_DATE)] | length')
+              if [ "$clean" -gt 0 ]; then findings=0; verdict="clean comment after $HEAD_DATE"
+              else echo "   no Codex verdict for this head yet"; continue; fi
             fi
 
-            # Any inline finding blocks; Codex only posts what it considers worth fixing.
-            findings=$(gh api "repos/$REPO/pulls/$PR/reviews/$review_id/comments" --paginate --jq 'length')
             mine=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
               --jq '[.[] | select(.user.login=="github-actions[bot]" and .commit_id==env.HEAD)] | sort_by(.submitted_at) | last | .state // empty')
-            echo "   codex review $review_id: $findings finding(s); gate so far: ${mine:-none}"
+            echo "   codex $verdict: $findings finding(s); gate so far: ${mine:-none}"
 
             if [ "$findings" -gt 0 ]; then
               [ "$mine" = "CHANGES_REQUESTED" ] && continue
@@ -77,7 +86,7 @@ jobs:
             else
               [ "$mine" = "APPROVED" ] && continue
               gh api -X POST "repos/$REPO/pulls/$PR/reviews" -f event=APPROVE -f commit_id="$HEAD" \
-                -f body="codex-gate: Codex review $review_id on $HEAD reports no findings." >/dev/null
+                -f body="codex-gate: Codex reports no findings on $HEAD ($verdict)." >/dev/null
               echo "   -> APPROVE"
             fi
           done
