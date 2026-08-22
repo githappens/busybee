@@ -47,11 +47,6 @@ use crate::{
 /// client polled at before the broker.
 const POLL: Duration = Duration::from_secs(1);
 
-/// How long a task gets to honour SIGTERM before SIGKILL follows. The
-/// escalation is the client's from before the broker, on a timer rather than
-/// on a second Ctrl-C.
-const KILL_GRACE: Duration = Duration::from_secs(1);
-
 /// The exit code a lease reports when its own client hung up: nobody is left
 /// to read it, but the code has to say the task did not finish on its own.
 const KILLED: i32 = 130;
@@ -203,6 +198,12 @@ pub struct Leases {
     params: Params,
     /// The token pool every task shares.
     jobserver: Jobserver,
+    /// How long a task gets to honour SIGTERM before SIGKILL follows. The
+    /// escalation is the client's from before the broker, on a timer rather
+    /// than on a second Ctrl-C. From the config file (`kill_grace_ms`): a
+    /// machine whose tasks shut down slowly needs longer, and the tests need
+    /// a grace they cannot race.
+    kill_grace: Duration,
     leases: BTreeMap<LeaseId, Lease>,
     next_id: u64,
     pueue: Pueue,
@@ -262,6 +263,7 @@ impl Leases {
     /// pueued confirms their task gone, and ids carry on from after theirs.
     pub fn new(
         params: Params,
+        kill_grace: Duration,
         recovered: Recovered,
         leases_path: PathBuf,
     ) -> (Self, Handle, mpsc::Receiver<Command>) {
@@ -276,6 +278,7 @@ impl Leases {
             scheduler: Scheduler::new(params),
             params,
             jobserver,
+            kill_grace,
             leases: BTreeMap::new(),
             next_id: 1,
             pueue: Pueue::default(),
@@ -301,7 +304,7 @@ impl Leases {
             actor.killing.insert(
                 task_id,
                 Kill {
-                    deadline: Instant::now() + KILL_GRACE,
+                    deadline: Instant::now() + kill_grace,
                     escalated: false,
                     record: Some(record),
                 },
@@ -696,7 +699,7 @@ impl Leases {
         self.killing.insert(
             task_id,
             Kill {
-                deadline: Instant::now() + KILL_GRACE,
+                deadline: Instant::now() + self.kill_grace,
                 escalated: false,
                 record,
             },
@@ -1275,6 +1278,10 @@ mod tests {
         max_concurrent: 4,
     };
 
+    /// The default grace; these tests drive the escalation by hand rather than
+    /// waiting on it.
+    const TEST_KILL_GRACE: Duration = Duration::from_millis(1000);
+
     /// An actor on a fresh pool in `directory`, with nothing recovered
     /// unless `recovered` says otherwise. The caller holds the umask: the
     /// actor creates a fifo and writes `leases.json`.
@@ -1286,6 +1293,7 @@ mod tests {
         let (adopted, killing, debt) = recovered(&jobserver);
         let (actor, _handle, _commands) = Leases::new(
             PARAMS,
+            TEST_KILL_GRACE,
             Recovered {
                 jobserver,
                 adopted,
@@ -1332,7 +1340,7 @@ mod tests {
         actor.killing.insert(
             9,
             Kill {
-                deadline: Instant::now() + KILL_GRACE,
+                deadline: Instant::now() + TEST_KILL_GRACE,
                 escalated: false,
                 record: None,
             },
@@ -1382,7 +1390,7 @@ mod tests {
         actor.killing.insert(
             9,
             Kill {
-                deadline: Instant::now() + KILL_GRACE,
+                deadline: Instant::now() + TEST_KILL_GRACE,
                 escalated: false,
                 record: Some(record),
             },

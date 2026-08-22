@@ -192,6 +192,7 @@ async fn serve(socket: &Path, ready: &mut Ready, config: SharedConfig) -> Result
     // The file the daemon refused to start without: the scheduler opens on the
     // pool it describes, not on a hardcoded one.
     let params = config.lock().await.params();
+    let kill_grace_ms = config.lock().await.kill_grace_ms;
     // Before the socket exists, and before the fifo: the tasks a previous
     // daemon left running are on the machine, and a lease taken now would be
     // sized as though it were idle — its persist overwriting the only record
@@ -199,7 +200,12 @@ async fn serve(socket: &Path, ready: &mut Ready, config: SharedConfig) -> Result
     // than running anything ungoverned.
     let leases_path = bzb_core::daemon::leases_path()?;
     let recovered = recovery::recover(&state_dir()?, &leases_path, params.pool_size).await?;
-    let (actor, leases, commands) = Leases::new(params, recovered, leases_path);
+    let (actor, leases, commands) = Leases::new(
+        params,
+        Duration::from_millis(kill_grace_ms),
+        recovered,
+        leases_path,
+    );
     tokio::spawn(actor.run(commands));
 
     // Nothing else can be listening: this process holds the pid-file lock.
@@ -661,7 +667,7 @@ fn open_log(log: &Path) -> Result<File> {
 pub(crate) mod tests {
     use super::*;
     use crate::{leases::Command, recovery::Recovered};
-    use bzb_core::jobserver::Jobserver;
+    use bzb_core::{config::DEFAULT_KILL_GRACE_MS, jobserver::Jobserver};
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc, MutexGuard, PoisonError,
@@ -843,6 +849,7 @@ pub(crate) mod tests {
         let params = running.lock().await.params();
         let (_actor, leases, commands) = Leases::new(
             params,
+            Duration::from_millis(DEFAULT_KILL_GRACE_MS),
             nothing_to_recover(tmp.path(), params.pool_size),
             tmp.path().join("leases.json"),
         );
@@ -886,6 +893,7 @@ pub(crate) mod tests {
         let params = running.lock().await.params();
         let (_actor, leases, mut commands) = Leases::new(
             params,
+            Duration::from_millis(DEFAULT_KILL_GRACE_MS),
             nothing_to_recover(tmp.path(), params.pool_size),
             tmp.path().join("leases.json"),
         );

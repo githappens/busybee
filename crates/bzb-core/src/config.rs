@@ -32,12 +32,17 @@ use crate::{
 pub const DEFAULT_MAX_CONCURRENT: u32 = 4;
 /// How long a static task's token drain may take, when the file does not say.
 pub const DEFAULT_DRAIN_DEADLINE_MS: u64 = 2000;
+/// How long a signalled task has to exit before SIGKILL follows, when the file
+/// does not say.
+pub const DEFAULT_KILL_GRACE_MS: u64 = 1000;
 
 /// Largest pool the fifo can hold at once — the smallest pipe capacity on
 /// macOS and Linux, which is what `jobserver::Jobserver` seeds into.
 const MAX_POOL_SIZE: u32 = 4096;
 const MIN_DRAIN_DEADLINE_MS: u64 = 100;
 const MAX_DRAIN_DEADLINE_MS: u64 = 60_000;
+const MIN_KILL_GRACE_MS: u64 = 100;
+const MAX_KILL_GRACE_MS: u64 = 60_000;
 
 /// The only substitutions the daemon performs on an injected value; see
 /// `docs/design/bzbd.md` §Classification.
@@ -50,6 +55,8 @@ pub struct Config {
     pub pool_size: u32,
     pub max_concurrent: u32,
     pub drain_deadline_ms: u64,
+    /// How long a task that was signalled has to exit before SIGKILL follows.
+    pub kill_grace_ms: u64,
     pub defaults: Defaults,
     /// Classification rows, keyed by the tool they match. Kept as written so
     /// `config show` prints the file's own spelling; [`Config::apply_overrides`]
@@ -237,6 +244,8 @@ impl Config {
             #[serde(default)]
             drain_deadline_ms: Option<Spanned<u64>>,
             #[serde(default)]
+            kill_grace_ms: Option<Spanned<u64>>,
+            #[serde(default)]
             defaults: WrittenDefaults,
             #[serde(default)]
             overrides: BTreeMap<String, Spanned<WrittenOverride>>,
@@ -269,6 +278,7 @@ impl Config {
             pool_size: written.pool_size.as_ref().map(Spanned::span),
             max_concurrent: written.max_concurrent.as_ref().map(Spanned::span),
             drain_deadline_ms: written.drain_deadline_ms.as_ref().map(Spanned::span),
+            kill_grace_ms: written.kill_grace_ms.as_ref().map(Spanned::span),
             r#static: written.defaults.r#static.as_ref().map(Spanned::span),
             overrides: written
                 .overrides
@@ -297,6 +307,9 @@ impl Config {
             drain_deadline_ms: written
                 .drain_deadline_ms
                 .map_or(DEFAULT_DRAIN_DEADLINE_MS, Spanned::into_inner),
+            kill_grace_ms: written
+                .kill_grace_ms
+                .map_or(DEFAULT_KILL_GRACE_MS, Spanned::into_inner),
             defaults: Defaults {
                 r#static: written
                     .defaults
@@ -360,6 +373,16 @@ impl Config {
                 ),
             ));
         }
+        if !(MIN_KILL_GRACE_MS..=MAX_KILL_GRACE_MS).contains(&self.kill_grace_ms) {
+            return Err(Refusal::at(
+                &spans.kill_grace_ms,
+                format!(
+                    "kill_grace_ms must be between {MIN_KILL_GRACE_MS} and \
+                     {MAX_KILL_GRACE_MS}, got {}",
+                    self.kill_grace_ms
+                ),
+            ));
+        }
         if self.defaults.r#static.cores_wanted() == Some(0) {
             return Err(Refusal::at(
                 &spans.r#static,
@@ -406,6 +429,7 @@ struct Spans {
     pool_size: Option<Range<usize>>,
     max_concurrent: Option<Range<usize>>,
     drain_deadline_ms: Option<Range<usize>>,
+    kill_grace_ms: Option<Range<usize>>,
     r#static: Option<Range<usize>>,
     /// Keyed as the file wrote them; the span covers the whole row.
     overrides: BTreeMap<String, Range<usize>>,

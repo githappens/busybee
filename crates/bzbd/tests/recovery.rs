@@ -45,6 +45,13 @@ const PATIENCE: Duration = Duration::from_secs(15);
 /// The pool every daemon here runs on, as its config file says it.
 const POOL: &str = "pool_size = 4\n";
 
+/// A pool of four whose SIGTERM grace is long enough that no test can lose a
+/// race against it. A test that kills the daemon "inside the grace" has to do
+/// so before the escalation fires; at the default second, hangup detection
+/// plus the record write plus killing the daemon can exceed it on a loaded CI
+/// runner, and the task is SIGKILLed out from under the test.
+const POOL_PATIENT_KILL: &str = "pool_size = 4\nkill_grace_ms = 30000\n";
+
 fn request(argv: &[&str]) -> LeaseRequest {
     LeaseRequest {
         argv: argv.iter().map(|a| (*a).to_string()).collect(),
@@ -62,6 +69,14 @@ fn request(argv: &[&str]) -> LeaseRequest {
 fn pool_of_four(config: &Path) -> Fixture {
     Fixture::start_with(
         Some(POOL),
+        &[("PUEUE_CONFIG_PATH", config.display().to_string())],
+    )
+}
+
+/// [`pool_of_four`] with a grace no test can race; see [`POOL_PATIENT_KILL`].
+fn pool_of_four_patient_kill(config: &Path) -> Fixture {
+    Fixture::start_with(
+        Some(POOL_PATIENT_KILL),
         &[("PUEUE_CONFIG_PATH", config.display().to_string())],
     )
 }
@@ -446,7 +461,7 @@ async fn a_restarted_daemon_finishes_the_teardown_it_was_killed_in() {
     let Some(pueued) = PueuedFixture::try_start() else {
         return;
     };
-    let mut daemon = pool_of_four(&pueued.config_path);
+    let mut daemon = pool_of_four_patient_kill(&pueued.config_path);
     // `trap` makes the shell ignore SIGTERM, and `sleep` inherits that.
     let (conn, _, survivor) = run(&daemon, request(&["sh", "-c", "trap '' TERM; sleep 5"])).await;
 
@@ -468,6 +483,10 @@ async fn a_restarted_daemon_finishes_the_teardown_it_was_killed_in() {
         record["class"] = Value::from("static");
         record["cores_held"] = Value::from(2);
     });
+    // The successor is the one that has to escalate, so it gets the ordinary
+    // grace back: the patient one above exists only so this test cannot lose
+    // the race to kill the first daemon inside it.
+    daemon.write_config(POOL);
     daemon.restart();
 
     assert_eq!(
