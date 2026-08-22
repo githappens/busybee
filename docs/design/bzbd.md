@@ -122,6 +122,13 @@ busybee: command exited 0 (elapsed 2m14s)
 
 Exit-code mapping is unchanged (`bzb-core/src/exit_code.rs`).
 
+`--detach` is the exception that owns stdout, because its lease id is the command's result and `busybee cancel <id>` is the only thing that can end the lease. It prints the lease id there, plus the pueue task id when the lease was admitted before the client returned:
+
+```
+busybee: lease 7 detached (pueue task assigned once admitted)
+busybee: lease 7 detached (pueue task 12)
+```
+
 ## Failure and recovery
 
 No silent fallbacks anywhere: if bzbd cannot create its fifo or socket it refuses to start and the client exits non-zero with the reason, rather than running the command ungoverned.
