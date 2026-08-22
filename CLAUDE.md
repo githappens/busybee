@@ -17,7 +17,7 @@ prefix single commands with `nix develop -c`:
 nix develop -c cargo build
 nix develop -c cargo test --workspace
 nix develop -c cargo clippy --workspace --all-targets -- -D warnings
-nix develop -c cargo fmt --check
+nix develop -c cargo fmt --all --check
 ```
 
 Builds and the test suite are the kind of load busybee exists to serialise, so
@@ -31,10 +31,9 @@ busybee -- cargo test --workspace
 `build/debug/` and `build/release/` rather than `target/`. Do not change that
 setting and do not commit `build/` — it is gitignored.
 
-Both gates currently fail on the tree as it stands: `cargo fmt --check` reports
-diffs in most files, and clippy reports one `items_after_test_module` error in
-`crates/bzb/src/enqueue.rs`. Format the files you touch; do not reformat the
-workspace as a side effect of an unrelated change.
+CI runs the format check, that clippy line and the test suite on Linux and
+macOS, so all three gate a merge. Format the files you touch; do not reformat
+the workspace as a side effect of an unrelated change.
 
 The dev shell gains `gnumake` and `ninja` when the jobserver work lands — add
 them to `flake.nix` in that change, not ahead of it.
