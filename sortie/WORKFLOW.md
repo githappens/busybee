@@ -57,6 +57,7 @@ agent:
   max_retry_backoff_ms: 300000
 
 claude-code:
+  model: opus
   permission_mode: dontAsk
   allowed_tools: "Bash Edit MultiEdit Write Read Glob Grep Agent TodoWrite WebFetch(domain:docs.rs) WebFetch(domain:github.com)"
   disallowed_tools: "mcp__sortie-tools__tracker_api WebSearch"
