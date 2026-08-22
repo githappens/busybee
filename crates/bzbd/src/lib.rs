@@ -9,7 +9,11 @@ use std::{
     io::{self, Read, Write},
     os::fd::{AsRawFd, FromRawFd},
     path::Path,
-    sync::Mutex,
+    sync::{
+        mpsc::{self, RecvTimeoutError, Sender},
+        Mutex,
+    },
+    time::Duration,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -35,7 +39,12 @@ pub fn run() -> Result<()> {
     // Fork before the runtime exists: a forked child inherits no threads.
     // Under `--foreground` there is no parent waiting for a report.
     let mut ready = if foreground {
-        Ready(None)
+        // Nothing to report to and nothing to watch: the caller is looking at
+        // our stderr and can stop us.
+        Ready {
+            pipe: None,
+            watchdog: None,
+        }
     } else {
         daemonize(&log)?
     };
@@ -227,22 +236,47 @@ fn lock_pid_file(path: &Path) -> Result<Option<File>> {
 /// anything else is the reason it is not.
 const SERVING: &str = "serving";
 
+/// How long a daemonized child may take to reach `report`. It holds the
+/// pid-file lock the whole time, and `setsid` has put it in its own session:
+/// the client that started it cannot reach it any more, and the forking parent
+/// it can reach may itself be killed when the client gives up. So a child that
+/// wedges during startup would keep every later daemon out of the lock
+/// forever. This bound is the child's own, and generous: a healthy startup is
+/// a lock, a runtime, two signal handlers and a bind.
+const STARTUP_WATCHDOG: Duration = Duration::from_secs(10);
+
 /// The daemonized child's end of the startup pipe. The forking parent stays
 /// alive reading it, so a failure after the fork reaches the caller's stderr
 /// instead of only `bzbd.log`.
-struct Ready(Option<File>);
+struct Ready {
+    pipe: Option<File>,
+    /// Dropped on the first report; that is what disarms the watchdog.
+    watchdog: Option<Sender<()>>,
+}
 
 impl Ready {
     /// Closing the pipe is what releases the parent, so it happens exactly
     /// once, on the first report.
     fn report(&mut self, message: &str) {
-        let Some(mut pipe) = self.0.take() else {
+        self.watchdog.take();
+        let Some(mut pipe) = self.pipe.take() else {
             return;
         };
         if let Err(err) = pipe.write_all(message.as_bytes()) {
             tracing::warn!("cannot report startup on the pipe: {err}");
         }
     }
+}
+
+/// Runs `expire` unless the returned sender is dropped within `timeout`.
+fn watchdog(timeout: Duration, expire: impl FnOnce() + Send + 'static) -> Sender<()> {
+    let (armed, disarmed) = mpsc::channel();
+    std::thread::spawn(move || {
+        if disarmed.recv_timeout(timeout) == Err(RecvTimeoutError::Timeout) {
+            expire();
+        }
+    });
+    armed
 }
 
 /// Detaches from the terminal: fork, `setsid`, and point the standard streams
@@ -268,7 +302,19 @@ fn daemonize(log: &Path) -> Result<Ready> {
     redirect(&devnull, libc::STDIN_FILENO)?;
     redirect(&log_file, libc::STDOUT_FILENO)?;
     redirect(&log_file, libc::STDERR_FILENO)?;
-    Ok(Ready(Some(writing)))
+    // Our stderr is the log by now, and exiting closes the startup pipe, so
+    // the parent reports the death too.
+    let watchdog = watchdog(STARTUP_WATCHDOG, || {
+        eprintln!(
+            "bzbd: startup did not finish within {}s; exiting so the pid-file lock is released",
+            STARTUP_WATCHDOG.as_secs()
+        );
+        std::process::exit(1);
+    });
+    Ok(Ready {
+        pipe: Some(writing),
+        watchdog: Some(watchdog),
+    })
 }
 
 fn startup_pipe() -> Result<(File, File)> {
@@ -336,6 +382,10 @@ fn open_log(log: &Path) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
 
     #[test]
     fn foreground_is_off_unless_asked_for() {
@@ -347,5 +397,45 @@ mod tests {
     fn an_unknown_argument_is_fatal() {
         let err = parse_args(["--nope".to_string()].into_iter()).unwrap_err();
         assert!(err.to_string().contains("--nope"), "message was {err}");
+    }
+
+    /// A child that wedges after taking the pid-file lock locks every later
+    /// daemon out of it, and no client can clear it: `setsid` put it in its own
+    /// session, so the process the client spawned is not even its ancestor any
+    /// more. The deadline therefore has to be the child's own.
+    #[test]
+    fn a_startup_that_never_reports_trips_the_watchdog() {
+        let tripped = Arc::new(AtomicBool::new(false));
+        let armed = watchdog(Duration::from_millis(50), {
+            let tripped = tripped.clone();
+            move || tripped.store(true, Ordering::SeqCst)
+        });
+
+        std::thread::sleep(Duration::from_millis(400));
+
+        assert!(tripped.load(Ordering::SeqCst), "the watchdog never fired");
+        drop(armed);
+    }
+
+    /// And a child that did start serving must survive: the watchdog bounds
+    /// startup, not the daemon.
+    #[test]
+    fn reporting_disarms_the_watchdog() {
+        let tripped = Arc::new(AtomicBool::new(false));
+        let mut ready = Ready {
+            pipe: None,
+            watchdog: Some(watchdog(Duration::from_millis(50), {
+                let tripped = tripped.clone();
+                move || tripped.store(true, Ordering::SeqCst)
+            })),
+        };
+
+        ready.report(SERVING);
+        std::thread::sleep(Duration::from_millis(400));
+
+        assert!(
+            !tripped.load(Ordering::SeqCst),
+            "a daemon that reported it is serving was killed anyway"
+        );
     }
 }
