@@ -14,5 +14,6 @@ pub mod exit_code;
 pub mod group;
 pub mod jobserver;
 pub mod log;
+pub mod scheduler;
 pub mod status;
 pub mod wait;
