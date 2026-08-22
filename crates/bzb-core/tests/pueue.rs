@@ -37,6 +37,33 @@ async fn connect_succeeds_when_pueued_is_running() {
     drop(client);
 }
 
+/// A blocked client reads its task's log from the pueued bzbd started that
+/// task on, so an unreachable socket means the two are pointed at different
+/// pueue configurations. Spawning a second daemon to fill the gap would answer
+/// every log request from an empty queue: the task id would simply not be
+/// there, and the client would report missing output instead of the real
+/// misconfiguration. `connect` therefore never spawns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn connect_fails_rather_than_spawning_a_second_pueued() {
+    let Some(mut p) = PueuedFixture::try_start() else {
+        return;
+    };
+    std::env::set_var("PUEUE_CONFIG_PATH", &p.config_path);
+    p.kill();
+
+    let err = client::connect()
+        .await
+        .expect_err("there is no daemon behind that socket");
+    assert!(
+        matches!(
+            err,
+            bzb_core::errors::BusybeeError::DaemonUnreachable { .. }
+        ),
+        "error was {err:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn enqueue_returns_a_task_id() {

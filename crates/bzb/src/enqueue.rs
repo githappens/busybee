@@ -5,7 +5,9 @@
 //! held open for the command's whole life and closing it is how Ctrl-C
 //! cancels. The task's own output is not on that connection: bzbd hands back
 //! the pueue task id, and the log is read straight from pueued, which is the
-//! one thing the client still talks to directly — read-only.
+//! one thing the client still talks to directly — read-only, and over the same
+//! pueue configuration the daemon used to start the task
+//! (`docs/design/bzbd.md` §Components).
 //!
 //! Everything busybee says goes to stderr; stdout carries the task's output
 //! and nothing else.
@@ -116,8 +118,15 @@ pub async fn run(
                     started_at = Some(Instant::now());
                     task = Some(Task {
                         // pueued is already up: bzbd needed it to start the
-                        // task we were just told about.
-                        pueue: client::connect_or_spawn().await?,
+                        // task we were just told about. Not being able to
+                        // reach it means this process's pueue configuration
+                        // points somewhere else, which is worth hearing —
+                        // spawning a daemon of our own would only give us an
+                        // empty queue to look the task up in.
+                        pueue: client::connect().await.context(
+                            "cannot read the task's log: bzbd started it on a pueued this \
+                             client cannot reach (check PUEUE_CONFIG_PATH)",
+                        )?,
                         id: pueue_task_id,
                         log_offset: 0,
                     });

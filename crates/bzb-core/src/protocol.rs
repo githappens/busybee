@@ -14,10 +14,18 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 use crate::classify::Class;
 
 /// Bumped whenever a change to the types below is not backwards compatible.
-/// 2 added [`LeaseView::tool`], which a version-1 daemon does not send: a
-/// client left talking to one after an in-place upgrade hears about the
-/// mismatch at the handshake instead of failing to decode its replies.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// The handshake matches it exactly, so a bump is what stops a client and a
+/// daemon from different builds — one of which is still installed while the
+/// other has just been upgraded — from half-understanding each other.
+///
+/// 2: [`LeaseView::tool`], which a version-1 daemon does not send, so a client
+/// left talking to one hears about the mismatch at the handshake instead of
+/// failing to decode its replies.
+///
+/// 3: [`LeaseRequest::detached`]. Neither direction survives the mismatch: a
+/// v2 client's `Submit` no longer decodes, and a v2 daemon ignores the field
+/// and kills a `--detach`ed lease the moment the client leaves.
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The longest line either end will read. Anyone who can open the socket could
 /// otherwise stream a newline-free message until the long-lived daemon runs out

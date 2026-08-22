@@ -259,6 +259,8 @@ impl Leases {
         // Classification arrives with the injection work; until then every
         // task is exclusive, which is what busybee did before the broker.
         let class = Class::None;
+        let unhonoured_override =
+            request.class_override.is_some() || request.cores_wanted.is_some();
         let lease = Lease {
             request,
             conn: events,
@@ -283,6 +285,19 @@ impl Leases {
             return;
         }
         self.send(id, LeaseEvent::Queued { id: id.0, ahead });
+        // An override the daemon cannot act on yet is said out loud: accepting
+        // one and running the task exclusive anyway would tell the caller their
+        // scheduling choice took effect when it did not.
+        if unhonoured_override {
+            self.send(
+                id,
+                LeaseEvent::Notice {
+                    text: "--class/--cores are not in effect yet (the injection work is #8); \
+                           this task runs exclusive"
+                        .into(),
+                },
+            );
+        }
 
         let actions = self.scheduler.handle(Event::Submit(spec));
         // The machine's own notification for this lease would repeat the
