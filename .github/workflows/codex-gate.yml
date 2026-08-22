@@ -96,17 +96,12 @@ jobs:
               echo "PR #$PR: Codex activity at $latest, last verdict ${gate_at:-none} -> judge"
               picked+=("$PR")
             elif [ -z "$latest" ]; then
-              # No Codex signal for this head. After 10 minutes, ask once per head;
-              # the manual trigger yields an explicit verdict comment.
-              nudged=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-                --jq '[.[] | select(.user.login==env.GATE and (.body | contains("codex-gate nudge " + env.HEAD)))] | length')
-              if [ "$age" -gt 600 ] && [ "$nudged" -eq 0 ]; then
-                gh api -X POST "repos/$REPO/issues/$PR/comments" \
-                  -f body="$(printf '@codex review\n\n<!-- codex-gate nudge %s: no automated review seen for this head after %s minutes -->' "$HEAD" "$((age/60))")" >/dev/null
-                echo "PR #$PR: no Codex signal for $HEAD after $((age/60)) min -> asked @codex review"
-              else
-                echo "PR #$PR: waiting for Codex (head ${age}s old, nudged=$nudged)"
-              fi
+              # No Codex signal for this head; wait for one. The gate cannot ask
+              # for a review itself: Codex only answers a mention from an account
+              # linked to it, and refuses one from github-actions[bot] with "create
+              # a Codex account and connect to github". The author's own agent asks
+              # when it needs to (sortie/WORKFLOW.md), posting as a linked user.
+              echo "PR #$PR: waiting for Codex (head ${age}s old)"
             else
               echo "PR #$PR: nothing new (codex $latest, verdict ${gate_at:-none})"
             fi
