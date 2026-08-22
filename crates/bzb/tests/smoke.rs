@@ -1,7 +1,5 @@
-mod common;
-
 use assert_cmd::Command as AssertCmd;
-use common::pueued::PueuedFixture;
+use bzb_test_support::PueuedFixture;
 
 #[test]
 fn pueued_fixture_starts_and_stops() {
@@ -67,6 +65,7 @@ async fn enqueue_returns_a_task_id() {
         cwd: std::env::current_dir().unwrap(),
         env: Default::default(),
         label: Some("smoke".into()),
+        start_immediately: false,
     };
     // Fresh isolated daemon: first task always gets id 0.
     let id = enqueue(&mut client, spec).await.unwrap();
@@ -112,6 +111,7 @@ async fn log_chunk_accumulates_across_polls() {
             cwd: std::env::current_dir().unwrap(),
             env: Default::default(),
             label: None,
+            start_immediately: false,
         },
     )
     .await
@@ -157,6 +157,7 @@ async fn log_chunk_returns_plaintext_for_repetitive_output() {
             cwd: std::env::current_dir().unwrap(),
             env: Default::default(),
             label: None,
+            start_immediately: false,
         },
     )
     .await

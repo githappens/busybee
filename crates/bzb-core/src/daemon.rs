@@ -70,6 +70,12 @@ pub fn log_path() -> Result<PathBuf, BusybeeError> {
     Ok(state_dir()?.join("bzbd.log"))
 }
 
+/// The leases bzbd is holding, as of its last change. Written by the daemon on
+/// every change and read back by a daemon that restarted.
+pub fn leases_path() -> Result<PathBuf, BusybeeError> {
+    Ok(state_dir()?.join("leases.json"))
+}
+
 /// An open, handshaken connection to `bzbd`.
 pub struct Connection {
     incoming: BufReader<OwnedReadHalf>,

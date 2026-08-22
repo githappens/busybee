@@ -177,6 +177,7 @@ dependencies = [
  "anyhow",
  "assert_cmd",
  "bzb-core",
+ "bzb-test-support",
  "clap",
  "crossterm",
  "futures",
@@ -195,11 +196,13 @@ name = "bzb-core"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bzb-test-support",
  "chrono",
  "libc",
  "pueue-lib",
  "serde",
  "serde_json",
+ "serial_test",
  "snap",
  "tempfile",
  "thiserror 1.0.69",
@@ -208,12 +211,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "bzb-test-support"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "which",
+]
+
+[[package]]
 name = "bzbd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bzb-core",
+ "bzb-test-support",
+ "chrono",
  "libc",
+ "pueue-lib",
+ "serde",
  "serde_json",
  "serial_test",
  "tempfile",

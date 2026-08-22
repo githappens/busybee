@@ -1,0 +1,12 @@
+[package]
+name = "bzb-test-support"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Test fixtures shared by the busybee crates: an isolated pueued in a temp directory."
+publish = false
+
+[dependencies]
+tempfile = "3"
+which = "6"

@@ -35,6 +35,7 @@ mach2 = "0.4"
 libc = "0.2"
 
 [dev-dependencies]
+bzb-test-support = { path = "../bzb-test-support" }
 tempfile = "3"
 assert_cmd = "2"
 which = "6"

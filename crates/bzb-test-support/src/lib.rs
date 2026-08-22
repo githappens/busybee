@@ -1,3 +1,8 @@
+//! Fixtures shared by the busybee crates' integration tests.
+//!
+//! Everything here spawns its own daemon in a temporary directory: a test must
+//! never reach the developer's own `pueued` or its `busybee` group.
+
 use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -78,20 +83,32 @@ impl PueuedFixture {
             socket_path.display()
         );
     }
-}
 
-/// A program that starts and exits without ever binding the socket is a broken
-/// fixture, not a reason to skip: `start_program` must panic, never return
-/// `None`. `true` stands in for such a daemon.
-#[test]
-#[should_panic(expected = "did not create")]
-fn start_program_panics_when_the_daemon_never_binds() {
-    PueuedFixture::start_program("true", Duration::from_millis(200));
+    /// Kills the daemon now, for a test about what happens when pueued dies.
+    /// Idempotent: `Drop` kills it again and does not mind.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for PueuedFixture {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A program that starts and exits without ever binding the socket is a
+    /// broken fixture, not a reason to skip: `start_program` must panic, never
+    /// return `None`. `true` stands in for such a daemon.
+    #[test]
+    #[should_panic(expected = "did not create")]
+    fn start_program_panics_when_the_daemon_never_binds() {
+        PueuedFixture::start_program("true", Duration::from_millis(200));
     }
 }
