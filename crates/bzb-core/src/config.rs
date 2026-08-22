@@ -230,7 +230,19 @@ impl Config {
             #[serde(default)]
             defaults: WrittenDefaults,
             #[serde(default)]
-            overrides: BTreeMap<String, Spanned<Override>>,
+            overrides: BTreeMap<String, Spanned<WrittenOverride>>,
+        }
+
+        /// [`Override`] as written. Its `env` values keep their own spans:
+        /// written as an expanded `[overrides.<tool>.env]` table an assignment
+        /// sits well below the row header, so the row's span would name a line
+        /// the reader has to search from rather than the one to fix.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct WrittenOverride {
+            class: Class,
+            #[serde(default)]
+            env: BTreeMap<String, Spanned<String>>,
         }
 
         /// [`Defaults`] as written. Separate because [`Defaults`] is what the
@@ -254,6 +266,16 @@ impl Config {
                 .iter()
                 .map(|(key, row)| (key.clone(), row.span()))
                 .collect(),
+            env: written
+                .overrides
+                .iter()
+                .flat_map(|(key, row)| {
+                    row.as_ref()
+                        .env
+                        .iter()
+                        .map(move |(name, value)| ((key.clone(), name.clone()), value.span()))
+                })
+                .collect(),
         };
         let config = Config {
             pool_size: match written.pool_size {
@@ -275,7 +297,20 @@ impl Config {
             overrides: written
                 .overrides
                 .into_iter()
-                .map(|(key, row)| (key, row.into_inner()))
+                .map(|(key, row)| {
+                    let row = row.into_inner();
+                    (
+                        key,
+                        Override {
+                            class: row.class,
+                            env: row
+                                .env
+                                .into_iter()
+                                .map(|(name, value)| (name, value.into_inner()))
+                                .collect(),
+                        },
+                    )
+                })
                 .collect(),
         };
         config.validate(&spans).map_err(|refusal| {
@@ -340,7 +375,14 @@ impl Config {
             }
             for (name, value) in &over.env {
                 check_placeholders(value).map_err(|reason| {
-                    Refusal::at(&row, format!("overrides.{key}.env.{name}: {reason}"))
+                    // The assignment's own line, falling back to the row's for
+                    // a config that was not parsed from a file at all.
+                    let at = spans
+                        .env
+                        .get(&(key.clone(), name.clone()))
+                        .cloned()
+                        .or_else(|| row.clone());
+                    Refusal::at(&at, format!("overrides.{key}.env.{name}: {reason}"))
                 })?;
             }
         }
@@ -356,9 +398,12 @@ struct Spans {
     max_concurrent: Option<Range<usize>>,
     drain_deadline_ms: Option<Range<usize>>,
     r#static: Option<Range<usize>>,
-    /// Keyed as the file wrote them; the span covers the whole row, which is
-    /// also where that row's `env` values are.
+    /// Keyed as the file wrote them; the span covers the whole row.
     overrides: BTreeMap<String, Range<usize>>,
+    /// Each `env` value's own span, keyed by (override key, variable name).
+    /// Separate from the row's because an expanded `[overrides.<tool>.env]`
+    /// table puts the assignment lines away from the row header.
+    env: BTreeMap<(String, String), Range<usize>>,
 }
 
 /// Why a file was refused, and where in it to look.
@@ -599,6 +644,22 @@ static = "fair"
             "message was {message:?}"
         );
         assert!(message.contains("line 3"), "message was {message:?}");
+    }
+
+    /// Written as an expanded table, an `env` value sits lines below the row
+    /// header. The line to fix is the assignment's own, not the row's.
+    #[test]
+    fn an_expanded_env_table_is_refused_at_the_offending_assignment() {
+        let message = error(
+            "[overrides.mytool]\nclass = \"static\"\n\n\
+             [overrides.mytool.env]\nGOOD = \"{cores}\"\nBAD = \"{threads}\"\n",
+        );
+
+        assert!(
+            message.contains("overrides.mytool.env.BAD"),
+            "message was {message:?}"
+        );
+        assert!(message.contains("line 6"), "message was {message:?}");
     }
 
     #[test]
