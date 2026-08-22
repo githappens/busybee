@@ -38,6 +38,9 @@ and runs inside `nix develop` so agents inherit cargo, pueued, make and ninja.
 First launch after a long gap: set `agent.max_concurrent_agents: 1` in
 `WORKFLOW.md`, watch one issue reach a PR, then raise it. That key hot-reloads.
 
+Watch a session read-only: `sortie/peek.sh <issue>` (last events from the agent's
+transcript plus the workspace's git state; `-f` follows).
+
 Dashboard: http://127.0.0.1:7678 (local only). Metrics: `/metrics` on the same
 port. Run history and cost: `sortie stats --since 24h` (reads `build/sortie.db`).
 
