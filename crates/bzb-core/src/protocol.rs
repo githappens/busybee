@@ -149,6 +149,10 @@ pub struct StatusReply {
 pub struct LeaseView {
     pub id: u64,
     pub label: String,
+    /// Basename of the tool [`crate::classify`] recognised, which is what
+    /// decided the class. Separate from `label`, which is the caller's
+    /// `--name` when there is one.
+    pub tool: String,
     pub class: String,
     pub cores: u32,
     pub state: String,
