@@ -73,9 +73,20 @@ jobs:
             codex_at=$(jq -r '[.[] | select(.user.login==env.REVIEWER and .commit_id==env.HEAD) | .submitted_at] | max // empty' <<<"$reviews")
             comment_at=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
               --jq '[.[] | select(.user.login==env.REVIEWER and .created_at > env.HEAD_DATE) | .created_at] | max // empty')
-            # 👀 only means "reviewing"; it is not a verdict, so it does not count as activity.
-            reaction_at=$(gh api "repos/$REPO/issues/$PR/reactions" --paginate \
-              --jq '[.[] | select(.user.login==env.REVIEWER and .content != "eyes" and .created_at > env.HEAD_DATE) | .created_at] | max // empty')
+            # Reactions and comments are not pinned to a commit: a clean verdict for
+            # the previous push can arrive after the next push. Count them only once
+            # the head is old enough for any in-flight review to have finished and
+            # Codex shows no 👀 (it keeps 👀 while reviewing). Findings-reviews are
+            # pinned to the head and count immediately.
+            reactions=$(gh api "repos/$REPO/issues/$PR/reactions" --paginate)
+            eyes=$(jq '[.[] | select(.user.login==env.REVIEWER and .content=="eyes")] | length' <<<"$reactions")
+            age=$(( $(date +%s) - $(date -d "$HEAD_DATE" +%s) ))
+            reaction_at=""
+            if [ "$eyes" -eq 0 ] && [ "$age" -ge 480 ]; then
+              reaction_at=$(jq -r '[.[] | select(.user.login==env.REVIEWER and .content != "eyes" and .created_at > env.HEAD_DATE) | .created_at] | max // empty' <<<"$reactions")
+            else
+              comment_at=""
+            fi
             latest=$(printf '%s\n%s\n%s\n' "$codex_at" "$comment_at" "$reaction_at" | sort | tail -1)
             gate_at=$(jq -r '[.[] | select(.user.login==env.GATE and .commit_id==env.HEAD) | .submitted_at] | max // empty' <<<"$reviews")
             if [ -n "$latest" ] && { [ -z "$gate_at" ] || [[ "$latest" > "$gate_at" ]]; }; then
@@ -84,7 +95,6 @@ jobs:
             elif [ -z "$latest" ]; then
               # No Codex signal for this head. After 10 minutes, ask once per head;
               # the manual trigger yields an explicit verdict comment.
-              age=$(( $(date +%s) - $(date -d "$HEAD_DATE" +%s) ))
               nudged=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
                 --jq '[.[] | select(.user.login==env.GATE and (.body | contains("codex-gate nudge " + env.HEAD)))] | length')
               if [ "$age" -gt 600 ] && [ "$nudged" -eq 0 ]; then
@@ -139,7 +149,9 @@ jobs:
             gh api "repos/$REPO/issues/$PR/comments" --paginate \
               --jq '[.[] | select(.created_at > env.HEAD_DATE)] | sort_by(.created_at) | .[] | "\n- [\(.created_at)] \(.user.login):\n  \(.body | gsub("\n"; "\n  "))"'
             echo
-            echo "## Reactions on the PR (a 👍 from Codex after the head commit is its automatic clean verdict)"
+            echo "## Head age: $(( ( $(date +%s) - $(date -d "$HEAD_DATE" +%s) ) / 60 )) minutes since the head commit"
+            echo
+            echo "## Reactions on the PR (👍 from Codex after the head commit = automatic clean verdict; 👀 = a review is still running)"
             gh api "repos/$REPO/issues/$PR/reactions" --paginate \
               --jq '.[] | "- [\(.created_at)] \(.user.login): \(.content)\(if .created_at > env.HEAD_DATE then "  (after head commit)" else "  (BEFORE head commit — stale)" end)"'
             echo
@@ -182,7 +194,10 @@ jobs:
             - APPROVE only when Codex's latest signal for THIS head is clean: a 👍
               reaction or a "no major issues" comment dated after the head commit, or a
               review on this head with zero inline findings — and no later Codex review
-              on this head carries findings.
+              on this head carries findings. Reactions and comments are not pinned to
+              a commit: if a Codex 👀 reaction is present, or the head commit is less
+              than 8 minutes old, a review may still be running for this head and an
+              earlier clean signal may belong to a previous push — answer UNSURE.
             - REQUEST_CHANGES when Codex's latest review on this head has one or more
               inline findings. Replies or rebuttals by the PR author do NOT lift a block:
               the author must fix or justify and push, and Codex's re-review of the new
