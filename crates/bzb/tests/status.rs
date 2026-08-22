@@ -3,9 +3,9 @@
 //! points the client at it with `BUSYBEE_STATE_DIR`.
 //!
 //! One test runs the real daemon, which is what proves the command works
-//! against what it talks to in production. The rest use a stand-in, because a
-//! daemon with no scheduler admits nothing and so cannot produce the leases the
-//! table is made of.
+//! against what it talks to in production. The rest use a stand-in: the daemon
+//! gives every lease `Class::None` until the classification work lands, so it
+//! cannot yet produce the static and jobserver rows the table is made of.
 
 use std::{
     io::BufRead,
@@ -237,8 +237,8 @@ async fn the_json_output_is_the_status_reply_the_daemon_sent() {
 }
 
 /// The stand-in above covers the rendering; this covers the wiring, against the
-/// daemon the command actually talks to. A daemon with no scheduler admits
-/// nothing, so it holds no leases and the pool it reports is whole and free.
+/// daemon the command actually talks to. Nothing has been submitted to it, so
+/// it holds no leases and the pool it reports is whole and free.
 #[tokio::test]
 async fn the_real_daemon_answers_the_status_request() {
     let daemon = RealBzbd::start();

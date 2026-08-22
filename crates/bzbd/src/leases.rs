@@ -20,7 +20,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use bzb_core::{
-    classify::Class,
+    classify::{classify, default_table, Class, Overrides},
     enqueue::{shell_escape_join, TaskSpec},
     errors::BusybeeError,
     exit_code::task_result_to_exit_code,
@@ -121,6 +121,13 @@ impl Lease {
             .label
             .clone()
             .unwrap_or_else(|| shell_escape_join(&self.request.argv))
+    }
+
+    /// The tool column of `busybee status`: the basename `classify` finds under
+    /// the wrappers. Reporting only — admission still gives every lease
+    /// `Class::None` until the injection work lands.
+    fn tool(&self) -> String {
+        classify(&self.request.argv, &Overrides::default(), &default_table()).tool
     }
 }
 
@@ -609,6 +616,7 @@ impl Leases {
                 LeaseView {
                     id: id.0,
                     label: lease.map(Lease::label).unwrap_or_default(),
+                    tool: lease.map(Lease::tool).unwrap_or_default(),
                     class: class.as_str().to_string(),
                     cores,
                     state: if running { "running" } else { "queued" }.to_string(),
