@@ -1,8 +1,9 @@
 # Merge gate: turn Codex's automated review into a review decision.
 #
 # Codex (chatgpt-codex-connector[bot]) reviews every push but never approves or
-# requests changes; it posts a review with inline findings when it has
-# something to say and otherwise only an issue comment. This workflow
+# requests changes. With findings it posts a review pinned to the head commit;
+# with nothing to flag it reacts 👍 on the PR (automatic review) or posts a
+# "no major issues" comment (manual @codex review). This workflow
 #
 #   1. selects (deterministically) the open PRs where Codex has said something
 #      about the current head commit that the gate has not yet judged,
@@ -35,7 +36,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  issues: read
+  issues: write
 
 concurrency:
   group: codex-gate
@@ -72,13 +73,28 @@ jobs:
             codex_at=$(jq -r '[.[] | select(.user.login==env.REVIEWER and .commit_id==env.HEAD) | .submitted_at] | max // empty' <<<"$reviews")
             comment_at=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
               --jq '[.[] | select(.user.login==env.REVIEWER and .created_at > env.HEAD_DATE) | .created_at] | max // empty')
-            latest=$(printf '%s\n%s\n' "$codex_at" "$comment_at" | sort | tail -1)
+            reaction_at=$(gh api "repos/$REPO/issues/$PR/reactions" --paginate \
+              --jq '[.[] | select(.user.login==env.REVIEWER and .created_at > env.HEAD_DATE) | .created_at] | max // empty')
+            latest=$(printf '%s\n%s\n%s\n' "$codex_at" "$comment_at" "$reaction_at" | sort | tail -1)
             gate_at=$(jq -r '[.[] | select(.user.login==env.GATE and .commit_id==env.HEAD) | .submitted_at] | max // empty' <<<"$reviews")
             if [ -n "$latest" ] && { [ -z "$gate_at" ] || [[ "$latest" > "$gate_at" ]]; }; then
               echo "PR #$PR: Codex activity at $latest, last verdict ${gate_at:-none} -> judge"
               picked+=("$PR")
+            elif [ -z "$latest" ]; then
+              # No Codex signal for this head. After 10 minutes, ask once per head;
+              # the manual trigger yields an explicit verdict comment.
+              age=$(( $(date +%s) - $(date -d "$HEAD_DATE" +%s) ))
+              nudged=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+                --jq '[.[] | select(.user.login==env.GATE and (.body | contains("codex-gate nudge " + env.HEAD)))] | length')
+              if [ "$age" -gt 600 ] && [ "$nudged" -eq 0 ]; then
+                gh api -X POST "repos/$REPO/issues/$PR/comments" \
+                  -f body="$(printf '@codex review\n\n<!-- codex-gate nudge %s: no automated review seen for this head after %s minutes -->' "$HEAD" "$((age/60))")" >/dev/null
+                echo "PR #$PR: no Codex signal for $HEAD after $((age/60)) min -> asked @codex review"
+              else
+                echo "PR #$PR: waiting for Codex (head ${age}s old, nudged=$nudged)"
+              fi
             else
-              echo "PR #$PR: nothing new (codex ${latest:-none}, verdict ${gate_at:-none})"
+              echo "PR #$PR: nothing new (codex $latest, verdict ${gate_at:-none})"
             fi
           done
           printf 'prs=%s\n' "$(printf '%s\n' "${picked[@]:-}" | grep -v '^$' | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
@@ -122,6 +138,10 @@ jobs:
             gh api "repos/$REPO/issues/$PR/comments" --paginate \
               --jq '[.[] | select(.created_at > env.HEAD_DATE)] | sort_by(.created_at) | .[] | "\n- [\(.created_at)] \(.user.login):\n  \(.body | gsub("\n"; "\n  "))"'
             echo
+            echo "## Reactions on the PR (a 👍 from Codex after the head commit is its automatic clean verdict)"
+            gh api "repos/$REPO/issues/$PR/reactions" --paginate \
+              --jq '.[] | "- [\(.created_at)] \(.user.login): \(.content)\(if .created_at > env.HEAD_DATE then "  (after head commit)" else "  (BEFORE head commit — stale)" end)"'
+            echo
             echo "## Previous gate verdicts on this head"
             gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
               --jq '[.[] | select(.user.login==env.GATE and .commit_id==env.HEAD)] | .[] | "- \(.submitted_at) \(.state): \(.body)"'
@@ -148,15 +168,17 @@ jobs:
             How the automated reviewer (Codex, login chatgpt-codex-connector[bot]) behaves:
             it reviews every push. When it has findings it submits a review pinned to
             the head commit with inline comments, each usually carrying a priority
-            badge (P0/P1/P2). When it has nothing to flag it submits no review and
-            instead posts an issue comment saying, in some wording, that it found no
-            major issues. Wording and formatting may vary between versions; judge the
-            meaning, not the exact text.
+            badge (P0/P1/P2). When it has nothing to flag it submits no review; an
+            automatic review then leaves a 👍 reaction on the PR, and a manually
+            requested review posts an issue comment saying, in some wording, that it
+            found no major issues. Only signals dated after the head commit count.
+            Wording and formatting may vary between versions; judge the meaning.
 
             Decision rules:
-            - APPROVE only when Codex's latest signal for THIS head is clean: either an
-              issue comment after the head commit saying it found nothing, or a review
-              on this head with zero inline findings.
+            - APPROVE only when Codex's latest signal for THIS head is clean: a 👍
+              reaction or a "no major issues" comment dated after the head commit, or a
+              review on this head with zero inline findings — and no later Codex review
+              on this head carries findings.
             - REQUEST_CHANGES when Codex's latest review on this head has one or more
               inline findings. Replies or rebuttals by the PR author do NOT lift a block:
               the author must fix or justify and push, and Codex's re-review of the new
