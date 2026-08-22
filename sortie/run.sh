@@ -39,4 +39,15 @@ fi
 
 cd "$REPO_ROOT"
 mkdir -p build/sortie-workspaces
-exec nix develop -c sortie --port "$PORT" "$@" "$WORKFLOW"
+
+# Sidecar: release dependents whose blockers have merged (sortie 1.21 does not
+# gate on blocked-by itself; see sortie/unblock.sh). Skipped for --dry-run.
+unblock_pid=""
+case " $* " in *" --dry-run "*) ;; *)
+  ( while sleep 60; do "$REPO_ROOT/sortie/unblock.sh" 2>/dev/null | sed 's/^/unblock: /'; done ) &
+  unblock_pid=$!
+  trap '[ -n "$unblock_pid" ] && kill "$unblock_pid" 2>/dev/null' EXIT
+  ;;
+esac
+
+nix develop -c sortie --port "$PORT" "$@" "$WORKFLOW"

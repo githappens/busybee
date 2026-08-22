@@ -60,7 +60,7 @@ not honour them** (its GitHub adapter only loads blockers for single-issue
 fetches, not for the candidate list), so the `sortie` marker label is the
 readiness gate: blocked issues carry `sortie:ready` for the board but no
 marker, and `sortie/unblock.sh` adds the marker once every blocker is closed.
-Run it from a loop (or after each merge). Ordering is by creation date.
+`run.sh` runs it every 60 s as a sidecar; it can also be run by hand after a merge. Ordering is by creation date.
 
 The board (Projects → "busybee · bzbd", Kanban view) mirrors these labels through
 `.github/workflows/project-sync.yml`, using the `PROJECT_TOKEN` secret.
