@@ -325,9 +325,23 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
     apply_injection(&mut plan, inject, user_flag.is_some());
     // A row's own variables ride along with whichever recipe it kept: they are
     // core counts and tool-specific knobs, so they stay useful under a forced
-    // class the way an injected `GOMAXPROCS` does.
+    // class the way an injected `GOMAXPROCS` does. What they may not do is
+    // take a variable the recipe already set: `MAKEFLAGS` is how a jobserver
+    // task reaches the fifo, and a row that replaced it would keep the class
+    // that reserves no tokens while running outside the pool. The recipe wins,
+    // and the dropped value is named.
     if let Some(rule) = rule {
-        plan.env_set.extend(rule.env_set.iter().cloned());
+        for (name, value) in &rule.env_set {
+            if plan.env_set.iter().any(|(set, _)| set == name) {
+                plan.notices.push(format!(
+                    "the {} row for {} sets {name}; busybee's own value takes precedence",
+                    class.as_str(),
+                    plan.tool
+                ));
+                continue;
+            }
+            plan.env_set.push((name.clone(), value.clone()));
+        }
     }
 
     match (class, overrides.cores) {
@@ -678,6 +692,41 @@ mod tests {
         assert!(!flag_matches("--jobs", "--jobs8"));
         assert!(flag_matches("--jobs", "--jobs=8"));
         assert!(!flag_matches("--jobs", "--jobs="));
+    }
+
+    /// `--class jobserver` reaches the fifo injection the same way a
+    /// jobserver row does, so a row's own variables cannot take `MAKEFLAGS`
+    /// from under it there either.
+    #[test]
+    fn a_forced_jobserver_class_keeps_the_authentication_over_a_rows_own_env() {
+        let table = Table {
+            rows: vec![Rule {
+                tool: "mytool".to_string(),
+                requires: None,
+                class: Class::Static,
+                inject: Inject::None,
+                parallel_flags: Vec::new(),
+                env_set: vec![("MAKEFLAGS".to_string(), "-j16".to_string())],
+            }],
+        };
+        let overrides = Overrides {
+            class: Some(Class::Jobserver),
+            cores: None,
+        };
+
+        let plan = classify(&["mytool".to_string()], &overrides, &table);
+
+        assert_eq!(
+            plan.env_set
+                .iter()
+                .filter(|(k, _)| k == "MAKEFLAGS")
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>(),
+            vec![JOBSERVER_AUTH],
+            "env_set was {:?}",
+            plan.env_set
+        );
+        assert!(plan.notices.iter().any(|n| n.contains("MAKEFLAGS")));
     }
 
     #[test]

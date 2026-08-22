@@ -183,7 +183,11 @@ An override key is matched on the tool's basename, the same string
 replaces every built-in row for that tool — class, injection and mode gate
 together — and a row forced to `jobserver` gets `MAKEFLAGS` even though the
 file cannot ask for it, which is what makes `--class jobserver`'s escape hatch
-available to a config file too.
+available to a config file too. A row's `env` is layered on top of that
+injection and never replaces it: `MAKEFLAGS` on a jobserver row is the fifo the
+task is accounted through, so busybee's value stays and the row's is dropped
+with a notice rather than leaving a task that reserves no tokens running
+outside the pool.
 
 Reload is SIGHUP or `busybee config reload`, which is the same reload over the
 socket so the client can report a refusal instead of leaving it in the log. New

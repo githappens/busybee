@@ -693,6 +693,41 @@ static = "fair"
         );
     }
 
+    /// A jobserver row's `MAKEFLAGS` is how the task reaches the fifo, so it is
+    /// also how the task gets accounted. A row's own `env` may not take that
+    /// key from under it: the task would keep the class that reserves no
+    /// tokens and lose the pool that bounds it.
+    #[test]
+    fn override_env_cannot_take_the_jobserver_authentication() {
+        let config = load(
+            "[overrides]\nmytool = { class = \"jobserver\", env = { MAKEFLAGS = \"-j16\" } }\n",
+        )
+        .expect("parse");
+        let mut table = default_table();
+        config.apply_overrides(&mut table);
+
+        let plan = classify(&["mytool".to_string()], &Overrides::default(), &table);
+
+        assert_eq!(plan.class, Class::Jobserver);
+        let makeflags: Vec<&String> = plan
+            .env_set
+            .iter()
+            .filter(|(k, _)| k == "MAKEFLAGS")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(
+            makeflags,
+            vec!["--jobserver-auth=fifo:{fifo}"],
+            "the configured value must not reach the plan at all: {:?}",
+            plan.env_set
+        );
+        assert!(
+            plan.notices.iter().any(|n| n.contains("MAKEFLAGS")),
+            "dropping a configured value has to say so: {:?}",
+            plan.notices
+        );
+    }
+
     /// `busybee config show` prints what the daemon runs with, so every key is
     /// there whether the file mentioned it or not, and what it prints has to
     /// parse back to the same thing.
