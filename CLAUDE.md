@@ -43,8 +43,7 @@ them to `flake.nix` in that change, not ahead of it.
 ```
 crates/bzb-core/   library: pueue-lib wrapper plus pure helpers
 crates/bzb/        binaries `busybee` and `bzb` (same entry point), monitor TUI
-crates/bzbd/       planned: the broker daemon; its file layout is fixed by the
-                   design document's module-layout section — follow it
+crates/bzbd/       planned: the broker daemon; module layout fixed by the spec
 ```
 
 `crates/bzb-core/src/`:
@@ -55,6 +54,7 @@ crates/bzbd/       planned: the broker daemon; its file layout is fixed by the
 | `group.rs`      | create/re-enforce the `busybee` group at `parallel_tasks = 1` |
 | `enqueue.rs`    | `TaskSpec` → pueue `AddRequest`; returns the new task id |
 | `wait.rs`       | pure state machine turning task-status polls into `WaitEvent`s |
+| `classify.rs`   | pure argv → `Plan`: admission class plus the env/argv edits |
 | `status.rs`     | `QueueSnapshot` — running/queued view of the group, plus `count_ahead` |
 | `log.rs`        | fetch and decompress a task's log from a byte offset |
 | `exit_code.rs`  | pueue `TaskResult` → process exit code |
