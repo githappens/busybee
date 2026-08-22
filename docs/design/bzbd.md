@@ -76,7 +76,7 @@ Head-of-line blocking is intentional: a `none` lease waits for the pool to be fu
 
 Operates on the argv the client received (the shell has already handled `|`, `&&`, redirects outside busybee). Steps:
 
-1. **Unwrap wrappers** until the first non-wrapper token: `nix develop [args] -c|--command`, `nix shell [args] -c`, `env [VAR=val...]`, `caffeinate [-flags]`, `nice [-n N]`. A shell string (`sh -c '...'`, `bash -lc '...'`) is opaque: class **none**.
+1. **Unwrap wrappers** until the first non-wrapper token: `nix develop [args] -c|--command`, `nix shell [args] -c`, `env [VAR=val...]`, `caffeinate [-flags]`, `nice [-n N]`. A shell string (`sh -c '...'`, `bash -lc '...'`) is opaque: class **none**. Unwrapped wrappers stay in `argv`, so an `env NAME=value` operand is applied by `env` *after* the daemon has set up the environment and wins over anything busybee injects under the same name (`env MAKEFLAGS=-j100 make`): drop that injection and emit a notice, exactly as for a user-supplied `-j`.
 2. Look up the basename of the tool:
 
 | tool | class | injection | notes |
@@ -93,11 +93,11 @@ Operates on the argv the client received (the shell has already handled `|`, `&&
 | everything else | none | — | |
 
 3. Overrides: `--class jobserver|static|none`, `--cores N` (static target; ignored with a notice for jobserver class). A user-supplied parallelism flag always wins over injection and produces a one-line notice.
-4. Every task additionally gets `BUSYBEE_CLASS=<class>` and `BUSYBEE_CORES=<n or pool_size>` in its env so opaque scripts can cooperate (`xcodebuild ... -jobs "${BUSYBEE_CORES:-8}"`). This is the only remedy for argv-only tools hidden inside scripts.
+4. Every task additionally gets `BUSYBEE_CLASS=<class>` and `BUSYBEE_CORES=<fair share>` in its env so opaque scripts can cooperate (`xcodebuild ... -jobs "${BUSYBEE_CORES:-8}"`). This is the only remedy for argv-only tools hidden inside scripts.
 
 The `Plan` is data: `{ class, tool: String, env_set: Vec<(String,String)>, env_append: Vec<(String,String)>, env_unset: Vec<String>, argv: Vec<String>, cores_wanted: Option<u32>, notices: Vec<String> }`. Executing it is a separate concern.
 
-`classify` never reads the environment or the filesystem, so values it emits carry placeholders the daemon substitutes at dispatch: `{fifo}` (fifo path), `{cores}` (granted cores), `{cores-1}` (`max(1, cores − 1)`). These three are the only substitution points. `env_append` exists for `PYTEST_ADDOPTS`, which must extend the caller's value rather than replace it; the daemon joins the two with a space. `cores_wanted` carries `--cores` through to admission (never set for jobserver, which is where the notice comes from). `argv` is the whole command line as received, wrappers included, so the daemon runs it as-is. An override that forces `jobserver` on a row that has no fifo injection (an opaque script, a static tool) still gets `MAKEFLAGS`; forcing `static`/`none` keeps a core-count injection and drops a fifo one.
+`classify` never reads the environment or the filesystem, so values it emits carry placeholders the daemon substitutes at dispatch: `{fifo}` (fifo path), `{cores}` (fair share), `{cores-1}` (`max(1, cores − 1)`). These three are the only substitution points. `{cores}` is the task's fair share of the pool at admission — `clamp(cores_wanted, 1, ceil(pool_size / (admitted_count + 1)))` for static/none, and the same `ceil(pool_size / (admitted_count + 1))` for jobserver, which holds no tokens of its own. Jobserver tasks get a number at all because the threads they spawn that *don't* speak the protocol (`RUST_TEST_THREADS`) need bounding, and pool_size there would let every concurrently admitted task claim the whole machine. `env_append` exists for `PYTEST_ADDOPTS`, which must extend the caller's value rather than replace it; the daemon joins the two with a space. `cores_wanted` carries `--cores` through to admission (never set for jobserver, which is where the notice comes from). `argv` is the whole command line as received, wrappers included, so the daemon runs it as-is. An override that forces `jobserver` on a row that has no fifo injection (an opaque script, a static tool) still gets `MAKEFLAGS`; forcing `static`/`none` keeps a core-count injection and drops a fifo one.
 
 ## Client output contract
 

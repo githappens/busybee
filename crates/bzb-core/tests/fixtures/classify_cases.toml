@@ -12,7 +12,9 @@
 #   env_set_contains      "NAME=value" entries that must be in env_set
 #   env_set_absent        names that must NOT be in env_set
 #   env_unset_contains    names that must be in env_unset
+#   env_unset_absent      names that must NOT be in env_unset
 #   env_append_contains   "NAME=suffix" entries that must be in env_append
+#   env_append_absent     names that must NOT be in env_append
 #   expect_argv           full expected Plan.argv (optional)
 #   notices_contain       substrings that must appear in some notice
 #   no_notices            true if the plan must carry no notices at all
@@ -122,6 +124,31 @@ class = "jobserver"
 tool = "ninja"
 env_set_contains = ["MAKEFLAGS=--jobserver-auth=fifo:{fifo}"]
 no_notices = true
+
+[[case]]
+name = "env assignment shadows an injected variable"
+argv = ["env", "MAKEFLAGS=-j100", "make", "all"]
+class = "jobserver"
+tool = "make"
+env_set_absent = ["MAKEFLAGS"]
+notices_contain = ["MAKEFLAGS"]
+
+[[case]]
+name = "env assignment shadows an unset, leaving the rest of the recipe"
+argv = ["env", "CMAKE_BUILD_PARALLEL_LEVEL=64", "cmake", "--build", "build"]
+class = "jobserver"
+tool = "cmake"
+env_set_contains = ["MAKEFLAGS=--jobserver-auth=fifo:{fifo}"]
+env_unset_absent = ["CMAKE_BUILD_PARALLEL_LEVEL"]
+notices_contain = ["CMAKE_BUILD_PARALLEL_LEVEL"]
+
+[[case]]
+name = "env assignment shadows an appended variable"
+argv = ["env", "PYTEST_ADDOPTS=-x", "pytest", "tests/"]
+class = "static"
+tool = "pytest"
+env_append_absent = ["PYTEST_ADDOPTS"]
+notices_contain = ["PYTEST_ADDOPTS"]
 
 [[case]]
 name = "env with flags is opaque"

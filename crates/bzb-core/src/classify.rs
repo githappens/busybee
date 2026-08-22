@@ -16,8 +16,14 @@
 //! | placeholder | replaced with |
 //! |---|---|
 //! | `{fifo}` | absolute path of the jobserver fifo |
-//! | `{cores}` | cores granted to the task (pool size for jobserver tasks) |
+//! | `{cores}` | the task's fair share of the pool at admission |
 //! | `{cores-1}` | `max(1, cores - 1)` |
+//!
+//! `{cores}` is a fair share for *every* class, jobserver included. A jobserver
+//! task holds no tokens of its own, but the threads it spawns that do not speak
+//! the protocol (rustc's test harness) still have to be bounded by something,
+//! and the pool size is exactly the wrong number: every concurrently admitted
+//! task would claim all of it.
 //!
 //! # Shape of a plan
 //!
@@ -233,7 +239,7 @@ pub fn default_table() -> Table {
 /// Classify `argv` into a [`Plan`]. Total: any argv, including an empty one,
 /// yields a plan.
 pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
-    let (tool, args) = unwrap_wrappers(argv);
+    let (tool, args, env_assigned) = unwrap_wrappers(argv);
 
     let rule = table.lookup(&tool, args);
     let table_class = rule.map_or(Class::None, |r| r.class);
@@ -287,7 +293,37 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
     plan.env_set
         .push(("BUSYBEE_CORES".to_string(), "{cores}".to_string()));
 
+    drop_shadowed_env(&mut plan, &env_assigned);
+
     plan
+}
+
+/// `env NAME=value` operands survive in [`Plan::argv`], and `env` applies them
+/// *after* the daemon has set up the task's environment — so they win. Drop the
+/// edits they would override rather than emitting a plan that provably does not
+/// take effect, and say which ones went.
+fn drop_shadowed_env(plan: &mut Plan, assigned: &[&str]) {
+    let shadowed = |name: &str| assigned.contains(&name);
+
+    let hit: Vec<String> = plan
+        .env_set
+        .iter()
+        .chain(plan.env_append.iter())
+        .map(|(k, _)| k)
+        .chain(plan.env_unset.iter())
+        .filter(|k| shadowed(k))
+        .cloned()
+        .collect();
+
+    plan.env_set.retain(|(k, _)| !shadowed(k));
+    plan.env_append.retain(|(k, _)| !shadowed(k));
+    plan.env_unset.retain(|k| !shadowed(k));
+
+    for name in hit {
+        plan.notices.push(format!(
+            "your env sets {name}; it takes precedence over busybee's value"
+        ));
+    }
 }
 
 fn apply_injection(plan: &mut Plan, inject: Inject, user_flag: bool) {
@@ -306,7 +342,8 @@ fn apply_injection(plan: &mut Plan, inject: Inject, user_flag: bool) {
         Inject::Cargo => {
             set(plan, "MAKEFLAGS", JOBSERVER_AUTH);
             set(plan, "CARGO_MAKEFLAGS", JOBSERVER_AUTH);
-            // Test threads are not token-accounted; bound them to the share.
+            // Test threads are not token-accounted; bound them to the fair
+            // share so concurrent `cargo test` runs do not each take the pool.
             set(plan, "RUST_TEST_THREADS", "{cores}");
         }
         Inject::Xcodebuild => {
@@ -363,21 +400,23 @@ fn flag_notice(tool: &str, flag: &str, inject: Inject, class: Class) -> String {
 }
 
 /// Skip wrapper commands until the first token that actually runs something.
-/// Returns the tool's basename and the tokens after it; an opaque command
-/// (empty argv, a shell string, a wrapper we refuse to parse) yields a label
-/// and no arguments, so no table row can match it.
-fn unwrap_wrappers(argv: &[String]) -> (String, &[String]) {
+/// Returns the tool's basename, the tokens after it, and the variable names any
+/// `env` wrapper assigns along the way. An opaque command (empty argv, a shell
+/// string, a wrapper we refuse to parse) yields a label and no arguments, so no
+/// table row can match it.
+fn unwrap_wrappers(argv: &[String]) -> (String, &[String], Vec<&str>) {
     let mut rest = argv;
+    let mut assigned = Vec::new();
 
     loop {
         let Some(first) = rest.first() else {
-            return (TOOL_UNKNOWN.to_string(), &[]);
+            return (TOOL_UNKNOWN.to_string(), &[], assigned);
         };
         let name = basename(first);
         let args = &rest[1..];
 
         if SHELLS.contains(&name) {
-            return (TOOL_SHELL.to_string(), &[]);
+            return (TOOL_SHELL.to_string(), &[], assigned);
         }
 
         let skipped = match name {
@@ -391,9 +430,14 @@ fn unwrap_wrappers(argv: &[String]) -> (String, &[String]) {
         match skipped {
             // A wrapper that swallowed the rest of the line (`nix develop`
             // with no `-c`, `env -i …`) is opaque: we cannot say what runs.
-            Some(0) => return (name.to_string(), &[]),
-            Some(n) => rest = &args[n..],
-            None => return (name.to_string(), args),
+            Some(0) => return (name.to_string(), &[], assigned),
+            Some(n) => {
+                if name == "env" {
+                    assigned.extend(args[..n].iter().filter_map(|a| Some(a.split_once('=')?.0)));
+                }
+                rest = &args[n..];
+            }
+            None => return (name.to_string(), args, assigned),
         }
     }
 }

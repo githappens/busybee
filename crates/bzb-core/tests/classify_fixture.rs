@@ -27,7 +27,11 @@ struct Case {
     #[serde(default)]
     env_unset_contains: Vec<String>,
     #[serde(default)]
+    env_unset_absent: Vec<String>,
+    #[serde(default)]
     env_append_contains: Vec<String>,
+    #[serde(default)]
+    env_append_absent: Vec<String>,
     expect_argv: Option<Vec<String>>,
     #[serde(default)]
     notices_contain: Vec<String>,
@@ -102,6 +106,20 @@ fn fixture_cases_classify_as_expected() {
                 plan.env_unset.contains(key),
                 "case {name}: expected env_unset to contain {key}, got {:?}",
                 plan.env_unset
+            );
+        }
+        for key in &case.env_unset_absent {
+            assert!(
+                !plan.env_unset.contains(key),
+                "case {name}: expected env_unset to omit {key}, got {:?}",
+                plan.env_unset
+            );
+        }
+        for key in &case.env_append_absent {
+            assert!(
+                !plan.env_append.iter().any(|(k, _)| k == key),
+                "case {name}: expected env_append to omit {key}, got {:?}",
+                plan.env_append
             );
         }
         if let Some(expected) = &case.expect_argv {
