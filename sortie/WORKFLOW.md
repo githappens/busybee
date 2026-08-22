@@ -176,6 +176,15 @@ Blocked-by issues (all must already be merged on `main`): {{ range $i, $b := .is
    machine names, user names, local paths, or references to other projects.
    No AI co-author trailers in commits.
 
+## Keep the branch mergeable
+
+Before finishing, and at the start of every continuation, run `git fetch origin`
+and check whether `origin/main` has moved under you (`git merge-base --is-ancestor
+origin/main HEAD` fails). If so, rebase onto `origin/main`, resolve conflicts so
+the result still satisfies the issue and the spec, rerun the full test suite, and
+`git push --force-with-lease`. Never merge `main` into the branch; history stays
+linear for the squash merge. A PR that does not merge cleanly is never merged.
+
 ## Finishing
 
 When the acceptance criteria pass locally:
