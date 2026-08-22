@@ -39,6 +39,10 @@ use serde::{Deserialize, Serialize};
 
 /// Value written into `MAKEFLAGS` / `CARGO_MAKEFLAGS` for pool members.
 const JOBSERVER_AUTH: &str = "--jobserver-auth=fifo:{fifo}";
+/// Every variable a jobserver task's fifo authentication can arrive in. Cargo
+/// reads `CARGO_MAKEFLAGS` before `MAKEFLAGS`, so a recipe that sets only the
+/// latter still owns both — see the collision guard in [`classify`].
+const JOBSERVER_AUTH_VARS: [&str; 2] = ["MAKEFLAGS", "CARGO_MAKEFLAGS"];
 /// `Plan::tool` for an opaque shell string (`sh -c '…'`).
 const TOOL_SHELL: &str = "<shell>";
 /// `Plan::tool` when there is nothing to look at (empty argv).
@@ -334,15 +338,20 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
     // A row's own variables ride along with whichever recipe it kept: they are
     // core counts and tool-specific knobs, so they stay useful under a forced
     // class the way an injected `GOMAXPROCS` does. What they may not do is
-    // take a variable busybee already set: `MAKEFLAGS` is how a jobserver
-    // task reaches the fifo, and a row that replaced it would keep the class
-    // that reserves no tokens while running outside the pool. Busybee's value
-    // wins, and the dropped one is named.
+    // supply the fifo authentication: a row that named a fifo of its own would
+    // keep the class that reserves no tokens while running outside the pool.
+    // Busybee owns every variable it already set, and — for a jobserver task —
+    // every variable the authentication can arrive in, whether the recipe
+    // filled it or not. The dropped value is named.
     if let Some(rule) = rule {
         for (name, value) in &rule.env_set {
-            if plan.env_set.iter().any(|(set, _)| set == name) {
+            let taken = plan.env_set.iter().any(|(set, _)| set == name);
+            let reserved =
+                class == Class::Jobserver && JOBSERVER_AUTH_VARS.contains(&name.as_str());
+            if taken || reserved {
                 plan.notices.push(format!(
-                    "the {} row for {} sets {name}; busybee's own value takes precedence",
+                    "the {} row for {} sets {name}; busybee owns that variable and the \
+                     configured value is dropped",
                     class.as_str(),
                     plan.tool
                 ));

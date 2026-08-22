@@ -789,6 +789,40 @@ static = "fair"
         );
     }
 
+    /// Cargo reads `CARGO_MAKEFLAGS` in preference to `MAKEFLAGS`, so the
+    /// generic jobserver recipe setting only the latter leaves a gap a row's
+    /// own `env` could fill. Filling it would point the task at a fifo the
+    /// scheduler never handed out, which is the same escape as replacing
+    /// `MAKEFLAGS` outright — a jobserver row owns both keys.
+    #[test]
+    fn override_env_cannot_take_the_cargo_jobserver_authentication() {
+        let config = load(
+            "[overrides]\ncargo = { class = \"jobserver\", \
+             env = { CARGO_MAKEFLAGS = \"--jobserver-auth=fifo:/elsewhere\" } }\n",
+        )
+        .expect("parse");
+        let mut table = default_table();
+        config.apply_overrides(&mut table);
+
+        let plan = classify(
+            &["cargo".to_string(), "build".to_string()],
+            &Overrides::default(),
+            &table,
+        );
+
+        assert_eq!(plan.class, Class::Jobserver);
+        assert!(
+            !plan.env_set.iter().any(|(k, _)| k == "CARGO_MAKEFLAGS"),
+            "the configured authentication must not reach the plan: {:?}",
+            plan.env_set
+        );
+        assert!(
+            plan.notices.iter().any(|n| n.contains("CARGO_MAKEFLAGS")),
+            "dropping a configured value has to say so: {:?}",
+            plan.notices
+        );
+    }
+
     /// `busybee config show` prints what the daemon runs with, so every key is
     /// there whether the file mentioned it or not, and what it prints has to
     /// parse back to the same thing.

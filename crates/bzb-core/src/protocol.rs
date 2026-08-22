@@ -315,6 +315,38 @@ mod tests {
         );
     }
 
+    /// [`Request::ConfigReload`] was added after protocol version 3. A
+    /// version-3 daemon — one still running from before an in-place upgrade —
+    /// cannot decode it, and answers the generic "that is not a request" error
+    /// rather than naming the mismatch. The handshake is where that pairing is
+    /// supposed to be refused, and it only refuses it if [`PROTOCOL_VERSION`]
+    /// moved with the variant.
+    #[test]
+    fn a_config_reload_does_not_decode_against_protocol_version_3() {
+        /// [`Request`] as version 3 spelled it. Nothing reads the payloads —
+        /// it is the set of variants that decides what decodes.
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        enum Version3 {
+            Ping,
+            Status,
+            Submit(LeaseRequest),
+            Cancel { lease: u64 },
+        }
+
+        let line = serde_json::to_string(&Request::ConfigReload).expect("encode");
+
+        let error = serde_json::from_str::<Version3>(&line)
+            .expect_err("a version-3 daemon must not decode a config reload")
+            .to_string();
+
+        assert!(error.contains("ConfigReload"), "error was {error:?}");
+        assert_ne!(
+            PROTOCOL_VERSION, 3,
+            "a request the previous version cannot decode needs a version bump"
+        );
+    }
+
     #[test]
     fn an_event_round_trips_inside_a_response() {
         let line = serde_json::to_string(&Response::Event(LeaseEvent::Queued { id: 1, ahead: 2 }))

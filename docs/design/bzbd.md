@@ -187,7 +187,10 @@ available to a config file too. A row's `env` is layered on top of that
 injection and never replaces it: `MAKEFLAGS` on a jobserver row is the fifo the
 task is accounted through, so busybee's value stays and the row's is dropped
 with a notice rather than leaving a task that reserves no tokens running
-outside the pool. The same holds for the `BUSYBEE_CLASS` and `BUSYBEE_CORES`
+outside the pool. A jobserver row owns `CARGO_MAKEFLAGS` on the same grounds
+even though the forced injection sets only `MAKEFLAGS` — cargo reads the
+cargo-specific spelling first, so leaving it open would be the same escape by
+another name. The same holds for the `BUSYBEE_CLASS` and `BUSYBEE_CORES`
 of point 4 above, which every class injects: they are how a task reads back the
 bargain it was admitted under, so a row cannot describe itself to the task as
 something other than what the scheduler booked.

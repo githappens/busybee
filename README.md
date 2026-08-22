@@ -99,7 +99,7 @@ static = "fair"           # or a fixed core count
 | `defaults.static` | `"fair"` or integer ≥ 1 | `"fair"` | Cores such a task asks for: `"fair"` is its share of the pool at the moment it starts. |
 | `overrides.<tool>` | table | none | One classification row. |
 | `overrides.<tool>.class` | `"jobserver"`, `"static"` or `"none"` | required | How the tool shares the pool: joins it dynamically, holds a fixed number of cores, or takes the machine. |
-| `overrides.<tool>.env` | table of strings | empty | Variables to set for the task, on top of what the class injects. Values may contain `{cores}`, `{cores-1}` and `{fifo}`, and nothing else. A variable busybee already injects — `MAKEFLAGS` on a jobserver row, and `BUSYBEE_CLASS`/`BUSYBEE_CORES` on every row — keeps busybee's value, and the row's is dropped with a notice. |
+| `overrides.<tool>.env` | table of strings | empty | Variables to set for the task, on top of what the class injects. Values may contain `{cores}`, `{cores-1}` and `{fifo}`, and nothing else. A variable busybee owns — `MAKEFLAGS` and `CARGO_MAKEFLAGS` on a jobserver row, and `BUSYBEE_CLASS`/`BUSYBEE_CORES` on every row — keeps busybee's value, and the row's is dropped with a notice. |
 
 An override key is matched against the tool's basename, so `"./build.sh"` and
 `"build.sh"` name the same row (two keys that collapse to one are an error).
