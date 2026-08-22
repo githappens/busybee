@@ -213,21 +213,28 @@ async fn the_json_output_carries_no_ansi_escapes_on_a_terminal() {
     let daemon = FakeBzbd::start(reply());
     let (mut master, slave) = openpty();
 
-    let status = tokio::process::Command::new(BUSYBEE)
+    let mut child = tokio::process::Command::new(BUSYBEE)
         .arg("status")
         .arg("--json")
         .env("BUSYBEE_STATE_DIR", daemon.state_dir())
-        // Takes ownership of the fd and closes it in this process once the
-        // child has it.
-        .stdout(unsafe { Stdio::from_raw_fd(slave) })
-        .status()
-        .await
+        .stdout(Stdio::from(slave.try_clone().expect("clone the slave")))
+        .spawn()
         .expect("run busybee status --json on a pty");
-    assert!(status.success(), "busybee status --json exited {status}");
 
-    // One line, already buffered by the pty: the child has exited.
-    let mut line = String::new();
-    master.read_line(&mut line).expect("read the pty");
+    // Read while the child runs, on a thread so the fake daemon's task still
+    // gets to answer. Waiting for the child first would race macOS, which
+    // flushes the pty's output queue once the last slave descriptor closes;
+    // `slave` stays open here for the same reason.
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        master.read_line(&mut line).expect("read the pty");
+        line
+    });
+
+    let status = child.wait().await.expect("wait for busybee status --json");
+    assert!(status.success(), "busybee status --json exited {status}");
+    let line = reader.join().expect("the pty reader thread");
+
     assert!(
         !line.contains('\u{1b}'),
         "the json line carries an escape: {line:?}"
@@ -236,9 +243,9 @@ async fn the_json_output_carries_no_ansi_escapes_on_a_terminal() {
     assert_eq!(decoded.pool_size, 18);
 }
 
-/// A pseudo-terminal, as `(master reader, slave fd)`. The slave is what the
-/// child gets as stdout, which is what makes `isatty` true for it.
-fn openpty() -> (std::io::BufReader<std::fs::File>, std::os::fd::RawFd) {
+/// A pseudo-terminal, as `(master reader, slave)`. The slave is what the child
+/// gets as stdout, which is what makes `isatty` true for it.
+fn openpty() -> (std::io::BufReader<std::fs::File>, std::fs::File) {
     let (mut master, mut slave) = (-1, -1);
     assert_eq!(
         unsafe {
@@ -255,8 +262,10 @@ fn openpty() -> (std::io::BufReader<std::fs::File>, std::os::fd::RawFd) {
         std::io::Error::last_os_error()
     );
     // SAFETY: `openpty` filled both fds and nothing else owns them.
-    (
-        std::io::BufReader::new(unsafe { std::fs::File::from_raw_fd(master) }),
-        slave,
-    )
+    unsafe {
+        (
+            std::io::BufReader::new(std::fs::File::from_raw_fd(master)),
+            std::fs::File::from_raw_fd(slave),
+        )
+    }
 }
