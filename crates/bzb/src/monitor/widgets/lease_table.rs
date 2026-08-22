@@ -29,15 +29,18 @@ const WIDTHS: [Constraint; 7] = [
     Constraint::Min(0),
 ];
 
-/// `WIDTHS` with the two columns that hold an unbounded number widened to what
-/// is actually on screen: bzbd's lease counter climbs for as long as the daemon
-/// lives, and a lease runs for as long as its command does. A clipped id is one
-/// the operator would pass to `busybee cancel` wrong, and a clipped duration is
-/// a different duration rather than a shorter one.
+/// `WIDTHS` with the three columns whose content the monitor does not bound
+/// widened to what is actually on screen: bzbd's lease counter climbs for as
+/// long as the daemon lives, a lease runs for as long as its command does, and
+/// the tool is the basename of whatever the caller wrapped. A clipped id is one
+/// the operator would pass to `busybee cancel` wrong, a clipped duration is a
+/// different duration rather than a shorter one, and a clipped tool no longer
+/// names what is holding the pool.
 fn widths(leases: &[&LeaseView]) -> [Constraint; 7] {
     let mut widths = WIDTHS;
     widths[0] = fit(leases, 5, id);
     widths[2] = fit(leases, 7, |lease| elapsed(lease.elapsed_ms));
+    widths[3] = fit(leases, 12, |lease| printable(&lease.tool));
     widths
 }
 
@@ -225,6 +228,24 @@ mod tests {
         let lines = draw(&leases, 90, 1);
         assert!(lines[0].starts_with("#10000"), "row was {:?}", lines[0]);
         assert!(lines[0].contains("xcodebuild") || lines[0].contains("cargo"));
+    }
+
+    /// The tool is the basename of whatever the caller wrapped, so it is as
+    /// long as they made it, and an explicit `--name` means the label does not
+    /// carry it either: clipped, the row no longer says what is running.
+    #[test]
+    fn a_tool_wider_than_the_column_widens_it() {
+        let mut leases = vec![lease(1, "running", "static")];
+        leases[0].tool = "custom-build-runner".into();
+
+        let lines = draw(&leases, 90, 1);
+
+        assert!(
+            lines[0].contains("custom-build-runner"),
+            "row was {:?}",
+            lines[0]
+        );
+        assert!(lines[0].contains("lease 1"), "row was {:?}", lines[0]);
     }
 
     /// A lease can run for hours, and the elapsed time is the column the
