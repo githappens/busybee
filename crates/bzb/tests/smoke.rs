@@ -1,286 +1,457 @@
-use assert_cmd::Command as AssertCmd;
+//! The client end to end, against daemons of the test's own: an isolated
+//! `pueued` and a `bzbd` in a temporary state directory.
+//!
+//! `busybee` starts bzbd itself when the socket is unreachable, so no test
+//! spawns one by hand — the auto-start is the path under test. What every test
+//! does is point `BUSYBEE_STATE_DIR` and `PUEUE_CONFIG_PATH` somewhere of its
+//! own, so nothing here can reach a developer's daemon or queue.
+
+use std::{
+    path::{Path, PathBuf},
+    process::{Command, Output, Stdio},
+    time::{Duration, Instant},
+};
+
+use bzb_core::{
+    daemon::Connection,
+    protocol::{Request, Response, StatusReply},
+};
 use bzb_test_support::PueuedFixture;
+use tempfile::TempDir;
 
-#[test]
-fn pueued_fixture_starts_and_stops() {
-    let Some(p) = PueuedFixture::try_start() else {
-        return;
-    };
-    assert!(p.socket_path.exists());
-    drop(p);
-    // Socket path may or may not be removed by pueued on shutdown; that's OK.
+/// Long enough for a poll tick (1 s) plus the daemons' own latency, short
+/// enough that a task which never runs fails the test instead of hanging it.
+const PATIENCE: Duration = Duration::from_secs(15);
+
+/// A busybee client with daemons of its own.
+struct Busybee {
+    _pueue: PueuedFixture,
+    tmp: TempDir,
 }
 
-use bzb_core::client;
-use bzb_core::enqueue::{enqueue, TaskSpec};
+impl Busybee {
+    /// `None` when `pueued` is not on `PATH`, which is how these tests skip
+    /// themselves outside the dev shell.
+    fn start() -> Option<Self> {
+        let pueue = PueuedFixture::try_start()?;
+        // bzbd is started by the client, from next to the client's own binary.
+        let bzbd = Path::new(env!("CARGO_BIN_EXE_busybee"))
+            .parent()
+            .expect("the client binary has a directory")
+            .join("bzbd");
+        assert!(
+            bzbd.is_file(),
+            "{} is missing; build the whole workspace (cargo build --workspace) \
+             so the client has a daemon to start",
+            bzbd.display()
+        );
+        Some(Self {
+            _pueue: pueue,
+            tmp: TempDir::new().expect("create tempdir"),
+        })
+    }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial_test::serial]
-async fn connect_succeeds_when_pueued_is_running() {
-    let Some(p) = PueuedFixture::try_start() else {
-        return;
-    };
-    // SAFETY: Settings::read checks PUEUE_CONFIG_PATH; tests run single-threaded
-    // with respect to env mutation here via the #[tokio::test] below using
-    // multi_thread is fine because we only read env inside connect_or_spawn.
-    // The env var is process-wide, so keep only one integration test setting
-    // this at a time (tests run serially by default unless explicit parallelism).
-    std::env::set_var("PUEUE_CONFIG_PATH", &p.config_path);
-    let client = client::connect_or_spawn()
-        .await
-        .expect("connect should succeed");
-    drop(client);
+    /// A `busybee` invocation pointed at this test's daemons.
+    fn cmd(&self, args: &[&str]) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_busybee"));
+        cmd.env("BUSYBEE_STATE_DIR", self.state_dir())
+            .env("PUEUE_CONFIG_PATH", &self._pueue.config_path)
+            .args(args);
+        cmd
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        self.cmd(args).output().expect("run busybee")
+    }
+
+    fn state_dir(&self) -> PathBuf {
+        self.tmp.path().join("state")
+    }
+
+    fn socket(&self) -> PathBuf {
+        self.state_dir().join("bzbd.sock")
+    }
+
+    /// bzbd is started by the client under test, so a test that only spawned
+    /// one has a window in which there is no socket to ask yet. The error is
+    /// returned rather than raised: to the waiters below it is a "not yet".
+    fn status(&self) -> anyhow::Result<StatusReply> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        runtime.block_on(async {
+            let mut conn = Connection::connect(&self.socket()).await?;
+            conn.send(Request::Status).await?;
+            match conn.recv().await? {
+                Response::Status(status) => Ok(status),
+                other => anyhow::bail!("expected a status reply, got {other:?}"),
+            }
+        })
+    }
+
+    /// Waits for bzbd to hold `count` leases, or fails saying what it held.
+    fn wait_for_leases(&self, count: usize) {
+        self.wait_for(&format!("{count} lease(s)"), |status| {
+            status.leases.len() == count
+        });
+    }
+
+    /// Waits for a task to be running, which is the point at which bzbd has it
+    /// on the machine rather than merely on the queue.
+    fn wait_for_a_running_task(&self) {
+        self.wait_for("a running task", |status| {
+            status.leases.iter().any(|l| l.state == "running")
+        });
+    }
+
+    fn wait_for(&self, what: &str, ready: impl Fn(&StatusReply) -> bool) {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            // Kept for the failure message, so a wait that never reached bzbd
+            // at all says that instead of blaming the condition.
+            let why = match self.status() {
+                Ok(status) if ready(&status) => return,
+                Ok(status) => format!("bzbd holds {:?}", status.leases),
+                Err(err) => format!("bzbd is unreachable: {err}"),
+            };
+            assert!(Instant::now() < deadline, "waited for {what}; {why}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial_test::serial]
-async fn ensure_group_is_idempotent() {
-    let Some(p) = PueuedFixture::try_start() else {
-        return;
-    };
-    std::env::set_var("PUEUE_CONFIG_PATH", &p.config_path);
-    let mut client = client::connect_or_spawn().await.unwrap();
-    bzb_core::group::ensure_busybee_group(&mut client)
-        .await
-        .unwrap();
-    bzb_core::group::ensure_busybee_group(&mut client)
-        .await
-        .unwrap();
-    // A second call must be a no-op (both calls return Ok without erroring).
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial_test::serial]
-async fn enqueue_returns_a_task_id() {
-    let Some(p) = PueuedFixture::try_start() else {
-        return;
-    };
-    std::env::set_var("PUEUE_CONFIG_PATH", &p.config_path);
-    let mut client = client::connect_or_spawn().await.unwrap();
-    bzb_core::group::ensure_busybee_group(&mut client)
-        .await
-        .unwrap();
-    let spec = TaskSpec {
-        command: "true".into(),
-        cwd: std::env::current_dir().unwrap(),
-        env: Default::default(),
-        label: Some("smoke".into()),
-        start_immediately: false,
-    };
-    // Fresh isolated daemon: first task always gets id 0.
-    let id = enqueue(&mut client, spec).await.unwrap();
-    let _ = id; // unwrap() above already proves the call succeeded
-}
-
-#[test]
-#[serial_test::serial]
-fn detach_prints_task_id_and_exits_zero() {
-    let Some(p) = PueuedFixture::try_start() else {
-        return;
-    };
-    let mut cmd = AssertCmd::cargo_bin("busybee").unwrap();
-    cmd.env("PUEUE_CONFIG_PATH", &p.config_path);
-    let out = cmd.args(["--detach", "--", "true"]).output().unwrap();
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.starts_with("busybee: enqueued task "),
-        "got: {stdout}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[serial_test::serial]
-async fn log_chunk_accumulates_across_polls() {
-    let Some(p) = PueuedFixture::try_start() else {
-        return;
-    };
-    std::env::set_var("PUEUE_CONFIG_PATH", &p.config_path);
-    let mut client = client::connect_or_spawn().await.unwrap();
-    bzb_core::group::ensure_busybee_group(&mut client)
-        .await
-        .unwrap();
-    let id = bzb_core::enqueue::enqueue(
-        &mut client,
-        TaskSpec {
-            command: "printf one; printf two".into(),
-            cwd: std::env::current_dir().unwrap(),
-            env: Default::default(),
-            label: None,
-            start_immediately: false,
-        },
-    )
-    .await
-    .unwrap();
-
-    // Poll up to 10s for the task to complete and the full output to appear.
-    let mut seen = String::new();
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let (bytes, _) = bzb_core::log::fetch_log_chunk(&mut client, id, 0)
-            .await
-            .unwrap();
-        seen = String::from_utf8_lossy(&bytes).into_owned();
-        if seen.contains("onetwo") {
+impl Drop for Busybee {
+    fn drop(&mut self) {
+        // The daemon the client auto-started is in its own session; the pid
+        // file is what is left to find it by. A test that never started one
+        // has no file and nothing to kill.
+        let Ok(pid) = std::fs::read_to_string(self.state_dir().join("bzbd.pid")) else {
             return;
+        };
+        if let Ok(pid) = pid.trim().parse::<i32>() {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
         }
     }
-    panic!("never saw full output; last: {seen:?}");
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
 #[serial_test::serial]
-async fn log_chunk_returns_plaintext_for_repetitive_output() {
-    // Regression: pueue-lib's LogRequest returns task output compressed with
-    // snappy's frame format. busybee must decompress before streaming. A
-    // short literal output would survive unharmed inside a snappy frame, so
-    // force back-references by printing a long repeated line.
-    let Some(p) = PueuedFixture::try_start() else {
+fn the_task_s_exit_code_is_the_client_s_exit_code() {
+    let Some(busybee) = Busybee::start() else {
         return;
     };
-    std::env::set_var("PUEUE_CONFIG_PATH", &p.config_path);
-    let mut client = client::connect_or_spawn().await.unwrap();
-    bzb_core::group::ensure_busybee_group(&mut client)
-        .await
-        .unwrap();
-
-    let line = "AudioFileFormat:Multiplier:createWriterForAudioFileFormat";
-    let repeats = 200;
-    let id = bzb_core::enqueue::enqueue(
-        &mut client,
-        TaskSpec {
-            command: format!("sh -c 'for i in $(seq 1 {repeats}); do echo {line}; done'"),
-            cwd: std::env::current_dir().unwrap(),
-            env: Default::default(),
-            label: None,
-            start_immediately: false,
-        },
-    )
-    .await
-    .unwrap();
-
-    let expected = {
-        let mut s = String::new();
-        for _ in 0..repeats {
-            s.push_str(line);
-            s.push('\n');
-        }
-        s
-    };
-
-    let mut last: Vec<u8> = Vec::new();
-    for _ in 0..50 {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let (bytes, _) = bzb_core::log::fetch_log_chunk(&mut client, id, 0)
-            .await
-            .unwrap();
-        last = bytes;
-        if last.len() >= expected.len() {
-            break;
-        }
+    for (command, expected) in [
+        ("exit 0", 0),
+        ("exit 42", 42),
+        // sh's own code for a command it cannot find.
+        ("this-command-does-not-exist", 127),
+        // Death by signal: no exit code of its own, so it takes the one
+        // busybee uses for a task that did not finish on its own terms.
+        ("kill -TERM $$", 130),
+    ] {
+        let out = busybee.run(&["--", "sh", "-c", command]);
+        assert_eq!(
+            out.status.code(),
+            Some(expected),
+            "`{command}` exited {:?}; stderr: {}",
+            out.status.code(),
+            stderr(&out)
+        );
     }
+}
 
-    // Snappy framing magic must NOT appear in a plaintext stream.
-    assert!(
-        !last.windows(6).any(|w| w == b"sNaPpY"),
-        "output still contains snappy frame magic; first 32 bytes: {:x?}",
-        &last[..last.len().min(32)]
-    );
-    // The decompressed bytes must match the command's output exactly.
+/// stdout is the task's (`docs/design/bzbd.md` §Client output contract), so
+/// every line busybee writes about itself has to be on stderr — and in the
+/// order the lease reached them.
+#[test]
+#[serial_test::serial]
+fn busybee_s_own_lines_go_to_stderr_in_lease_order() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let out = busybee.run(&["--", "sh", "-c", "printf hello"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+
+    assert_eq!(stdout(&out), "hello", "stderr was: {}", stderr(&out));
+
+    let stderr = stderr(&out);
+    let mut rest = stderr.as_str();
+    for expected in [
+        "busybee: queued (0 ahead)\n",
+        "busybee: running — ",
+        "busybee: command exited 0 (elapsed ",
+    ] {
+        let at = rest
+            .find(expected)
+            .unwrap_or_else(|| panic!("{expected:?} is missing or out of order in {stderr:?}"));
+        rest = &rest[at + expected.len()..];
+    }
+}
+
+/// `--class`/`--cores` reach the task through the daemon's injection, which
+/// lands with the classification work (#8).
+#[test]
+#[serial_test::serial]
+#[ignore = "needs the daemon-side injection from #8"]
+fn a_static_task_is_told_how_many_cores_it_holds() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let out = busybee.run(&[
+        "--class",
+        "static",
+        "--cores",
+        "2",
+        "--",
+        "sh",
+        "-c",
+        "echo $BUSYBEE_CORES",
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out).trim(), "2");
+}
+
+/// Ctrl-C closes the connection, and the connection is the lease: bzbd drops
+/// it, and the client is not waiting around for it to say so.
+#[test]
+#[serial_test::serial]
+fn sigint_while_queued_exits_130_and_drops_the_lease() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let mut running = busybee
+        .cmd(&["--", "sleep", "5"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the task that holds the machine");
+    busybee.wait_for_a_running_task();
+
+    let mut queued = busybee
+        .cmd(&["--", "echo", "second"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the queued client");
+    busybee.wait_for_leases(2);
+
+    unsafe { libc::kill(queued.id() as i32, libc::SIGINT) };
+    let interrupted = Instant::now();
+    let status = queued.wait().expect("wait for the interrupted client");
     assert_eq!(
-        String::from_utf8(last).expect("output is valid utf-8"),
-        expected,
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn blocking_mode_streams_stdout_and_returns_exit_code() {
-    let Some(p) = PueuedFixture::try_start() else {
-        return;
-    };
-    let mut cmd = AssertCmd::cargo_bin("busybee").unwrap();
-    cmd.env("PUEUE_CONFIG_PATH", &p.config_path);
-    let out = cmd
-        .args(["--", "sh", "-c", "printf hello; exit 0"])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("hello"));
-}
-
-#[test]
-#[serial_test::serial]
-fn blocking_mode_propagates_non_zero_exit_code() {
-    let Some(p) = PueuedFixture::try_start() else {
-        return;
-    };
-    let mut cmd = AssertCmd::cargo_bin("busybee").unwrap();
-    cmd.env("PUEUE_CONFIG_PATH", &p.config_path);
-    let out = cmd.args(["--", "sh", "-c", "exit 7"]).output().unwrap();
-    assert_eq!(out.status.code(), Some(7));
-}
-
-#[test]
-#[serial_test::serial]
-fn blocking_mode_second_task_waits_for_first_parallel_is_one() {
-    let Some(p) = PueuedFixture::try_start() else {
-        return;
-    };
-    let cfg = p.config_path.clone();
-    let h1 = std::thread::spawn({
-        let cfg = cfg.clone();
-        move || {
-            let mut cmd = AssertCmd::cargo_bin("busybee").unwrap();
-            cmd.env("PUEUE_CONFIG_PATH", &cfg);
-            cmd.args(["--", "sh", "-c", "sleep 1; echo first"])
-                .output()
-                .unwrap()
-        }
-    });
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    let start2 = std::time::Instant::now();
-    let mut cmd2 = AssertCmd::cargo_bin("busybee").unwrap();
-    cmd2.env("PUEUE_CONFIG_PATH", &cfg);
-    let out2 = cmd2.args(["--", "echo", "second"]).output().unwrap();
-    let elapsed2 = start2.elapsed();
-    h1.join().unwrap();
-    assert!(out2.status.success());
-    assert!(
-        elapsed2 >= std::time::Duration::from_millis(800),
-        "second task finished too fast ({elapsed2:?}); parallelism may be > 1"
-    );
-}
-
-#[test]
-#[serial_test::serial]
-fn sigint_while_running_cancels_task_exits_130() {
-    let Some(p) = PueuedFixture::try_start() else {
-        return;
-    };
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_busybee"));
-    cmd.env("PUEUE_CONFIG_PATH", &p.config_path);
-    cmd.args(["--", "sleep", "30"]);
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    let mut child = cmd.spawn().unwrap();
-    // Give the enqueue + queue-tick cycle time to get the task into Running state.
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
-    let out = child.wait().unwrap();
-    assert_eq!(
-        out.code(),
+        status.code(),
         Some(130),
-        "expected exit 130, got {:?}",
-        out.code()
+        "exit code was {:?}",
+        status.code()
     );
+    assert!(
+        interrupted.elapsed() < Duration::from_secs(1),
+        "the client took {:?} to exit",
+        interrupted.elapsed()
+    );
+
+    // Only the running task is left; the interrupted one's lease went with its
+    // connection.
+    busybee.wait_for_leases(1);
+    let _ = running.kill();
+    let _ = running.wait();
+}
+
+/// The same for a task that is already on the machine: the client hangs up,
+/// bzbd kills the task and the lease goes with it.
+#[test]
+#[serial_test::serial]
+fn sigint_while_running_exits_130_and_kills_the_task() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let marker = busybee.tmp.path().join("survived");
+    let mut client = busybee
+        .cmd(&[
+            "--",
+            "sh",
+            "-c",
+            &format!("sleep 30; touch {}", marker.display()),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the client");
+    busybee.wait_for_a_running_task();
+
+    unsafe { libc::kill(client.id() as i32, libc::SIGINT) };
+    let status = client.wait().expect("wait for the interrupted client");
+
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "exit code was {:?}",
+        status.code()
+    );
+    busybee.wait_for_leases(0);
+    assert!(!marker.exists(), "the cancelled task ran to the end");
+}
+
+/// A `none` task takes the whole pool (`docs/design/bzbd.md` §Admission
+/// policy), so a second one waits for it rather than running alongside.
+#[test]
+#[serial_test::serial]
+fn a_task_that_owns_the_machine_makes_the_next_one_wait() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let mut first = busybee
+        .cmd(&["--", "sleep", "2"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the first client");
+    busybee.wait_for_a_running_task();
+
+    let started = Instant::now();
+    let second = busybee.run(&["--", "echo", "second"]);
+
+    assert!(second.status.success(), "stderr: {}", stderr(&second));
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "the second task ran after {:?}; it should have waited",
+        started.elapsed()
+    );
+    assert!(
+        stderr(&second).contains("busybee: queued (1 ahead)"),
+        "the queue position is missing from {:?}",
+        stderr(&second)
+    );
+    first.wait().expect("wait for the first client");
+}
+
+/// `--detach` hands the task to bzbd and returns; the lease outlives the
+/// client that asked for it.
+#[test]
+#[serial_test::serial]
+fn a_detached_task_outlives_the_client_that_asked_for_it() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let marker = busybee.tmp.path().join("done");
+    let start = Instant::now();
+    let out = busybee.run(&[
+        "--detach",
+        "--",
+        "sh",
+        "-c",
+        &format!("sleep 1; touch {}", marker.display()),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "--detach blocked for {:?}",
+        start.elapsed()
+    );
+    assert!(
+        stdout(&out).starts_with("busybee: lease "),
+        "stdout was: {}",
+        stdout(&out)
+    );
+
+    // The client is gone; the task runs to the end anyway.
+    busybee.wait_for_leases(0);
+    assert!(marker.exists(), "the detached task never ran to the end");
+}
+
+/// Nothing holds a detached lease, so `cancel` is the only way to end one.
+#[test]
+#[serial_test::serial]
+fn cancel_ends_a_detached_lease() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let marker = busybee.tmp.path().join("finished");
+    let out = busybee.run(&[
+        "--detach",
+        "--",
+        "sh",
+        "-c",
+        &format!("sleep 30; touch {}", marker.display()),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let lease = lease_id(&stdout(&out));
+    busybee.wait_for_leases(1);
+
+    let cancelled = busybee.run(&["cancel", &lease.to_string()]);
+    assert!(cancelled.status.success(), "stderr: {}", stderr(&cancelled));
+
+    busybee.wait_for_leases(0);
+    assert!(!marker.exists(), "the cancelled task ran to the end");
+
+    // A lease that is already gone is an error, not a silent success.
+    let again = busybee.run(&["cancel", &lease.to_string()]);
+    assert!(!again.status.success(), "cancelling twice was accepted");
+    assert!(
+        stderr(&again).contains(&lease.to_string()),
+        "the refusal must name the lease: {}",
+        stderr(&again)
+    );
+}
+
+fn lease_id(line: &str) -> u64 {
+    line.trim()
+        .strip_prefix("busybee: lease ")
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|id| id.parse().ok())
+        .unwrap_or_else(|| panic!("no lease id in {line:?}"))
+}
+
+/// The client starts bzbd when there is none; every other test relies on it,
+/// this one says so.
+#[test]
+#[serial_test::serial]
+fn the_client_starts_the_daemon_it_needs() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    assert!(!busybee.socket().exists(), "bzbd was already running");
+
+    let out = busybee.run(&["--", "sh", "-c", "printf up"]);
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(stdout(&out), "up");
+    assert!(busybee.socket().exists(), "bzbd was never started");
+}
+
+/// A daemon that cannot start is not a reason to run the command ungoverned
+/// (`docs/design/bzbd.md` §Failure and recovery): the client says why and the
+/// command never runs.
+#[test]
+#[serial_test::serial]
+fn a_daemon_that_cannot_start_stops_the_command() {
+    let tmp = TempDir::new().expect("create tempdir");
+    // A state directory under a regular file: it cannot be created, whoever
+    // the tests are running as.
+    let blocked = tmp.path().join("a-file");
+    std::fs::write(&blocked, "not a directory").expect("write the file in the way");
+    let marker = tmp.path().join("ran");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_busybee"))
+        .env("BUSYBEE_STATE_DIR", blocked.join("state"))
+        .args(["--", "touch"])
+        .arg(&marker)
+        .output()
+        .expect("run busybee");
+
+    assert_eq!(out.status.code(), Some(1), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("state directory"),
+        "the reason is missing from {:?}",
+        stderr(&out)
+    );
+    assert!(!marker.exists(), "the command ran without a daemon");
 }

@@ -26,18 +26,6 @@ pub struct TaskSpec {
     pub start_immediately: bool,
 }
 
-impl TaskSpec {
-    pub fn from_current_env(command: String, label: Option<String>) -> std::io::Result<Self> {
-        Ok(Self {
-            command,
-            cwd: std::env::current_dir()?,
-            env: std::env::vars().collect(),
-            label,
-            start_immediately: false,
-        })
-    }
-}
-
 /// Join argv-style command parts into a single shell-safe string for pueue's
 /// `sh -c` runner.
 pub fn shell_escape_join(parts: &[String]) -> String {

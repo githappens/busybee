@@ -57,10 +57,13 @@ Every `busybee -- cmd` is a lease request:
 
 ```
 LeaseRequest { argv: Vec<String>, cwd, env, label: Option<String>,
-               class_override: Option<Class>, cores_wanted: Option<u32> }
+               class_override: Option<Class>, cores_wanted: Option<u32>,
+               detached: bool }
 ```
 
 Lifecycle: `Queued` → `Admitted { pueue_task_id, class, cores }` → `Finished { exit_code }`. A lease ends when pueued reports the task `Done`, or when the requesting client's connection drops (before admission: dropped from the queue; after: task killed, tokens returned). The client holds its socket open for the lease's whole life; connection = lease.
+
+`detached: true` (`--detach`) is the one exception, and the reason the flag can keep its contract of returning immediately: the lease survives its connection, so bzbd runs it to completion whether or not anyone is still listening. Nothing holds it, so no Ctrl-C can reach it either — `Request::Cancel { lease }` (`busybee cancel <id>`) is the only way to end one early, and bzbd answers `Ack`, or `Error` when the lease is not there. A cancel that silently accepted an unknown id would report success for a task still on the machine.
 
 ## Admission policy (pure state machine, no IO)
 

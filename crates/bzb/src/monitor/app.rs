@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use bzb_core::{client, group, status::QueueSnapshot};
+use bzb_core::{client, status::QueueSnapshot};
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEvent};
 use futures::StreamExt;
 use pueue_lib::message::{Request, Response};
@@ -42,10 +42,9 @@ async fn run_loop<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> R
         queued: vec![],
     };
 
+    // Read-only from here on: bzbd owns the `busybee` group and everything
+    // that goes into it.
     let mut stream: Option<Client> = client::connect_or_spawn().await.ok();
-    if let Some(ref mut s) = stream {
-        let _ = group::ensure_busybee_group(s).await;
-    }
 
     let mut cpu_tick = time::interval(Duration::from_millis(500));
     cpu_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -69,9 +68,6 @@ async fn run_loop<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> R
             _ = queue_tick.tick() => {
                 if stream.is_none() {
                     stream = client::connect_or_spawn().await.ok();
-                    if let Some(ref mut s) = stream {
-                        let _ = group::ensure_busybee_group(s).await;
-                    }
                 }
                 if let Some(ref mut s) = stream {
                     if let Ok(snap) = fetch_snapshot(s).await {

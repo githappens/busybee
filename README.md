@@ -47,6 +47,7 @@ how hot the box is.
 busybee -- cmake --build build --target MyProject
 busybee --name "backend tests" -- cargo test --workspace
 busybee --detach -- long-running-thing     # enqueue and return immediately
+busybee cancel 7                            # end a detached task
 busybee monitor                             # live TUI
 busybee status                              # one-shot pool + queue view
 busybee status --json                       # the same, for scripts and agents
@@ -58,6 +59,10 @@ idle pool on stderr and exits 0, unless the daemon died leaving tasks behind.
 
 Press `q` in the monitor to quit. Press `Ctrl-C` while blocked to cancel — the
 queued or running task is killed and busybee exits 130.
+
+`--detach` prints a lease id and returns, and the task keeps running after the
+client is gone. Nothing is left holding it, so `Ctrl-C` cannot reach a detached
+task: `busybee cancel <id>` is the only way to end one early.
 
 ## Roadmap
 

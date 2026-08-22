@@ -95,6 +95,9 @@ pub struct LeaseRequest {
     pub label: Option<String>,
     pub class_override: Option<Class>,
     pub cores_wanted: Option<u32>,
+    /// `--detach`: the lease outlives the connection that asked for it, so
+    /// hanging up does not cancel it. Only [`Request::Cancel`] does.
+    pub detached: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -104,6 +107,9 @@ pub enum Response {
         pid: u32,
     },
     Status(StatusReply),
+    /// The request was carried out. A cancel that changed nothing is an
+    /// [`Response::Error`] instead: the caller named a lease that is not there.
+    Ack,
     /// Streamed on a `Submit` connection for the lifetime of the lease.
     Event(LeaseEvent),
     Error {
@@ -231,6 +237,7 @@ mod tests {
             label: None,
             class_override: Some(Class::Static),
             cores_wanted: Some(4),
+            detached: false,
         };
         let line = serde_json::to_string(&request).unwrap();
         assert!(

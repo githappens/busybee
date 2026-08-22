@@ -35,6 +35,7 @@ fn request(argv: &[&str]) -> LeaseRequest {
         label: None,
         class_override: None,
         cores_wanted: None,
+        detached: false,
     }
 }
 

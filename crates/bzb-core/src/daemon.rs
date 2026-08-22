@@ -734,6 +734,7 @@ mod tests {
                 label: None,
                 class_override: None,
                 cores_wanted: None,
+                detached: false,
             }))
             .await;
         let Err(BusybeeError::Protocol(message)) = error else {

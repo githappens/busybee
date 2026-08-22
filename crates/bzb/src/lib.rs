@@ -15,12 +15,17 @@ pub fn run() -> anyhow::Result<()> {
     match cli.mode() {
         Mode::Blocking => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(enqueue::run(cli.cmd, cli.name))?;
+            rt.block_on(enqueue::run(cli.cmd, cli.name, cli.class, cli.cores))?;
             Ok(())
         }
         Mode::Detach => {
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(detach::run(cli.cmd, cli.name))?;
+            rt.block_on(detach::run(cli.cmd, cli.name, cli.class, cli.cores))?;
+            Ok(())
+        }
+        Mode::Cancel(lease) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(detach::cancel(lease))?;
             Ok(())
         }
         Mode::Monitor => {
