@@ -6,8 +6,8 @@
 
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Write},
-    os::fd::AsRawFd,
+    io::{self, Read, Write},
+    os::fd::{AsRawFd, FromRawFd},
     path::Path,
     sync::Mutex,
 };
@@ -33,13 +33,31 @@ pub fn run() -> Result<()> {
     let log = log_path()?;
 
     // Fork before the runtime exists: a forked child inherits no threads.
-    if !foreground {
-        daemonize(&log)?;
+    // Under `--foreground` there is no parent waiting for a report.
+    let mut ready = if foreground {
+        Ready(None)
+    } else {
+        daemonize(&log)?
+    };
+
+    let result = start(&mut ready, &log);
+    if let Err(err) = &result {
+        // Our stderr is the log file by now; the parent is the only route back
+        // to the terminal the user is looking at.
+        ready.report(&format!("{err:#}"));
     }
-    init_logging(&log)?;
+    result
+}
+
+/// Everything that happens after the fork, so a failure has one place to be
+/// reported from.
+fn start(ready: &mut Ready, log: &Path) -> Result<()> {
+    init_logging(log)?;
 
     let pid_file = pid_path()?;
     let Some(_locked) = lock_pid_file(&pid_file)? else {
+        // Someone else is already serving, which is what the caller wanted.
+        ready.report(SERVING);
         eprintln!("bzbd: already running");
         tracing::info!(pid_file = %pid_file.display(), "another bzbd holds the lock; exiting");
         return Ok(());
@@ -47,7 +65,7 @@ pub fn run() -> Result<()> {
 
     tokio::runtime::Runtime::new()
         .context("cannot start the tokio runtime")?
-        .block_on(serve(&socket_path()?, &pid_file))
+        .block_on(serve(&socket_path()?, &pid_file, ready))
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<bool> {
@@ -61,7 +79,13 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<bool> {
     Ok(foreground)
 }
 
-async fn serve(socket: &Path, pid_file: &Path) -> Result<()> {
+async fn serve(socket: &Path, pid_file: &Path, ready: &mut Ready) -> Result<()> {
+    // Before the socket exists: the socket is how everyone else finds us, and
+    // a SIGTERM landing before these are installed kills us on the spot,
+    // leaving the socket and the pid file behind.
+    let mut terminate = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
+    let mut interrupt = signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?;
+
     // Nothing else can be listening: this process holds the pid-file lock.
     if socket.exists() {
         std::fs::remove_file(socket)
@@ -71,8 +95,9 @@ async fn serve(socket: &Path, pid_file: &Path) -> Result<()> {
         .with_context(|| format!("cannot bind the socket {}", socket.display()))?;
     tracing::info!(socket = %socket.display(), pid = std::process::id(), "bzbd listening");
 
-    let mut terminate = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
-    let mut interrupt = signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?;
+    // The socket accepts connections and SIGTERM will be caught: only now may
+    // the caller stop waiting.
+    ready.report(SERVING);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
@@ -198,16 +223,43 @@ fn lock_pid_file(path: &Path) -> Result<Option<File>> {
     Ok(Some(file))
 }
 
+/// What the daemonized child writes down the pipe once it is serving;
+/// anything else is the reason it is not.
+const SERVING: &str = "serving";
+
+/// The daemonized child's end of the startup pipe. The forking parent stays
+/// alive reading it, so a failure after the fork reaches the caller's stderr
+/// instead of only `bzbd.log`.
+struct Ready(Option<File>);
+
+impl Ready {
+    /// Closing the pipe is what releases the parent, so it happens exactly
+    /// once, on the first report.
+    fn report(&mut self, message: &str) {
+        let Some(mut pipe) = self.0.take() else {
+            return;
+        };
+        if let Err(err) = pipe.write_all(message.as_bytes()) {
+            tracing::warn!("cannot report startup on the pipe: {err}");
+        }
+    }
+}
+
 /// Detaches from the terminal: fork, `setsid`, and point the standard streams
-/// at the log file. Same shape as pueued's `-d`.
-fn daemonize(log: &Path) -> Result<()> {
+/// at the log file. Same shape as pueued's `-d`, except the parent waits for
+/// the child's verdict before exiting. Only the child returns.
+fn daemonize(log: &Path) -> Result<Ready> {
     let log_file = open_log(log)?;
     let devnull = File::open("/dev/null").context("cannot open /dev/null")?;
+    let (reading, writing) = startup_pipe()?;
 
     match unsafe { libc::fork() } {
         -1 => return Err(io::Error::last_os_error()).context("cannot fork"),
-        0 => {}
-        _ => std::process::exit(0),
+        0 => drop(reading),
+        _ => {
+            drop(writing);
+            await_startup(reading, log);
+        }
     }
     if unsafe { libc::setsid() } == -1 {
         return Err(io::Error::last_os_error()).context("cannot setsid");
@@ -216,7 +268,38 @@ fn daemonize(log: &Path) -> Result<()> {
     redirect(&devnull, libc::STDIN_FILENO)?;
     redirect(&log_file, libc::STDOUT_FILENO)?;
     redirect(&log_file, libc::STDERR_FILENO)?;
-    Ok(())
+    Ok(Ready(Some(writing)))
+}
+
+fn startup_pipe() -> Result<(File, File)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error()).context("cannot create the startup pipe");
+    }
+    // Safety: `pipe` filled both fds and nothing else owns them.
+    Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+}
+
+/// Runs in the forking parent: blocks until the child reports, then exits
+/// with its verdict. An empty read means the child died without saying why.
+fn await_startup(mut reading: File, log: &Path) -> ! {
+    let mut message = String::new();
+    let code = match reading.read_to_string(&mut message) {
+        Ok(_) if message == SERVING => 0,
+        Ok(_) if message.is_empty() => {
+            eprintln!("bzbd: exited during startup; see {}", log.display());
+            1
+        }
+        Ok(_) => {
+            eprintln!("bzbd: {message}");
+            1
+        }
+        Err(err) => {
+            eprintln!("bzbd: cannot read the startup pipe: {err}");
+            1
+        }
+    };
+    std::process::exit(code);
 }
 
 fn redirect(source: &File, fd: i32) -> Result<()> {

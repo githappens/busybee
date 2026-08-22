@@ -2,7 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BusybeeError {
-    #[error("pueued is not running and auto-start failed: {context}")]
+    /// Raised for both daemons, so `context` names the one that failed.
+    #[error("{context}")]
     DaemonUnreachable { context: String },
 
     #[error("pueued rejected our request: {0}")]
@@ -42,6 +43,16 @@ mod tests {
             context: "no socket".into(),
         };
         assert_eq!(exit_code_for(&e), 2);
+    }
+
+    /// The variant covers both daemons, so the context names which one failed
+    /// and the wording must not contradict it.
+    #[test]
+    fn daemon_unreachable_shows_the_context_verbatim() {
+        let e = BusybeeError::DaemonUnreachable {
+            context: "cannot connect to bzbd at /tmp/bzbd.sock".into(),
+        };
+        assert_eq!(e.to_string(), "cannot connect to bzbd at /tmp/bzbd.sock");
     }
 
     #[test]

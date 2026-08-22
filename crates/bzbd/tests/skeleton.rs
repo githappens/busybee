@@ -179,6 +179,52 @@ async fn a_protocol_version_mismatch_gets_an_error_and_the_connection_closes() {
     );
 }
 
+/// Daemon mode forks; the parent may only exit once the child is serving,
+/// otherwise a client that waited for it still finds no socket.
+#[tokio::test]
+async fn daemonizing_returns_only_once_the_socket_is_serving() {
+    let tmp = TempDir::new().expect("create tempdir");
+    let status = Command::new(BZBD)
+        .env("BUSYBEE_STATE_DIR", tmp.path())
+        .status()
+        .expect("run bzbd");
+    assert!(status.success(), "bzbd exited {status}");
+
+    // Deliberately no waiting: the socket has to be there already.
+    let mut conn = Connection::connect(&tmp.path().join("bzbd.sock"))
+        .await
+        .expect("connect");
+    conn.send(Request::Ping).await.expect("send ping");
+    let Response::Pong { pid, .. } = conn.recv().await.expect("recv pong") else {
+        panic!("expected a Pong");
+    };
+
+    sigterm(pid);
+    wait_for(&tmp.path().join("bzbd.sock"), false);
+}
+
+/// A daemon that dies after the fork must say why on the caller's stderr; the
+/// forking parent has no other way to report it.
+#[tokio::test]
+async fn a_startup_failure_after_the_fork_reaches_the_caller() {
+    let tmp = TempDir::new().expect("create tempdir");
+    // A socket path far past sun_path's ~104 bytes: the directory is created
+    // by the parent, the bind then fails in the child.
+    let state = tmp.path().join("d".repeat(120));
+
+    let out = Command::new(BZBD)
+        .env("BUSYBEE_STATE_DIR", &state)
+        .output()
+        .expect("run bzbd");
+
+    assert!(!out.status.success(), "bzbd exited {}", out.status);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("cannot bind the socket"),
+        "stderr was {stderr:?}"
+    );
+}
+
 #[tokio::test]
 async fn connect_or_spawn_starts_a_daemon_when_none_is_running() {
     let tmp = TempDir::new().expect("create tempdir");

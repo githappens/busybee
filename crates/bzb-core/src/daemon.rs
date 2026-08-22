@@ -4,7 +4,7 @@
 use std::{
     env,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::Stdio,
     time::{Duration, Instant},
 };
 
@@ -14,6 +14,7 @@ use tokio::{
         unix::{OwnedReadHalf, OwnedWriteHalf},
         UnixStream,
     },
+    process::Command,
     time::sleep,
 };
 
@@ -23,9 +24,17 @@ use crate::protocol::{Hello, LeaseEvent, Request, Response, PROTOCOL_VERSION};
 /// Directory holding `bzbd.sock`, `bzbd.pid` and `bzbd.log`.
 pub fn state_dir() -> Result<PathBuf, BusybeeError> {
     if let Some(dir) = env::var_os("BUSYBEE_STATE_DIR") {
+        if dir.is_empty() {
+            return Err(BusybeeError::Other(
+                "BUSYBEE_STATE_DIR is set but empty; unset it or give it a directory".into(),
+            ));
+        }
         return Ok(PathBuf::from(dir));
     }
-    if let Some(dir) = env::var_os("XDG_STATE_HOME") {
+    // The XDG spec says a value that is empty or not absolute counts as unset.
+    // Resolving one relative to the working directory would give each caller
+    // its own socket, and each of those its own daemon.
+    if let Some(dir) = env::var_os("XDG_STATE_HOME").filter(|d| Path::new(d).is_absolute()) {
         return Ok(PathBuf::from(dir).join("busybee"));
     }
     let home = env::var_os("HOME").ok_or_else(|| {
@@ -101,7 +110,10 @@ impl Connection {
 
     /// Reader over the events the daemon streams on a `Submit` connection.
     pub fn events(&mut self) -> Events<'_> {
-        Events { conn: self }
+        Events {
+            conn: self,
+            finished: false,
+        }
     }
 
     async fn write_json(&mut self, value: &impl serde::Serialize) -> Result<(), BusybeeError> {
@@ -124,14 +136,23 @@ impl Connection {
 
 pub struct Events<'a> {
     conn: &'a mut Connection,
+    finished: bool,
 }
 
 impl Events<'_> {
-    /// The next lease event, or `None` once the daemon closes the connection.
+    /// The next lease event, or `None` once the stream ends. A stream that
+    /// ends before `Finished` lost the lease's exit code with it, so that is
+    /// an error rather than a normal end.
     pub async fn next(&mut self) -> Result<Option<LeaseEvent>, BusybeeError> {
         match self.conn.recv_opt().await? {
-            None => Ok(None),
-            Some(Response::Event(event)) => Ok(Some(event)),
+            None if self.finished => Ok(None),
+            None => Err(BusybeeError::DaemonUnreachable {
+                context: "bzbd closed the connection before the lease finished".into(),
+            }),
+            Some(Response::Event(event)) => {
+                self.finished |= matches!(event, LeaseEvent::Finished { .. });
+                Ok(Some(event))
+            }
             Some(Response::Error { message }) => Err(BusybeeError::EnqueueRejected(message)),
             Some(other) => Err(BusybeeError::Protocol(format!(
                 "expected an event, got {other:?}"
@@ -173,7 +194,7 @@ pub async fn connect_or_spawn_bzbd() -> Result<Connection, BusybeeError> {
             Err(other) => other,
         };
         if !spawned {
-            spawn_bzbd()?;
+            spawn_bzbd(deadline).await?;
             spawned = true;
             continue;
         }
@@ -194,29 +215,46 @@ pub async fn connect_or_spawn_bzbd() -> Result<Connection, BusybeeError> {
 
 /// Starts `bzbd` in daemonize mode. Prefers the binary next to the running
 /// executable so a locally built client starts its matching daemon, and falls
-/// back to PATH. The daemonizing parent exits as soon as it has forked, so
-/// waiting for it costs nothing and surfaces its startup errors.
-fn spawn_bzbd() -> Result<(), BusybeeError> {
+/// back to PATH. The daemonizing parent exits once its child is serving or has
+/// failed, so waiting for it both paces the retry and surfaces startup errors;
+/// a child that never reports is bounded by `deadline`.
+async fn spawn_bzbd(deadline: Instant) -> Result<(), BusybeeError> {
     let neighbour = env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("bzbd")))
         .filter(|path| path.is_file());
     let program = neighbour.unwrap_or_else(|| PathBuf::from("bzbd"));
 
-    let status = Command::new(&program)
+    let child = Command::new(&program)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| BusybeeError::DaemonUnreachable {
             context: format!("cannot spawn {}: {e}", program.display()),
         })?;
-    if !status.success() {
+
+    let budget = deadline.saturating_duration_since(Instant::now());
+    let Ok(output) = tokio::time::timeout(budget, child.wait_with_output()).await else {
         return Err(BusybeeError::DaemonUnreachable {
             context: format!(
-                "{} exited with {status}; see {}",
+                "{} did not report that it is serving within {} seconds; see {}",
                 program.display(),
+                STARTUP_TIMEOUT.as_secs(),
                 log_path()?.display()
+            ),
+        });
+    };
+    let output = output.map_err(|e| BusybeeError::DaemonUnreachable {
+        context: format!("cannot wait for {}: {e}", program.display()),
+    })?;
+    if !output.status.success() {
+        return Err(BusybeeError::DaemonUnreachable {
+            context: format!(
+                "{} exited with {}: {}",
+                program.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
             ),
         });
     }
@@ -253,11 +291,21 @@ mod tests {
         });
     }
 
+    /// All of the state-directory rules in one test: the environment is
+    /// process-wide, so splitting them would race across test threads.
     #[tokio::test]
-    async fn state_dir_prefers_the_override_then_xdg() {
+    async fn state_dir_resolves_the_environment_in_order() {
         temp_env(&[("BUSYBEE_STATE_DIR", Some("/tmp/override"))], || {
             assert_eq!(state_dir().unwrap(), PathBuf::from("/tmp/override"));
         });
+
+        // An empty override is a misconfiguration, not a request for the
+        // default: falling back silently would hide it.
+        temp_env(&[("BUSYBEE_STATE_DIR", Some(""))], || {
+            let err = state_dir().unwrap_err().to_string();
+            assert!(err.contains("BUSYBEE_STATE_DIR"), "message was {err:?}");
+        });
+
         temp_env(
             &[
                 ("BUSYBEE_STATE_DIR", None),
@@ -267,22 +315,53 @@ mod tests {
                 assert_eq!(state_dir().unwrap(), PathBuf::from("/tmp/xdg/busybee"));
             },
         );
+
+        // An empty or relative XDG value counts as unset. Honouring a relative
+        // one would put the socket in a different place per working directory,
+        // and each of those would auto-start its own daemon.
+        for value in ["", "relative/state"] {
+            temp_env(
+                &[
+                    ("BUSYBEE_STATE_DIR", None),
+                    ("XDG_STATE_HOME", Some(value)),
+                    ("HOME", Some("/tmp/home")),
+                ],
+                || {
+                    assert_eq!(
+                        state_dir().unwrap(),
+                        PathBuf::from("/tmp/home/.local/state/busybee"),
+                        "XDG_STATE_HOME={value:?}"
+                    );
+                },
+            );
+        }
+    }
+
+    fn event_line(event: LeaseEvent) -> String {
+        serde_json::to_string(&Response::Event(event)).unwrap()
+    }
+
+    fn pong() -> Response {
+        Response::Pong {
+            version: "0".into(),
+            pid: 1,
+        }
     }
 
     #[tokio::test]
-    async fn events_yields_streamed_events_until_the_daemon_closes() {
+    async fn events_yields_streamed_events_until_the_lease_finishes() {
         let dir = tempfile::TempDir::new().unwrap();
         let socket = dir.path().join("events.sock");
-        let queued =
-            serde_json::to_string(&Response::Event(LeaseEvent::Queued { id: 4, ahead: 1 }))
-                .unwrap();
         fake_daemon(
             socket.clone(),
-            Response::Pong {
-                version: "0".into(),
-                pid: 1,
-            },
-            vec![queued],
+            pong(),
+            vec![
+                event_line(LeaseEvent::Queued { id: 4, ahead: 1 }),
+                event_line(LeaseEvent::Finished {
+                    id: 4,
+                    exit_code: 0,
+                }),
+            ],
         )
         .await;
 
@@ -292,7 +371,37 @@ mod tests {
             events.next().await.unwrap(),
             Some(LeaseEvent::Queued { id: 4, ahead: 1 })
         ));
+        assert!(matches!(
+            events.next().await.unwrap(),
+            Some(LeaseEvent::Finished {
+                id: 4,
+                exit_code: 0
+            })
+        ));
         assert!(events.next().await.unwrap().is_none());
+    }
+
+    /// `Finished` carries the exit code, so a stream that stops before it lost
+    /// the lease. Reporting that as a normal end of stream would let a
+    /// `while let Some(..)` consumer exit as if the command had succeeded.
+    #[tokio::test]
+    async fn events_report_a_stream_that_ends_before_the_lease_finishes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("truncated.sock");
+        fake_daemon(
+            socket.clone(),
+            pong(),
+            vec![event_line(LeaseEvent::Queued { id: 7, ahead: 0 })],
+        )
+        .await;
+
+        let mut conn = Connection::connect(&socket).await.unwrap();
+        let mut events = conn.events();
+        assert!(events.next().await.unwrap().is_some());
+        let Err(BusybeeError::DaemonUnreachable { context }) = events.next().await else {
+            panic!("expected a truncated stream to be an error");
+        };
+        assert!(context.contains("finish"), "{context}");
     }
 
     /// A daemon that answered and refused our version is reachable: reporting
