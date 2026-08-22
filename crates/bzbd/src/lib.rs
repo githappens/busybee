@@ -143,9 +143,7 @@ async fn handle(stream: UnixStream) -> Result<()> {
         Line::Closed => return Ok(()),
         // Dropping the writer closes the connection: we cannot find the next
         // message on a connection whose framing we have already lost.
-        Line::Malformed(reason) => {
-            return reply(&mut writer, Response::Error { message: reason }).await
-        }
+        Line::Malformed(reason) => return reply(&mut writer, Response::error(reason)).await,
     };
     match serde_json::from_str::<Hello>(&first) {
         Ok(hello) if hello.hello == PROTOCOL_VERSION => {}
@@ -153,21 +151,17 @@ async fn handle(stream: UnixStream) -> Result<()> {
             // Dropping the writer closes the connection.
             return reply(
                 &mut writer,
-                Response::Error {
-                    message: format!(
-                        "protocol version {} is not supported; bzbd speaks {PROTOCOL_VERSION}",
-                        hello.hello
-                    ),
-                },
+                Response::error(format!(
+                    "protocol version {} is not supported; bzbd speaks {PROTOCOL_VERSION}",
+                    hello.hello
+                )),
             )
             .await;
         }
         Err(err) => {
             return reply(
                 &mut writer,
-                Response::Error {
-                    message: format!(r#"expected {{"hello": <version>}} first: {err}"#),
-                },
+                Response::error(format!(r#"expected {{"hello": <version>}} first: {err}"#)),
             )
             .await;
         }
@@ -178,25 +172,23 @@ async fn handle(stream: UnixStream) -> Result<()> {
         let line = match next_line(&mut incoming).await? {
             Line::Text(line) => line,
             Line::Closed => return Ok(()),
-            Line::Malformed(reason) => {
-                return reply(&mut writer, Response::Error { message: reason }).await
-            }
+            Line::Malformed(reason) => return reply(&mut writer, Response::error(reason)).await,
         };
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Ping) => pong(),
             // The token pool arrives with the scheduler. An all-zero StatusReply
             // would be indistinguishable from a real idle pool, so refuse
             // instead of inventing one.
-            Ok(Request::Status | Request::Submit(_) | Request::Cancel { .. }) => Response::Error {
-                message: "not implemented".into(),
-            },
-            // Without the request itself: escaping it and then JSON-encoding
-            // the message quadruples it, so echoing a line that fit within
-            // MAX_LINE_BYTES would answer with one that does not. The decoder
-            // reports the offending line and column anyway.
-            Err(err) => Response::Error {
-                message: format!("cannot decode the request: {err}"),
-            },
+            Ok(Request::Status | Request::Submit(_) | Request::Cancel { .. }) => {
+                Response::error("not implemented")
+            }
+            // Not echoing the request: escaping it and then JSON-encoding the
+            // message quadruples it, so a line that fit within MAX_LINE_BYTES
+            // would be answered with one that does not. The decoder still
+            // quotes what it choked on, which is why every error message here
+            // goes through Response::error to be cut to a length that survives
+            // encoding.
+            Err(err) => Response::error(format!("cannot decode the request: {err}")),
         };
         reply(&mut writer, response).await?;
     }

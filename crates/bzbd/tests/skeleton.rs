@@ -244,6 +244,35 @@ async fn oversized_line_error(daemon: &Fixture, prelude: &[u8]) -> String {
 /// that fits would be answered with a line that does not.
 #[tokio::test]
 async fn the_error_for_an_undecodable_request_stays_within_the_line_limit() {
+    let mut request = vec![b'"'; MAX_LINE_BYTES - 1];
+    request.push(b'\n');
+    let message = bounded_decode_error(&request).await;
+    assert!(
+        message.contains("decode"),
+        "expected a decode error, got {message:?}"
+    );
+}
+
+/// Serde quotes the input it choked on, so an in-limit line naming an unknown
+/// variant comes back embedded in the error the daemon would otherwise relay
+/// verbatim. The prefix matters more than the offending name.
+#[tokio::test]
+async fn the_error_for_an_unknown_request_variant_stays_within_the_line_limit() {
+    let mut request = vec![b'"'];
+    request.extend_from_slice(&vec![b'x'; MAX_LINE_BYTES - 3]);
+    request.extend_from_slice(b"\"\n");
+    assert_eq!(request.len(), MAX_LINE_BYTES);
+    let message = bounded_decode_error(&request).await;
+    assert!(
+        message.contains("decode"),
+        "expected a decode error, got {message:?}"
+    );
+}
+
+/// Sends `request` to a fresh daemon after the handshake and returns the error
+/// message, having checked that the reply itself stayed inside the frame the
+/// client is willing to read.
+async fn bounded_decode_error(request: &[u8]) -> String {
     let daemon = Fixture::start();
     let stream = tokio::net::UnixStream::connect(daemon.socket_path())
         .await
@@ -254,9 +283,7 @@ async fn the_error_for_an_undecodable_request_stays_within_the_line_limit() {
     writer.write_all(b"{\"hello\":1}\n").await.expect("hello");
     lines.next_line().await.expect("read").expect("a pong");
 
-    let mut request = vec![b'"'; MAX_LINE_BYTES - 1];
-    request.push(b'\n');
-    writer.write_all(&request).await.expect("write request");
+    writer.write_all(request).await.expect("write request");
 
     let reply = lines
         .next_line()
@@ -269,10 +296,7 @@ async fn the_error_for_an_undecodable_request_stays_within_the_line_limit() {
         reply.len()
     );
     match serde_json::from_str::<Response>(&reply).expect("decode reply") {
-        Response::Error { message } => assert!(
-            message.contains("decode"),
-            "expected a decode error, got {message:?}"
-        ),
+        Response::Error { message } => message,
         other => panic!("expected an Error, got {other:?}"),
     }
 }

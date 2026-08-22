@@ -100,6 +100,31 @@ pub enum Response {
     },
 }
 
+/// The longest message [`Response::error`] will carry. A decoder quotes the
+/// input it choked on, so an error over a line that fit within
+/// [`MAX_LINE_BYTES`] can already be longer than one, and JSON-encoding the
+/// message escapes it again. Cutting the message this far below the limit
+/// leaves room for either expansion; nothing said past a kilobyte of
+/// explanation helps the peer.
+const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
+
+impl Response {
+    /// An [`Response::Error`] whose encoded line fits [`MAX_LINE_BYTES`]
+    /// whatever the message quotes.
+    pub fn error(message: impl std::fmt::Display) -> Self {
+        let mut message = message.to_string();
+        if message.len() > MAX_ERROR_MESSAGE_BYTES {
+            let mut end = MAX_ERROR_MESSAGE_BYTES;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            message.push('…');
+        }
+        Response::Error { message }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusReply {
     pub pool_size: u32,
