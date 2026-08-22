@@ -241,11 +241,6 @@ pub async fn connect_or_spawn_bzbd() -> Result<Connection, BusybeeError> {
             Err(refusal @ BusybeeError::Protocol(_)) => return Err(refusal),
             Err(other) => other,
         };
-        if !spawned {
-            spawn_bzbd(&bzbd_program(), deadline).await?;
-            spawned = true;
-            continue;
-        }
         if Instant::now() >= deadline {
             return Err(BusybeeError::DaemonUnreachable {
                 context: format!(
@@ -257,7 +252,18 @@ pub async fn connect_or_spawn_bzbd() -> Result<Connection, BusybeeError> {
                 ),
             });
         }
-        sleep(Duration::from_millis(100)).await;
+        // Pace the retries, but not the first spawn: `spawn_bzbd` already
+        // waits for the daemon it starts to report that it is serving.
+        if spawned {
+            sleep(Duration::from_millis(100)).await;
+        }
+        // Spawning again is not redundant. A daemon shutting down unlinks its
+        // socket while it still holds the pid-file lock, so a spawn landing in
+        // that window exits "already running" without leaving anything to
+        // connect to; only a later one, once the lock is free, brings a daemon
+        // back. An unnecessary spawn costs a fork that exits the same way.
+        spawn_bzbd(&bzbd_program(), deadline).await?;
+        spawned = true;
     }
 }
 

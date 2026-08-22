@@ -215,6 +215,7 @@ dependencies = [
  "bzb-core",
  "libc",
  "serde_json",
+ "serial_test",
  "tempfile",
  "tokio",
  "tracing",

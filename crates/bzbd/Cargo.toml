@@ -22,3 +22,6 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# `BUSYBEE_STATE_DIR` and `PATH` are process-wide, so the tests that set them
+# cannot run alongside each other.
+serial_test = "3"

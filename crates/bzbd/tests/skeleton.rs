@@ -5,7 +5,7 @@
 
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::{fd::AsRawFd, unix::fs::PermissionsExt},
     path::{Path, PathBuf},
     process::{Child, Command},
     time::{Duration, Instant},
@@ -463,6 +463,7 @@ async fn a_startup_failure_after_the_fork_reaches_the_caller() {
 }
 
 #[tokio::test]
+#[serial_test::serial]
 async fn connect_or_spawn_starts_a_daemon_when_none_is_running() {
     let tmp = TempDir::new().expect("create tempdir");
     // `connect_or_spawn_bzbd` reads the environment of this process and looks
@@ -486,6 +487,43 @@ async fn connect_or_spawn_starts_a_daemon_when_none_is_running() {
             .trim(),
         pid.to_string()
     );
+    sigterm(pid);
+    wait_for(&tmp.path().join("bzbd.sock"), false);
+}
+
+/// A daemon on its way out unlinks its socket first and keeps the pid-file
+/// lock until its runtime is gone. An auto-spawn landing in that window exits
+/// "already running" without serving, so the client has to spawn again once
+/// the lock is free rather than wait out its deadline on an absent socket.
+#[tokio::test]
+#[serial_test::serial]
+async fn connect_or_spawn_starts_a_daemon_once_a_departing_one_releases_the_lock() {
+    let tmp = TempDir::new().expect("create tempdir");
+    std::env::set_var("BUSYBEE_STATE_DIR", tmp.path());
+    std::env::set_var("PATH", Path::new(BZBD).parent().expect("bzbd's directory"));
+
+    // Stand in for that daemon: the lock is held, the socket is already gone.
+    let pid_file = fs::File::create(tmp.path().join("bzbd.pid")).expect("create the pid file");
+    assert_eq!(
+        unsafe { libc::flock(pid_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "flock failed"
+    );
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        // Teardown finishes: closing the file releases the lock.
+        drop(pid_file);
+    });
+
+    let mut conn = bzb_core::daemon::connect_or_spawn_bzbd()
+        .await
+        .expect("connect or spawn");
+    conn.send(Request::Ping).await.expect("send ping");
+    let pid = match conn.recv().await.expect("recv pong") {
+        Response::Pong { pid, .. } => pid,
+        other => panic!("expected a Pong, got {other:?}"),
+    };
+
     sigterm(pid);
     wait_for(&tmp.path().join("bzbd.sock"), false);
 }
