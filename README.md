@@ -54,7 +54,7 @@ busybee status --json                       # the same, for scripts and agents
 
 `busybee status` prints the token pool and one row per task; `--json` prints
 the daemon's reply as a single JSON line. With no daemon running it reports an
-idle pool on stderr and exits 0.
+idle pool on stderr and exits 0, unless the daemon died leaving tasks behind.
 
 Press `q` in the monitor to quit. Press `Ctrl-C` while blocked to cancel — the
 queued or running task is killed and busybee exits 130.

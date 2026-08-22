@@ -5,11 +5,11 @@
 //! daemon reports and computes nothing of its own beyond `approx_in_use`,
 //! which is arithmetic on the numbers in the reply.
 
-use std::time::Duration;
+use std::{io::ErrorKind, time::Duration};
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use bzb_core::{
-    daemon::{socket_path, Connection},
+    daemon::{leases_path, socket_path, Connection},
     protocol::{LeaseView, Request, Response, StatusReply},
 };
 
@@ -27,16 +27,11 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 /// is listening on is reported as what it is, and everything else propagates.
 pub async fn run(json: bool) -> Result<()> {
     let socket = socket_path()?;
-    // Nothing listening is not a degraded path to report around: no daemon
-    // means no pool, no leases and nothing being gated, which is what this
-    // says. It goes to stderr like every other busybee message, so a `--json`
-    // consumer sees an empty stdout rather than an invented reply — an all-zero
-    // `StatusReply` is indistinguishable from a real idle pool. A daemon that
-    // answered and then failed the handshake is running, so that propagates
-    // rather than being reported as an idle machine.
+    // A daemon that answered and then failed the handshake is running, so that
+    // propagates rather than being reported as an idle machine; nothing
+    // listening is `report_absent_daemon`'s to explain.
     let Some(mut conn) = Connection::connect_if_listening(&socket).await? else {
-        eprintln!("busybee: daemon not running; pool idle");
-        return Ok(());
+        return report_absent_daemon();
     };
 
     let exchange = async {
@@ -64,6 +59,44 @@ pub async fn run(json: bool) -> Result<()> {
             render(&reply)
         }
     );
+    Ok(())
+}
+
+/// What to report when nothing is listening on the socket.
+///
+/// No daemon usually means no pool, no leases and nothing being gated, which is
+/// what the message says: it is a true report, not a degraded one, and it goes
+/// to stderr like every other busybee message so a `--json` consumer sees an
+/// empty stdout rather than an invented reply — an all-zero `StatusReply` is
+/// indistinguishable from a real idle pool.
+///
+/// A daemon that *died* is the exception. Its tasks are pueued's children and
+/// keep running (`docs/design/bzbd.md` §Failure and recovery), and `leases.json`
+/// is the record of them it left behind. Leases in that file are load on the
+/// machine this command cannot report on, so it says so and exits non-zero
+/// rather than calling the pool idle and inviting more.
+fn report_absent_daemon() -> Result<()> {
+    let path = leases_path()?;
+    let recorded: Vec<serde_json::Value> = match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .with_context(|| format!("cannot read the leases bzbd left in {}", path.display()))?,
+        // Never written, or written and cleaned up: either way it records no
+        // leases, which is the same as an empty one.
+        Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
+        Err(e) => bail!(
+            "cannot open the leases bzbd left in {}: {e}",
+            path.display()
+        ),
+    };
+    if !recorded.is_empty() {
+        bail!(
+            "bzbd is not running, but {} still records {} lease(s) it held: the tasks \
+             pueued started for them may still be on the machine, so the pool is not idle",
+            path.display(),
+            recorded.len()
+        );
+    }
+    eprintln!("busybee: daemon not running; pool idle");
     Ok(())
 }
 

@@ -265,8 +265,8 @@ async fn the_real_daemon_answers_the_status_request() {
 }
 
 /// A daemon killed outright cannot unlink its socket, so the file outlives it.
-/// Nothing is listening on it, which is the idle pool the message describes —
-/// the presence of the file is not what decides that.
+/// Nothing is listening on it and it held no leases, which is the idle pool the
+/// message describes — the presence of the file is not what decides that.
 #[tokio::test]
 async fn a_killed_daemon_leaves_a_socket_that_still_reports_an_idle_pool() {
     let mut daemon = RealBzbd::start();
@@ -286,6 +286,35 @@ async fn a_killed_daemon_leaves_a_socket_that_still_reports_an_idle_pool() {
         stderr.contains("busybee: daemon not running; pool idle"),
         "stderr was {stderr:?}"
     );
+}
+
+/// `docs/design/bzbd.md` §Failure and recovery: a bzbd that dies leaves its
+/// tasks running — they are pueued's children — and `leases.json` records them.
+/// Nothing is listening, but the pool is not idle, and an agent told that it is
+/// starts more load on top of what is already on the machine.
+#[tokio::test]
+async fn a_daemon_that_died_with_live_leases_is_not_reported_as_an_idle_pool() {
+    let state = TempDir::new().expect("create tempdir");
+    std::fs::write(
+        state.path().join("leases.json"),
+        r#"[{"id":1,"label":"ui build","class":"static","cores_held":9,
+             "pueue_task_id":3,"started_at_unix_ms":1}]"#,
+    )
+    .expect("write leases.json");
+
+    let output = run_status(state.path(), &[]).await;
+
+    assert!(
+        !output.status.success(),
+        "busybee status exited {}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("pool idle"),
+        "leases left running were reported as an idle pool: {stderr:?}"
+    );
+    assert!(stderr.contains("leases.json"), "stderr was {stderr:?}");
 }
 
 /// A daemon that is listening and failing is not an idle machine. Reporting it
