@@ -1,4 +1,5 @@
 mod cli;
+mod config;
 mod detach;
 mod enqueue;
 mod monitor;
@@ -8,7 +9,7 @@ mod status;
 mod version_parse;
 
 use clap::Parser;
-use cli::{Cli, Mode};
+use cli::{Cli, ConfigAction, Mode};
 
 pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -37,6 +38,11 @@ pub fn run() -> anyhow::Result<()> {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(status::run(json))?;
             Ok(())
+        }
+        Mode::Config(ConfigAction::Show) => config::show(),
+        Mode::Config(ConfigAction::Reload) => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(config::reload())
         }
         Mode::MissingCommand => {
             let argv0 = std::env::args().next().unwrap_or_default();

@@ -490,3 +490,120 @@ fn a_daemon_that_cannot_start_stops_the_command() {
     );
     assert!(!marker.exists(), "the command ran without a daemon");
 }
+
+/// `config show` is the one command whose result is the configuration itself,
+/// so it prints to stdout — and it prints every key, not only the ones the
+/// file happens to mention.
+#[test]
+fn config_show_prints_the_effective_config() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    std::fs::write(&path, "pool_size = 7\n").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_busybee"))
+        .env("BUSYBEE_CONFIG", &path)
+        .args(["config", "show"])
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("pool_size = 7"), "stdout was {stdout}");
+    assert!(stdout.contains("max_concurrent = 4"), "stdout was {stdout}");
+}
+
+/// Nothing to reload without a daemon, and starting one to answer would be a
+/// surprise. Say which socket was tried instead.
+#[test]
+fn config_reload_without_a_daemon_is_an_error_that_says_why() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_busybee"))
+        .env("BUSYBEE_STATE_DIR", tmp.path())
+        .env("BUSYBEE_CONFIG", tmp.path().join("config.toml"))
+        .args(["config", "reload"])
+        .output()
+        .unwrap();
+
+    assert!(!out.status.success(), "reload succeeded with no daemon");
+    assert!(
+        stderr(&out).contains("bzbd is not running"),
+        "stderr was {:?}",
+        stderr(&out)
+    );
+}
+
+/// Runs `busybee config reload` against a state directory of the test's own,
+/// and gives up on the process if it never exits — the thing under test here is
+/// a command that hangs, so without a deadline of the test's own a regression
+/// stalls the suite instead of failing it.
+async fn run_config_reload(state: &Path) -> Output {
+    let run = tokio::process::Command::new(env!("CARGO_BIN_EXE_busybee"))
+        .env("BUSYBEE_STATE_DIR", state)
+        .env("BUSYBEE_CONFIG", state.join("config.toml"))
+        .args(["config", "reload"])
+        .kill_on_drop(true)
+        .output();
+    tokio::time::timeout(PATIENCE, run)
+        .await
+        .expect("busybee config reload never exited")
+        .expect("run busybee config reload")
+}
+
+/// A daemon that accepts the connection and then fails — a dropped socket, a
+/// refused protocol version — is running. Calling that "not running" puts a
+/// false diagnosis at the top of the error, and the version refusal is exactly
+/// what an upgraded client meets across an in-place upgrade.
+#[tokio::test]
+async fn config_reload_against_a_listening_daemon_does_not_call_it_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::UnixListener::bind(tmp.path().join("bzbd.sock")).expect("bind");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        drop(stream);
+    });
+
+    let out = run_config_reload(tmp.path()).await;
+
+    assert!(!out.status.success(), "reload succeeded against a failure");
+    assert!(
+        !stderr(&out).contains("is not running"),
+        "a listening daemon was reported absent: {:?}",
+        stderr(&out)
+    );
+}
+
+/// The handshake has a deadline of its own; the request after it does not. A
+/// daemon that pongs and then wedges would hold this one-shot command open for
+/// as long as it stays wedged.
+#[tokio::test]
+async fn config_reload_against_a_wedged_daemon_gives_up() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::UnixListener::bind(tmp.path().join("bzbd.sock")).expect("bind");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        lines.next_line().await.expect("read").expect("a hello");
+        let pong = Response::Pong {
+            version: "test".into(),
+            pid: std::process::id(),
+        };
+        let line = format!("{}\n", serde_json::to_string(&pong).expect("encode"));
+        writer.write_all(line.as_bytes()).await.expect("write");
+        // Handshaken, and silent from here: nothing answers the reload request
+        // and nothing closes the connection on it.
+        std::future::pending::<()>().await;
+    });
+
+    let out = run_config_reload(tmp.path()).await;
+
+    assert!(!out.status.success(), "reload succeeded against silence");
+    assert!(
+        stderr(&out).contains("did not answer"),
+        "stderr was {:?}",
+        stderr(&out)
+    );
+}

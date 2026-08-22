@@ -25,7 +25,12 @@ use crate::classify::Class;
 /// 3: [`LeaseRequest::detached`]. Neither direction survives the mismatch: a
 /// v2 client's `Submit` no longer decodes, and a v2 daemon ignores the field
 /// and kills a `--detach`ed lease the moment the client leaves.
-pub const PROTOCOL_VERSION: u32 = 3;
+///
+/// 4: [`Request::ConfigReload`] and [`Response::ConfigReloaded`], neither of
+/// which a v3 peer can decode — a `busybee config reload` against a daemon
+/// left running across the upgrade would hear "that is not a request" rather
+/// than the mismatch the handshake exists to name.
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The longest line either end will read. Anyone who can open the socket could
 /// otherwise stream a newline-free message until the long-lived daemon runs out
@@ -92,7 +97,13 @@ pub enum Request {
     Ping,
     Status,
     Submit(LeaseRequest),
-    Cancel { lease: u64 },
+    Cancel {
+        lease: u64,
+    },
+    /// Re-read the config file. The daemon answers
+    /// [`Response::ConfigReloaded`] with what it now runs on, or
+    /// [`Response::Error`] with the reason it kept what it had.
+    ConfigReload,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +129,12 @@ pub enum Response {
     /// The request was carried out. A cancel that changed nothing is an
     /// [`Response::Error`] instead: the caller named a lease that is not there.
     Ack,
+    /// The configuration the daemon runs on after a [`Request::ConfigReload`].
+    ConfigReloaded {
+        pool_size: u32,
+        max_concurrent: u32,
+        drain_deadline_ms: u64,
+    },
     /// Streamed on a `Submit` connection for the lifetime of the lease.
     Event(LeaseEvent),
     Error {
@@ -295,6 +312,38 @@ mod tests {
         assert_ne!(
             PROTOCOL_VERSION, 1,
             "a required field the previous version never sent needs a version bump"
+        );
+    }
+
+    /// [`Request::ConfigReload`] was added after protocol version 3. A
+    /// version-3 daemon — one still running from before an in-place upgrade —
+    /// cannot decode it, and answers the generic "that is not a request" error
+    /// rather than naming the mismatch. The handshake is where that pairing is
+    /// supposed to be refused, and it only refuses it if [`PROTOCOL_VERSION`]
+    /// moved with the variant.
+    #[test]
+    fn a_config_reload_does_not_decode_against_protocol_version_3() {
+        /// [`Request`] as version 3 spelled it. Nothing reads the payloads —
+        /// it is the set of variants that decides what decodes.
+        #[derive(Debug, Deserialize)]
+        #[allow(dead_code)]
+        enum Version3 {
+            Ping,
+            Status,
+            Submit(LeaseRequest),
+            Cancel { lease: u64 },
+        }
+
+        let line = serde_json::to_string(&Request::ConfigReload).expect("encode");
+
+        let error = serde_json::from_str::<Version3>(&line)
+            .expect_err("a version-3 daemon must not decode a config reload")
+            .to_string();
+
+        assert!(error.contains("ConfigReload"), "error was {error:?}");
+        assert_ne!(
+            PROTOCOL_VERSION, 3,
+            "a request the previous version cannot decode needs a version bump"
         );
     }
 

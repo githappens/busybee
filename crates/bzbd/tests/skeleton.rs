@@ -17,7 +17,7 @@ use bzb_core::{
     daemon::Connection,
     protocol::{Request, Response, MAX_LINE_BYTES, PROTOCOL_VERSION},
 };
-use common::{sigterm, wait_for, Fixture, BZBD};
+use common::{isolated_config, sigterm, wait_for, Fixture, BZBD};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -98,11 +98,7 @@ async fn status_reports_an_untouched_pool_while_no_lease_exists() {
 async fn a_second_instance_exits_zero_and_the_first_keeps_serving() {
     let daemon = Fixture::start();
 
-    let second = Command::new(BZBD)
-        .arg("--foreground")
-        .env("BUSYBEE_STATE_DIR", daemon.state_dir())
-        .output()
-        .expect("run second bzbd");
+    let second = daemon.run_second_instance();
 
     assert!(
         second.status.success(),
@@ -363,6 +359,7 @@ async fn daemonizing_returns_only_once_the_socket_is_serving() {
     let tmp = TempDir::new().expect("create tempdir");
     let status = Command::new(BZBD)
         .env("BUSYBEE_STATE_DIR", tmp.path())
+        .env("BUSYBEE_CONFIG", isolated_config(tmp.path()))
         .status()
         .expect("run bzbd");
     assert!(status.success(), "bzbd exited {status}");
@@ -391,6 +388,7 @@ async fn a_startup_failure_after_the_fork_reaches_the_caller() {
 
     let out = Command::new(BZBD)
         .env("BUSYBEE_STATE_DIR", &state)
+        .env("BUSYBEE_CONFIG", isolated_config(tmp.path()))
         .output()
         .expect("run bzbd");
 
@@ -409,6 +407,7 @@ async fn connect_or_spawn_starts_a_daemon_when_none_is_running() {
     // `connect_or_spawn_bzbd` reads the environment of this process and looks
     // up `bzbd` on PATH, so both have to be set here.
     std::env::set_var("BUSYBEE_STATE_DIR", tmp.path());
+    std::env::set_var("BUSYBEE_CONFIG", isolated_config(tmp.path()));
     std::env::set_var("PATH", Path::new(BZBD).parent().expect("bzbd's directory"));
 
     let mut conn = bzb_core::daemon::connect_or_spawn_bzbd()
@@ -440,6 +439,7 @@ async fn connect_or_spawn_starts_a_daemon_when_none_is_running() {
 async fn connect_or_spawn_starts_a_daemon_once_a_departing_one_releases_the_lock() {
     let tmp = TempDir::new().expect("create tempdir");
     std::env::set_var("BUSYBEE_STATE_DIR", tmp.path());
+    std::env::set_var("BUSYBEE_CONFIG", isolated_config(tmp.path()));
     std::env::set_var("PATH", Path::new(BZBD).parent().expect("bzbd's directory"));
 
     // Stand in for that daemon: the lock is held, the socket is already gone.

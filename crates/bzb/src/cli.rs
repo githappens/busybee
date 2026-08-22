@@ -56,6 +56,20 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+
+    /// Inspect or reload ~/.config/busybee/config.toml.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Subcommand)]
+pub enum ConfigAction {
+    /// Print the effective configuration (defaults merged) as TOML.
+    Show,
+    /// Make the running bzbd re-read the config file.
+    Reload,
 }
 
 impl Cli {
@@ -65,6 +79,7 @@ impl Cli {
             (Some(Command::Monitor), _, _) => Mode::Monitor,
             (Some(Command::Status { json }), _, _) => Mode::Status { json: *json },
             (Some(Command::Cancel { lease }), _, _) => Mode::Cancel(*lease),
+            (Some(Command::Config { action }), _, _) => Mode::Config(*action),
             (None, true, false) => Mode::Detach,
             (None, false, false) => Mode::Blocking,
             (None, _, true) => Mode::MissingCommand,
@@ -79,6 +94,7 @@ pub enum Mode {
     Monitor,
     Status { json: bool },
     Cancel(u64),
+    Config(ConfigAction),
     MissingCommand,
 }
 
@@ -157,6 +173,18 @@ mod tests {
         let cli = parse(&["--", "make"]);
         assert_eq!(cli.class, None);
         assert_eq!(cli.cores, None);
+    }
+
+    #[test]
+    fn config_subcommands() {
+        assert_eq!(
+            parse(&["config", "show"]).mode(),
+            Mode::Config(ConfigAction::Show)
+        );
+        assert_eq!(
+            parse(&["config", "reload"]).mode(),
+            Mode::Config(ConfigAction::Reload)
+        );
     }
 
     #[test]

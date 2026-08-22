@@ -39,6 +39,10 @@ use serde::{Deserialize, Serialize};
 
 /// Value written into `MAKEFLAGS` / `CARGO_MAKEFLAGS` for pool members.
 const JOBSERVER_AUTH: &str = "--jobserver-auth=fifo:{fifo}";
+/// Every variable a jobserver task's fifo authentication can arrive in. Cargo
+/// reads `CARGO_MAKEFLAGS` before `MAKEFLAGS`, so a recipe that sets only the
+/// latter still owns both — see the collision guard in [`classify`].
+const JOBSERVER_AUTH_VARS: [&str; 2] = ["MAKEFLAGS", "CARGO_MAKEFLAGS"];
 /// `Plan::tool` for an opaque shell string (`sh -c '…'`).
 const TOOL_SHELL: &str = "<shell>";
 /// `Plan::tool` when there is nothing to look at (empty argv).
@@ -146,6 +150,11 @@ pub struct Rule {
     /// a notice is emitted, and for [`Inject::Xcodebuild`] the injection is
     /// skipped entirely (argv injection would otherwise duplicate the flag).
     pub parallel_flags: Vec<String>,
+    /// Extra variables the row sets, on top of whatever [`Rule::inject`]
+    /// recipe applies. Empty for every built-in row: this is what carries a
+    /// config file's `[overrides]` `env` table, whose values the file cannot
+    /// express as one of the fixed recipes.
+    pub env_set: Vec<(String, String)>,
 }
 
 /// Ordered list of classification rows; the first match wins.
@@ -214,6 +223,7 @@ pub fn default_table() -> Table {
             class,
             inject,
             parallel_flags: flags.iter().map(|f| f.to_string()).collect(),
+            env_set: Vec::new(),
         }
     }
 
@@ -317,6 +327,39 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
     };
 
     apply_injection(&mut plan, inject, user_flag.is_some());
+    // Injected before the row's own variables are layered on, so that the
+    // collision guard below covers them too: these two report the bargain the
+    // task was admitted under, and a row that replaced them would describe
+    // itself to the task as something other than what the scheduler booked.
+    plan.env_set
+        .push(("BUSYBEE_CLASS".to_string(), class.as_str().to_string()));
+    plan.env_set
+        .push(("BUSYBEE_CORES".to_string(), "{cores}".to_string()));
+    // A row's own variables ride along with whichever recipe it kept: they are
+    // core counts and tool-specific knobs, so they stay useful under a forced
+    // class the way an injected `GOMAXPROCS` does. What they may not do is
+    // supply the fifo authentication: a row that named a fifo of its own would
+    // keep the class that reserves no tokens while running outside the pool.
+    // Busybee owns every variable it already set, and — for a jobserver task —
+    // every variable the authentication can arrive in, whether the recipe
+    // filled it or not. The dropped value is named.
+    if let Some(rule) = rule {
+        for (name, value) in &rule.env_set {
+            let taken = plan.env_set.iter().any(|(set, _)| set == name);
+            let reserved =
+                class == Class::Jobserver && JOBSERVER_AUTH_VARS.contains(&name.as_str());
+            if taken || reserved {
+                plan.notices.push(format!(
+                    "the {} row for {} sets {name}; busybee owns that variable and the \
+                     configured value is dropped",
+                    class.as_str(),
+                    plan.tool
+                ));
+                continue;
+            }
+            plan.env_set.push((name.clone(), value.clone()));
+        }
+    }
 
     match (class, overrides.cores) {
         (Class::Jobserver, Some(_)) => plan.notices.push(
@@ -325,11 +368,6 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
         ),
         (_, cores) => plan.cores_wanted = cores,
     }
-
-    plan.env_set
-        .push(("BUSYBEE_CLASS".to_string(), class.as_str().to_string()));
-    plan.env_set
-        .push(("BUSYBEE_CORES".to_string(), "{cores}".to_string()));
 
     drop_shadowed_env(&mut plan, &env_assigned);
 
@@ -543,7 +581,9 @@ fn unwrap_wrappers(argv: &[String]) -> (String, &[String], Vec<&str>) {
     }
 }
 
-fn basename(token: &str) -> &str {
+/// The tool a token names, which is what the table is keyed by — and what
+/// `config`'s override keys are matched on, hence the crate visibility.
+pub(crate) fn basename(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
 
@@ -664,6 +704,88 @@ mod tests {
         assert!(!flag_matches("--jobs", "--jobs8"));
         assert!(flag_matches("--jobs", "--jobs=8"));
         assert!(!flag_matches("--jobs", "--jobs="));
+    }
+
+    /// `--class jobserver` reaches the fifo injection the same way a
+    /// jobserver row does, so a row's own variables cannot take `MAKEFLAGS`
+    /// from under it there either.
+    #[test]
+    fn a_forced_jobserver_class_keeps_the_authentication_over_a_rows_own_env() {
+        let table = Table {
+            rows: vec![Rule {
+                tool: "mytool".to_string(),
+                requires: None,
+                class: Class::Static,
+                inject: Inject::None,
+                parallel_flags: Vec::new(),
+                env_set: vec![("MAKEFLAGS".to_string(), "-j16".to_string())],
+            }],
+        };
+        let overrides = Overrides {
+            class: Some(Class::Jobserver),
+            cores: None,
+        };
+
+        let plan = classify(&["mytool".to_string()], &overrides, &table);
+
+        assert_eq!(
+            plan.env_set
+                .iter()
+                .filter(|(k, _)| k == "MAKEFLAGS")
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>(),
+            vec![JOBSERVER_AUTH],
+            "env_set was {:?}",
+            plan.env_set
+        );
+        assert!(plan.notices.iter().any(|n| n.contains("MAKEFLAGS")));
+    }
+
+    /// `BUSYBEE_CLASS` and `BUSYBEE_CORES` are how a task reports the bargain
+    /// it was admitted under, so a row's own variables may not take them
+    /// either. They are injected for every class, not by a recipe, so the
+    /// collision has to be caught for them by name rather than by whatever
+    /// [`apply_injection`] happened to set.
+    #[test]
+    fn a_rows_own_env_cannot_take_the_busybee_variables() {
+        let table = Table {
+            rows: vec![Rule {
+                tool: "mytool".to_string(),
+                requires: None,
+                class: Class::Static,
+                inject: Inject::None,
+                parallel_flags: Vec::new(),
+                env_set: vec![
+                    ("BUSYBEE_CLASS".to_string(), "none".to_string()),
+                    ("BUSYBEE_CORES".to_string(), "64".to_string()),
+                ],
+            }],
+        };
+
+        let plan = classify(&["mytool".to_string()], &Overrides::default(), &table);
+
+        assert_eq!(
+            plan.env_set
+                .iter()
+                .filter(|(k, _)| k == "BUSYBEE_CLASS")
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>(),
+            vec!["static"],
+            "env_set was {:?}",
+            plan.env_set
+        );
+        assert_eq!(
+            plan.env_set
+                .iter()
+                .filter(|(k, _)| k == "BUSYBEE_CORES")
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>(),
+            vec!["{cores}"],
+            "env_set was {:?}",
+            plan.env_set
+        );
+        assert!(plan.notices.iter().any(|n| n.contains("BUSYBEE_CLASS")));
+        assert!(plan.notices.iter().any(|n| n.contains("BUSYBEE_CORES")));
     }
 
     #[test]

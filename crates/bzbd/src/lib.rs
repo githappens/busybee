@@ -1,9 +1,10 @@
 //! `bzbd`, busybee's broker daemon.
 //!
-//! It owns the state directory, the unix socket and the single-instance lock,
-//! and it is the only thing that submits tasks to pueued. A connection is a
-//! lease: `Submit` hands the request to the [`leases`] actor and streams that
-//! lease's events back until it finishes or the client hangs up.
+//! It owns the state directory, the unix socket, the single-instance lock and
+//! the loaded config file, and it is the only thing that submits tasks to
+//! pueued. A connection is a lease: `Submit` hands the request to the
+//! [`leases`] actor and streams that lease's events back until it finishes or
+//! the client hangs up.
 pub mod leases;
 pub mod submit;
 
@@ -17,16 +18,17 @@ use std::{
     path::Path,
     sync::{
         mpsc::{self, RecvTimeoutError, Sender},
-        Mutex,
+        Arc, Mutex,
     },
     time::Duration,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use bzb_core::{
+    config::Config,
     daemon::{log_path, pid_path, socket_path, state_dir},
     protocol::{read_line, Hello, LeaseEvent, Line, Request, Response, PROTOCOL_VERSION},
-    scheduler::{LeaseId, Params},
+    scheduler::LeaseId,
 };
 use tokio::{
     io::{AsyncWriteExt, BufReader},
@@ -128,8 +130,28 @@ fn start(ready: &mut Ready, log: &Path) -> Result<()> {
         return Ok(());
     };
 
+    // Only now, holding the lock: this process is the one that will serve, so
+    // the file it refuses to run on is its own. A second bzbd that found the
+    // daemon already up starts nothing and has nothing to refuse, and a config
+    // that went bad after the running daemon read it must not turn that
+    // invocation into a failure. Running the machine's builds under a
+    // configuration nobody wrote is worse than not running them, so a file this
+    // process cannot read stops it here; the reason travels back up the startup
+    // pipe to the caller's terminal rather than sitting in `bzbd.log`.
+    let config = Config::load()?;
+    tracing::info!(
+        pool_size = config.pool_size,
+        max_concurrent = config.max_concurrent,
+        drain_deadline_ms = config.drain_deadline_ms,
+        "config loaded"
+    );
+
     let runtime = tokio::runtime::Runtime::new().context("cannot start the tokio runtime")?;
-    let served = runtime.block_on(serve(&socket_path()?, ready));
+    let served = runtime.block_on(serve(
+        &socket_path()?,
+        ready,
+        Arc::new(tokio::sync::Mutex::new(config)),
+    ));
     // Every connection task dies with the runtime, so this is the point at
     // which no daemon work is left. Unlinking `bzbd.pid` before it would let a
     // concurrently launched bzbd create a fresh inode, lock that instead, and
@@ -158,14 +180,18 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<bool> {
 /// Serves until SIGTERM or SIGINT, then closes the listener and unlinks the
 /// socket. The pid file is `start`'s to unlink, once the runtime this runs on
 /// is gone: while it survives, so does the daemon work its lock excludes.
-async fn serve(socket: &Path, ready: &mut Ready) -> Result<()> {
+async fn serve(socket: &Path, ready: &mut Ready, config: SharedConfig) -> Result<()> {
     // Before the socket exists: the socket is how everyone else finds us, and
     // a SIGTERM landing before these are installed kills us on the spot,
     // leaving the socket and the pid file behind.
     let mut terminate = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?;
+    let mut hangup = signal(SignalKind::hangup()).context("cannot listen for SIGHUP")?;
 
-    let (actor, leases, commands) = Leases::new(params()?, bzb_core::daemon::leases_path()?);
+    // The file the daemon refused to start without: the scheduler opens on the
+    // pool it describes, not on a hardcoded one.
+    let params = config.lock().await.params();
+    let (actor, leases, commands) = Leases::new(params, bzb_core::daemon::leases_path()?);
     tokio::spawn(actor.run(commands));
 
     // Nothing else can be listening: this process holds the pid-file lock.
@@ -187,12 +213,19 @@ async fn serve(socket: &Path, ready: &mut Ready) -> Result<()> {
             accepted = listener.accept() => {
                 let (stream, _) = accepted.context("cannot accept a connection")?;
                 let leases = leases.clone();
+                let config = config.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle(stream, leases).await {
+                    if let Err(err) = handle(stream, leases, config).await {
                         tracing::warn!("connection failed: {err:#}");
                     }
                 });
             }
+            // A signal has no reply, so the log is where the outcome goes.
+            _ = hangup.recv() => match reload(&config, &leases).await {
+                // A finished reload has already logged what it put in force.
+                Ok(_) => {}
+                Err(refusal) => tracing::warn!("{refusal}"),
+            },
             _ = terminate.recv() => break,
             _ = interrupt.recv() => break,
         }
@@ -205,20 +238,76 @@ async fn serve(socket: &Path, ready: &mut Ready) -> Result<()> {
     Ok(())
 }
 
-/// Admission parameters until the config file lands: one token per logical
-/// core, and `docs/design/bzbd.md` §Admission policy's default of four
-/// concurrent leases.
-fn params() -> Result<Params> {
-    let pool_size = std::thread::available_parallelism()
-        .context("cannot count the machine's logical cores")?
-        .get();
-    Ok(Params {
-        pool_size: pool_size as u32,
-        max_concurrent: 4,
-    })
+/// The configuration a connection task shares with the accept loop. A tokio
+/// mutex, because [`reload`] holds it across the await on the scheduler: that
+/// is what keeps two reloads from interleaving.
+type SharedConfig = Arc<tokio::sync::Mutex<Config>>;
+
+/// Re-reads the config file and hands the new admission parameters to the
+/// scheduler. A file that will not parse or validate leaves the daemon on the
+/// configuration it already had — no half-applied reload, and the scheduler is
+/// never told about a file that was refused — with the line to fix in the
+/// reason. The scheduler taking the parameters is what finishes a reload: the
+/// stored [`Config`] and the log line follow it, so nothing the daemon reports
+/// describes a pool it is not running on yet.
+///
+/// A SIGHUP and a `config reload` can land together, or two clients can, and
+/// the file may differ between their reads. The running config is therefore
+/// held for the whole of read, apply and store: reloads apply one at a time
+/// and in the order they reach the scheduler, so what is stored is what the
+/// scheduler last took. The applied values are returned rather than read back
+/// afterwards, for the same reason — the next reload may already own the lock.
+///
+/// `drain_deadline_ms` is read per drain rather than pushed anywhere, so the
+/// stored [`Config`] is the whole of its application. The pool-size delta on
+/// the fifo is the other half of this and arrives with the drain (#8): bzbd
+/// owns no [`bzb_core::jobserver::Jobserver`] yet, so there are no tokens to
+/// release or acquire and nothing that could be clamped below what is held.
+async fn reload(config: &SharedConfig, leases: &Handle) -> Result<Applied, String> {
+    let mut running = config.lock().await;
+    match Config::load() {
+        Ok(reloaded) => {
+            // The scheduler goes first, and only what it took is stored and
+            // logged: on a signal the log is the whole reply, so a line saying
+            // the pool moved must not be readable before it has. A scheduler
+            // that cannot be reached is not a refused file either — the daemon
+            // is on its way down, and saying the config was rejected would name
+            // the wrong cause.
+            leases.set_params(reloaded.params()).await.map_err(|err| {
+                format!("config reloaded but the scheduler did not take it: {err:#}")
+            })?;
+            let applied = Applied {
+                pool_size: reloaded.pool_size,
+                max_concurrent: reloaded.max_concurrent,
+                drain_deadline_ms: reloaded.drain_deadline_ms,
+            };
+            *running = reloaded;
+            tracing::info!(
+                pool_size = applied.pool_size,
+                max_concurrent = applied.max_concurrent,
+                drain_deadline_ms = applied.drain_deadline_ms,
+                "config reloaded"
+            );
+            Ok(applied)
+        }
+        Err(err) => Err(format!(
+            "config reload refused, keeping the running configuration \
+             (pool_size {}): {err}",
+            running.pool_size
+        )),
+    }
 }
 
-async fn handle(stream: UnixStream, leases: Handle) -> Result<()> {
+/// What a finished [`reload`] put in force, for the caller that has to report
+/// it.
+#[derive(Debug)]
+struct Applied {
+    pool_size: u32,
+    max_concurrent: u32,
+    drain_deadline_ms: u64,
+}
+
+async fn handle(stream: UnixStream, leases: Handle, config: SharedConfig) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut incoming = BufReader::new(reader);
 
@@ -271,6 +360,19 @@ async fn handle(stream: UnixStream, leases: Handle) -> Result<()> {
             Ok(Request::Cancel { lease }) => match leases.cancel(LeaseId(lease)).await? {
                 true => Response::Ack,
                 false => Response::error(format!("there is no lease {lease}")),
+            },
+            Ok(Request::ConfigReload) => match reload(&config, &leases).await {
+                // Reports what this reload put in force, which the scheduler
+                // has already been given.
+                Ok(applied) => Response::ConfigReloaded {
+                    pool_size: applied.pool_size,
+                    max_concurrent: applied.max_concurrent,
+                    drain_deadline_ms: applied.drain_deadline_ms,
+                },
+                Err(refusal) => {
+                    tracing::warn!("{refusal}");
+                    Response::error(refusal)
+                }
             },
             // Not echoing the request: escaping it and then JSON-encoding the
             // message quadruples it, so a line that fit within MAX_LINE_BYTES
@@ -546,6 +648,7 @@ fn open_log(log: &Path) -> Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::leases::Command;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc, MutexGuard, PoisonError,
@@ -691,5 +794,124 @@ mod tests {
             !tripped.load(Ordering::SeqCst),
             "a daemon that reported it is serving was killed anyway"
         );
+    }
+
+    /// A reload is finished by the scheduler, not by the parse: until the new
+    /// admission parameters are in, the daemon is still running on the old
+    /// ones, and anything it stores or logs saying otherwise is ahead of what
+    /// governs admission. `BUSYBEE_CONFIG` is process-wide, hence the serial.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_reload_the_scheduler_never_took_leaves_the_running_config_alone() {
+        // A mask a tempdir survives, held so the owner-only test cannot set
+        // its own while this one is creating files.
+        let _umask = hold_umask(0o022);
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "pool_size = 4\n").expect("write the config");
+        std::env::set_var("BUSYBEE_CONFIG", &path);
+        let running: SharedConfig = Arc::new(tokio::sync::Mutex::new(
+            Config::load().expect("load the config"),
+        ));
+
+        // The actor is never spawned and its receiver is dropped, so every
+        // command the handle sends fails the way it would on a daemon that is
+        // already on its way down.
+        let params = running.lock().await.params();
+        let (_actor, leases, commands) = Leases::new(params, tmp.path().join("leases.json"));
+        drop(commands);
+        std::fs::write(&path, "pool_size = 6\n").expect("rewrite the config");
+
+        let refusal = reload(&running, &leases)
+            .await
+            .expect_err("a scheduler that never took the parameters reported success");
+
+        std::env::remove_var("BUSYBEE_CONFIG");
+        assert!(refusal.contains("scheduler"), "message was {refusal:?}");
+        assert_eq!(running.lock().await.pool_size, 4);
+    }
+
+    /// Reloads do not interleave. A SIGHUP and a `config reload` — or two
+    /// clients — can arrive while the file is being edited, and each of them
+    /// reads it, hands the scheduler what it read and stores that. Run at once,
+    /// the store order need not be the order the scheduler took them in, and
+    /// the daemon would then report a configuration it is not admitting on. So
+    /// a reload holds the running config for the whole of read, apply and
+    /// store: until the one in flight is finished, the next has not looked at
+    /// the file. `BUSYBEE_CONFIG` is process-wide, hence the serial.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_reload_in_flight_holds_the_next_one_off() {
+        // A mask a tempdir survives, held so the owner-only test cannot set
+        // its own while this one is creating files.
+        let _umask = hold_umask(0o022);
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "pool_size = 4\n").expect("write the config");
+        std::env::set_var("BUSYBEE_CONFIG", &path);
+        let running: SharedConfig = Arc::new(tokio::sync::Mutex::new(
+            Config::load().expect("load the config"),
+        ));
+
+        // No actor is spawned: this test is the scheduler, so it decides when
+        // a reload's parameters land and can keep one in flight while the next
+        // one tries to start.
+        let params = running.lock().await.params();
+        let (_actor, leases, mut commands) = Leases::new(params, tmp.path().join("leases.json"));
+
+        std::fs::write(&path, "pool_size = 6\n").expect("rewrite the config");
+        let first = tokio::spawn({
+            let (running, leases) = (running.clone(), leases.clone());
+            async move { reload(&running, &leases).await }
+        });
+        let done = match commands
+            .recv()
+            .await
+            .expect("the first reload sent nothing")
+        {
+            Command::SetParams { params, done } => {
+                assert_eq!(params.pool_size, 6);
+                done
+            }
+            _ => panic!("the first reload sent something other than set-params"),
+        };
+
+        // The first reload is in flight, waiting for the scheduler to take
+        // those parameters.
+        std::fs::write(&path, "pool_size = 8\n").expect("rewrite the config again");
+        let second = tokio::spawn({
+            let (running, leases) = (running.clone(), leases.clone());
+            async move { reload(&running, &leases).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), commands.recv())
+                .await
+                .is_err(),
+            "a second reload reached the scheduler while the first was still in flight"
+        );
+
+        done.send(()).expect("the first reload stopped waiting");
+        first
+            .await
+            .expect("join the first reload")
+            .expect("the first reload was refused");
+        match commands
+            .recv()
+            .await
+            .expect("the second reload sent nothing")
+        {
+            Command::SetParams { params, done } => {
+                assert_eq!(params.pool_size, 8);
+                done.send(()).expect("the second reload stopped waiting");
+            }
+            _ => panic!("the second reload sent something other than set-params"),
+        }
+        second
+            .await
+            .expect("join the second reload")
+            .expect("the second reload was refused");
+
+        std::env::remove_var("BUSYBEE_CONFIG");
+        assert_eq!(running.lock().await.pool_size, 8);
     }
 }
