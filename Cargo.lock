@@ -185,6 +185,7 @@ dependencies = [
  "mach2",
  "pueue-lib",
  "ratatui",
+ "serde_json",
  "serial_test",
  "tempfile",
  "tokio",

@@ -27,4 +27,7 @@ chrono = "0.4"
 serial_test = "3"
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
+# `test-util` for `#[tokio::test(start_paused = true)]`: tests that assert a
+# timeout fires do it on a paused clock rather than by waiting out the budget.
+tokio = { workspace = true, features = ["test-util"] }
 toml = "0.8"

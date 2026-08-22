@@ -14,7 +14,10 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 use crate::classify::Class;
 
 /// Bumped whenever a change to the types below is not backwards compatible.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// 2 added [`LeaseView::tool`], which a version-1 daemon does not send: a
+/// client left talking to one after an in-place upgrade hears about the
+/// mismatch at the handshake instead of failing to decode its replies.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The longest line either end will read. Anyone who can open the socket could
 /// otherwise stream a newline-free message until the long-lived daemon runs out
@@ -149,6 +152,13 @@ pub struct StatusReply {
 pub struct LeaseView {
     pub id: u64,
     pub label: String,
+    /// Basename of the tool [`crate::classify`] recognised, which is what
+    /// decides the class once the injection work lands. Until it does,
+    /// admission gives every lease `none` (see `docs/design/bzbd.md`
+    /// §Observability), so this field reports what was recognised and `class`
+    /// does not follow from it yet. Separate from `label`, which is the
+    /// caller's `--name` when there is one.
+    pub tool: String,
     pub class: String,
     pub cores: u32,
     pub state: String,
@@ -247,6 +257,30 @@ mod tests {
             message.len()
         );
         assert!(message.ends_with('…'), "message was {message:?}");
+    }
+
+    /// `tool` was added to [`LeaseView`] after protocol version 1, and a
+    /// version-1 daemon — one still running from before an in-place upgrade —
+    /// sends status replies without it. Making the field optional would leave
+    /// `busybee status` printing a blank tool column against such a daemon
+    /// instead of naming the mismatch, so the field is required and
+    /// [`PROTOCOL_VERSION`] moved with it: the handshake refuses the pairing
+    /// before any reply is decoded.
+    #[test]
+    fn a_lease_view_from_protocol_version_1_does_not_decode() {
+        let version_1 = r#"{"id":41,"label":"ui build","class":"static","cores":9,
+                            "state":"running","elapsed_ms":132000,"ahead":null,
+                            "pueue_task_id":3}"#;
+
+        let error = serde_json::from_str::<LeaseView>(version_1)
+            .expect_err("a reply without a tool must not decode")
+            .to_string();
+
+        assert!(error.contains("tool"), "error was {error:?}");
+        assert_ne!(
+            PROTOCOL_VERSION, 1,
+            "a required field the previous version never sent needs a version bump"
+        );
     }
 
     #[test]

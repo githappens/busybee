@@ -15,7 +15,7 @@ use std::{
 
 use bzb_core::{
     daemon::Connection,
-    protocol::{Request, Response, MAX_LINE_BYTES},
+    protocol::{Request, Response, MAX_LINE_BYTES, PROTOCOL_VERSION},
 };
 use common::{sigterm, wait_for, Fixture, BZBD};
 use tempfile::TempDir;
@@ -164,12 +164,19 @@ async fn an_oversized_hello_is_rejected_instead_of_buffered() {
 async fn an_oversized_request_is_rejected_instead_of_buffered() {
     let daemon = Fixture::start();
 
-    let message = oversized_line_error(&daemon, b"{\"hello\":1}\n").await;
+    let message = oversized_line_error(&daemon, hello().as_bytes()).await;
 
     assert!(
         message.contains(&MAX_LINE_BYTES.to_string()),
         "message was {message:?}"
     );
+}
+
+/// A handshake line the daemon accepts. Built from [`PROTOCOL_VERSION`] rather
+/// than written out, so the tests below that only need to get *past* the
+/// handshake keep doing so when the version moves.
+fn hello() -> String {
+    format!("{{\"hello\":{PROTOCOL_VERSION}}}\n")
 }
 
 /// Sends `prelude` (discarding one reply per line in it), then a newline-free
@@ -267,7 +274,7 @@ async fn bounded_decode_error(request: &[u8]) -> String {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
 
-    writer.write_all(b"{\"hello\":1}\n").await.expect("hello");
+    writer.write_all(hello().as_bytes()).await.expect("hello");
     lines.next_line().await.expect("read").expect("a pong");
 
     writer.write_all(request).await.expect("write request");
@@ -301,7 +308,7 @@ async fn an_unterminated_hello_is_refused_instead_of_answered() {
     let mut lines = BufReader::new(reader).lines();
 
     writer
-        .write_all(b"{\"hello\":1}")
+        .write_all(hello().trim_end().as_bytes())
         .await
         .expect("write hello");
     writer.shutdown().await.expect("close the write half");

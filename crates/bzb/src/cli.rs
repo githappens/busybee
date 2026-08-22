@@ -24,6 +24,23 @@ pub struct Cli {
 pub enum Command {
     /// Launch the live TUI monitor (CPU + queue).
     Monitor,
+
+    /// Print the token pool and one row per lease, then exit.
+    ///
+    /// With no daemon running there is no pool and nothing is being gated:
+    /// stdout stays empty, the reason goes to stderr, and the exit code is 0.
+    Status {
+        /// Print the daemon's reply as one JSON object instead of a table.
+        ///
+        /// The fields are `protocol::StatusReply` verbatim — `pool_size`,
+        /// `free`, `held` and `leases`, each lease carrying `id`, `label`,
+        /// `tool`, `class`, `cores`, `state`, `elapsed_ms`, `ahead` and
+        /// `pueue_task_id` — plus `approx_in_use`, which is
+        /// `pool_size - free - held` clamped at 0: an estimate of what the
+        /// jobserver tasks are using, never a scheduling input.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 impl Cli {
@@ -31,6 +48,7 @@ impl Cli {
     pub fn mode(&self) -> Mode {
         match (&self.command, self.detach, self.cmd.is_empty()) {
             (Some(Command::Monitor), _, _) => Mode::Monitor,
+            (Some(Command::Status { json }), _, _) => Mode::Status { json: *json },
             (None, true, false) => Mode::Detach,
             (None, false, false) => Mode::Blocking,
             (None, _, true) => Mode::MissingCommand,
@@ -43,6 +61,7 @@ pub enum Mode {
     Blocking,
     Detach,
     Monitor,
+    Status { json: bool },
     MissingCommand,
 }
 
@@ -82,6 +101,15 @@ mod tests {
     fn monitor_subcommand() {
         let cli = parse(&["monitor"]);
         assert_eq!(cli.mode(), Mode::Monitor);
+    }
+
+    #[test]
+    fn status_subcommand_defaults_to_the_human_table() {
+        assert_eq!(parse(&["status"]).mode(), Mode::Status { json: false });
+        assert_eq!(
+            parse(&["status", "--json"]).mode(),
+            Mode::Status { json: true }
+        );
     }
 
     #[test]

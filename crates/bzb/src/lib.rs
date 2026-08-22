@@ -3,6 +3,7 @@ mod detach;
 mod enqueue;
 mod monitor;
 mod signals;
+mod status;
 #[cfg(test)]
 mod version_parse;
 
@@ -25,6 +26,11 @@ pub fn run() -> anyhow::Result<()> {
         Mode::Monitor => {
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(monitor::app::run())?;
+            Ok(())
+        }
+        Mode::Status { json } => {
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(status::run(json))?;
             Ok(())
         }
         Mode::MissingCommand => {

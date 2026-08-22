@@ -29,6 +29,7 @@ ratatui.workspace = true
 crossterm.workspace = true
 pueue-lib.workspace = true
 futures.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mach2 = "0.4"
