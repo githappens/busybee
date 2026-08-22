@@ -19,7 +19,7 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use bzb_core::{
     daemon::{log_path, pid_path, socket_path, state_dir},
-    protocol::{Hello, Request, Response, StatusReply, PROTOCOL_VERSION},
+    protocol::{Hello, Request, Response, PROTOCOL_VERSION},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -168,15 +168,10 @@ async fn handle(stream: UnixStream) -> Result<()> {
     while let Some(line) = incoming.next_line().await? {
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Ping) => pong(),
-            // The token pool arrives with the scheduler; until then there is
-            // nothing under management to report.
-            Ok(Request::Status) => Response::Status(StatusReply {
-                pool_size: 0,
-                free: 0,
-                held: 0,
-                leases: Vec::new(),
-            }),
-            Ok(Request::Submit(_) | Request::Cancel { .. }) => Response::Error {
+            // The token pool arrives with the scheduler. An all-zero StatusReply
+            // would be indistinguishable from a real idle pool, so refuse
+            // instead of inventing one.
+            Ok(Request::Status | Request::Submit(_) | Request::Cancel { .. }) => Response::Error {
                 message: "not implemented".into(),
             },
             Err(err) => Response::Error {

@@ -101,6 +101,24 @@ async fn ping_reports_the_crate_version_and_the_daemon_pid() {
 }
 
 #[tokio::test]
+async fn status_is_refused_while_there_is_no_pool_to_report() {
+    let daemon = Fixture::start();
+    let mut conn = Connection::connect(&daemon.socket_path())
+        .await
+        .expect("connect");
+
+    conn.send(Request::Status).await.expect("send status");
+
+    match conn.recv().await.expect("recv status reply") {
+        Response::Error { message } => assert!(
+            message.contains("not implemented"),
+            "expected a not-implemented error, got {message:?}"
+        ),
+        other => panic!("expected an Error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn a_second_instance_exits_zero_and_the_first_keeps_serving() {
     let daemon = Fixture::start();
 
