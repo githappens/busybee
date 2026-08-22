@@ -21,8 +21,8 @@ you had typed it directly.
 **One pool of tokens.** A daemon (`bzbd`) owns a single machine-wide GNU make
 [jobserver](https://www.gnu.org/software/make/manual/html_node/POSIX-Jobserver.html)
 fifo holding `pool_size` tokens, one per logical core by default. Every build
-busybee starts is accounted against that one pool, so nothing is
-over-subscribed no matter how many sessions are running.
+draws its parallelism from that one pool, so the machine runs `pool_size` jobs
+plus the one untokened job each admitted task starts — not a pool per session.
 
 **Two ways to join it.** Tools that speak the jobserver protocol — make ≥ 4.4,
 ninja ≥ 1.13, cargo, and `cmake --build` through those generators — get
@@ -38,11 +38,9 @@ drains every token and uses all cores. When a second one starts, the two
 interleave token by token; when one finishes, the other grows back within a
 compile unit. No daemon decision is involved. The caveat is static tasks: their
 tools read the core count once at startup, so a static task is **locked at the
-number it was admitted with** until it exits, even if the machine empties out —
-reason enough to prefer a jobserver-aware tool where you have the choice.
-(Injection is being wired into the daemon in
-[#8](https://github.com/githappens/busybee/issues/8); until it lands every task
-is admitted `none` and says so.)
+number it was admitted with** until it exits, even if the machine empties out.
+(Injection lands with [#8](https://github.com/githappens/busybee/issues/8);
+until then every task is admitted `none` and says so.)
 
 ## Usage
 
@@ -86,7 +84,7 @@ early.
 | tool | class | how it gets its share |
 |---|---|---|
 | `make`, `gmake` (≥ 4.4) | jobserver | `MAKEFLAGS=--jobserver-auth=fifo:…` |
-| `ninja` (≥ 1.13) | jobserver | same, and only without an explicit `-j` |
+| `ninja` (≥ 1.13) | jobserver | same |
 | `cmake --build` (Make/Ninja generators) | jobserver | same, via the generator; `CMAKE_BUILD_PARALLEL_LEVEL` is removed |
 | `cargo` | jobserver | `MAKEFLAGS`, `CARGO_MAKEFLAGS`, `RUST_TEST_THREADS`; the `rustc` processes cargo spawns take tokens through it |
 | `xcodebuild` | static | argv `-jobs`, one below its tokens (`-jobs N` runs N+1 compiles) |
@@ -95,10 +93,13 @@ early.
 | `pytest` | static | `PYTEST_ADDOPTS` gains `-n N` |
 | `docker build`, everything else | none | nothing injected — the task runs alone |
 
+**Your own count wins.** `make -j8`, `ninja -j8`, `cargo build -j8` and
+`cmake --build … --parallel 8` keep your number: no injection, no tokens, a
+notice saying so — that task runs beside the pool rather than inside it.
+
 **none** is the honest default for a command busybee cannot reason about: a
-benchmark, a render, an opaque `sh -c '…'`. It is admitted with the whole pool
-and everything else waits — safe, but a waste of the machine, so name a better
-class when you know one.
+benchmark, a render, an opaque `sh -c '…'`. It takes the whole pool and
+everything else waits — safe but wasteful, so name a better class when you can.
 
 [#8](https://github.com/githappens/busybee/issues/8) adds `BUSYBEE_CLASS` and
 `BUSYBEE_CORES` to every task's environment — the remedy for a tool hidden
@@ -229,10 +230,9 @@ busybee (client)  ──unix socket──▶  bzbd (broker)  ──pueue-lib─�
 [pueue](https://github.com/Nukesor/pueue) keeps what it is good at — spawning,
 process groups, log capture, persistence — while `bzbd` decides what runs.
 [`docs/design/bzbd.md`](docs/design/bzbd.md) is the specification, tracked in
-[#2](https://github.com/githappens/busybee/issues/2).
-[#21](https://github.com/githappens/busybee/issues/21) will add
-`crates/bzb/tests/e2e_pool.rs`, the worked example of two jobserver builds and
-one static task sharing the pool.
+[#2](https://github.com/githappens/busybee/issues/2), and
+[#21](https://github.com/githappens/busybee/issues/21) will add the worked
+example: `crates/bzb/tests/e2e_pool.rs`, two jobserver builds and a static task.
 
 ## Not yet
 
