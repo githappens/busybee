@@ -37,6 +37,7 @@ use tracing::Level;
 pub fn run() -> Result<()> {
     let foreground = parse_args(std::env::args().skip(1))?;
 
+    restrict_umask();
     let dir = state_dir()?;
     create_state_dir(&dir)?;
     let log = log_path()?;
@@ -61,6 +62,16 @@ pub fn run() -> Result<()> {
         ready.report(&format!("{err:#}"));
     }
     result
+}
+
+/// Nothing bzbd creates is anyone else's business, and a mode set after the
+/// creation is always a window: a unix socket in particular is connectable
+/// from the moment it is bound. The umask makes owner-only part of every
+/// creation instead, before the first of them happens.
+fn restrict_umask() {
+    // SAFETY: `umask` is a process-wide setting with no preconditions. It is
+    // not thread-safe against a concurrent file creation, hence this early.
+    unsafe { libc::umask(0o077) };
 }
 
 /// Creates the state directory owner-only. The socket inside it is the
@@ -122,13 +133,10 @@ async fn serve(socket: &Path, pid_file: &Path, ready: &mut Ready) -> Result<()> 
         std::fs::remove_file(socket)
             .with_context(|| format!("cannot remove the stale socket {}", socket.display()))?;
     }
+    // Owner-only from birth: `restrict_umask` ran before any of this, because
+    // the socket is connectable the moment this bind returns.
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("cannot bind the socket {}", socket.display()))?;
-    // Belt and braces: the owner-only state directory already keeps other
-    // users from reaching this path, which is also what covers the moment
-    // between the bind and this chmod.
-    std::fs::set_permissions(socket, Permissions::from_mode(0o600))
-        .with_context(|| format!("cannot restrict the socket {}", socket.display()))?;
     tracing::info!(socket = %socket.display(), pid = std::process::id(), "bzbd listening");
 
     // The socket accepts connections and SIGTERM will be caught: only now may
@@ -472,6 +480,23 @@ mod tests {
             let mode = std::fs::metadata(dir).expect("stat").permissions().mode();
             assert_eq!(mode & 0o777, 0o700, "{} is {mode:o}", dir.display());
         }
+    }
+
+    /// A unix socket is connectable from the moment it is bound, so a mode
+    /// applied after the bind comes too late: under the usual 022 umask the
+    /// socket spends that window at 0755, connectable by anyone. The umask has
+    /// to carry the restriction into the creation instead.
+    #[test]
+    fn a_bound_socket_is_owner_only_from_birth() {
+        restrict_umask();
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("bzbd.sock");
+
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind the socket");
+
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        drop(listener);
+        assert_eq!(mode & 0o077, 0, "the socket was born {mode:o}");
     }
 
     /// A pid file we did not create is not ours to truncate: following a

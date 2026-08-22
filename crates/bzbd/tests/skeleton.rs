@@ -123,10 +123,15 @@ async fn the_state_directory_and_the_socket_are_owner_only() {
         "the state directory {} is not owner-only",
         daemon.state_dir().display()
     );
+    // Not an exact mode: `bind` derives the socket's from 0777, so the daemon's
+    // umask leaves it 0700. What has to hold is that nobody else is in it, and
+    // that it held from the moment the socket was bound: a chmod afterwards
+    // would leave a window in which any user could connect.
+    let socket = mode(&daemon.socket_path());
     assert_eq!(
-        mode(&daemon.socket_path()),
-        0o600,
-        "the socket is not owner-only"
+        socket & 0o077,
+        0,
+        "the socket is {socket:o}, not owner-only"
     );
 }
 
