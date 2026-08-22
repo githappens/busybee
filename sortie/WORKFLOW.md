@@ -71,6 +71,7 @@ claude-code:
   session_persistence: true
 
 reactions:
+  # Human CHANGES_REQUESTED reviews -> continuation turn.
   review_comments:
     provider: github
     max_retries: 2
@@ -79,6 +80,28 @@ reactions:
     poll_interval_ms: 120000
     debounce_ms: 60000
     max_continuation_turns: 3
+  # Codex (chatgpt-codex-connector[bot]) reviews every push; its P0/P1 inline
+  # comments -> continuation turn. github-actions[bot] only posts the verdict.
+  bot_review:
+    provider: github
+    bot_usernames: ["chatgpt-codex-connector", "chatgpt-codex-connector[bot]"]
+    max_retries: 2
+    escalation: label
+    escalation_label: needs-human
+    poll_interval_ms: 60000
+    max_continuation_turns: 5
+  # Merge once the review decision is APPROVED (codex-gate approves as
+  # github-actions[bot] when Codex reports no P0/P1 on the head commit; the
+  # main ruleset requires that approval) and every check is green.
+  auto_merge:
+    provider: github
+    strategy: squash
+    require_ci: true
+    delete_branch: true
+    poll_interval_ms: 60000
+    max_retries: 2
+    escalation: label
+    escalation_label: needs-human
   merge_completion:
     provider: github
     target_state: sortie:done
@@ -161,8 +184,10 @@ When the acceptance criteria pass locally:
      "$(git rev-parse --abbrev-ref HEAD)" "$(gh pr view --json number -q .number)" > .sortie/scm.json
    echo needs-human-review > .sortie/status
    ```
-5. Stop. A human reviews and merges; review comments come back to you as a
-   continuation turn.
+5. Stop. An automated reviewer (Codex) reviews every push and its findings come
+   back to you as a continuation turn; the PR merges automatically once the
+   review reports no P0/P1 findings and CI is green. Human review comments also
+   come back as continuation turns.
 {{ if .run.is_continuation }}
 
 ## Continuation
@@ -177,6 +202,17 @@ stopped. If a PR already exists, push to the same branch.
 {{ range .review_comments }}- {{ .reviewer }}{{ if .file }} on `{{ .file }}`{{ if .start_line }}:{{ .start_line }}{{ end }}{{ end }}: {{ .body }}
 {{ end }}
 Address every point, push, and reply on the PR with what changed.
+{{ end }}
+{{ if .bot_review_comments }}
+
+### Automated review findings to address (Codex)
+
+{{ range .bot_review_comments }}- {{ if .file }}`{{ .file }}`{{ if .start_line }}:{{ .start_line }}{{ end }}: {{ end }}{{ .body }}
+{{ end }}
+Treat P0 as must-fix and P1 as fix-or-justify. For each finding either fix it or
+reply on the PR thread with the reason it does not apply; then push. A new push
+triggers a fresh automated review; the PR merges automatically once the review
+reports no P0/P1 findings and CI is green.
 {{ end }}
 {{ end }}
 {{ if and .attempt (not .run.is_continuation) }}
