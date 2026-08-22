@@ -18,12 +18,12 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use bzb_core::{classify::Class, jobserver::Jobserver};
+use bzb_core::{classify::Class, group::BUSYBEE_GROUP, jobserver::Jobserver};
 use chrono::{DateTime, Local};
 use pueue_lib::task::{Task, TaskStatus};
 use serde::{Deserialize, Serialize};
 
-use crate::{leases::orphan, submit::Pueue};
+use crate::{leases::claim_orphans, submit::Pueue};
 
 /// What one lease looks like in `leases.json`: enough to take it back after a
 /// restart and to keep reporting it.
@@ -197,16 +197,8 @@ struct Reconciled {
 /// other. Dropped as never admitted, it would run on beside the next
 /// exclusive task.
 fn reconcile(mut records: Vec<Record>, tasks: &BTreeMap<usize, Task>) -> Reconciled {
-    let mut claimed: BTreeSet<usize> = records.iter().filter_map(|r| r.pueue_task_id).collect();
-    for record in &mut records {
-        if record.pueue_task_id.is_some() || record.submitted_at_unix_ms.is_none() {
-            continue;
-        }
-        if let Some(task_id) = orphan(tasks, &record.label, record.submitted_at(), &claimed) {
-            claimed.insert(task_id);
-            record.pueue_task_id = Some(task_id);
-        }
-    }
+    let claimed: BTreeSet<usize> = records.iter().filter_map(|r| r.pueue_task_id).collect();
+    claim_orphans(&mut records, tasks, claimed);
 
     let mut reconciled = Reconciled {
         adopted: Vec::new(),
@@ -219,6 +211,21 @@ fn reconcile(mut records: Vec<Record>, tasks: &BTreeMap<usize, Task>) -> Reconci
                 "its submission went unanswered, and pueued has no task for it".to_string()
             }
             None => "it was never admitted, and its client went with the daemon".to_string(),
+            // The id names whatever pueued calls that now: its state reset
+            // while no daemon was running, the number can be somebody else's
+            // task, and adopting that would let `busybee cancel` signal it.
+            Some(task_id)
+                if tasks.get(&task_id).is_some_and(|t| {
+                    t.group != BUSYBEE_GROUP || t.label.as_deref() != Some(&record.label)
+                }) =>
+            {
+                let task = &tasks[&task_id];
+                format!(
+                    "pueue task {task_id} is not the recorded task: it is {:?} in group {:?}, \
+                     so pueued's state was reset",
+                    task.label, task.group
+                )
+            }
             Some(task_id) => match tasks.get(&task_id).map(|t| &t.status) {
                 Some(TaskStatus::Running { .. }) if record.killing => {
                     reconciled.killing.push(record);
@@ -301,7 +308,7 @@ mod tests {
     fn record(id: u64, pueue_task_id: Option<usize>) -> Record {
         Record {
             id,
-            label: format!("task {id}"),
+            label: "sleep 5".into(),
             argv: vec!["sleep".into(), "5".into()],
             class: Class::None,
             cores_held: 0,
@@ -322,7 +329,7 @@ mod tests {
             status,
             Vec::new(),
             0,
-            None,
+            Some("sleep 5".into()),
         );
         task.id = id;
         task
@@ -377,6 +384,50 @@ mod tests {
         assert!(dropped[0].1.contains("finished"), "{:?}", dropped[0]);
         assert!(dropped[1].1.contains("gone"), "{:?}", dropped[1]);
         assert!(dropped[2].1.contains("never admitted"), "{:?}", dropped[2]);
+    }
+
+    /// A task id on record names whatever pueued calls that now: its state
+    /// reset while no daemon was running, the number can be somebody else's
+    /// task. Only the task that is the record's — in the `busybee` group,
+    /// under the record's label — is taken back; another is left alone,
+    /// since adopting it would let `busybee cancel` signal it.
+    #[test]
+    fn a_recorded_id_that_names_another_task_is_not_adopted() {
+        let mut relabelled = task(1, running());
+        relabelled.label = Some("cargo build".into());
+        let mut regrouped = task(2, running());
+        regrouped.group = "default".into();
+        let state = tasks(vec![relabelled, regrouped, task(3, running())]);
+        let records = vec![
+            record(10, Some(1)),
+            record(11, Some(2)),
+            record(12, Some(3)),
+        ];
+
+        let reconciled = reconcile(records, &state);
+
+        assert_eq!(
+            reconciled.adopted.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![12]
+        );
+        let dropped: Vec<(u64, &str)> = reconciled
+            .dropped
+            .iter()
+            .map(|(r, reason)| (r.id, reason.as_str()))
+            .collect();
+        assert_eq!(dropped.len(), 2, "dropped {dropped:?}");
+        assert_eq!(dropped[0].0, 10);
+        assert!(
+            dropped[0].1.contains("not the recorded task"),
+            "{:?}",
+            dropped[0]
+        );
+        assert_eq!(dropped[1].0, 11);
+        assert!(
+            dropped[1].1.contains("not the recorded task"),
+            "{:?}",
+            dropped[1]
+        );
     }
 
     /// A teardown the previous daemon did not see through is not a lease to

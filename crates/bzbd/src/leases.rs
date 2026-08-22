@@ -795,15 +795,17 @@ impl Leases {
                 .leases
                 .values()
                 .filter_map(|l| l.pueue_task_id)
+                .chain(self.killing.keys().copied())
                 .collect();
-            for mut record in std::mem::take(&mut self.unreconciled) {
-                match orphan(&state.tasks, &record.label, record.submitted_at(), &tracked) {
+            let mut records = std::mem::take(&mut self.unreconciled);
+            claim_orphans(&mut records, &state.tasks, tracked);
+            for record in records {
+                match record.pueue_task_id {
                     Some(task_id) => {
                         tracing::error!(
                             task = task_id,
                             "pueued started a task whose submission failed; stopping it"
                         );
-                        record.pueue_task_id = Some(task_id);
                         self.kill_task(task_id, Some(record)).await;
                     }
                     None => {
@@ -1023,11 +1025,32 @@ fn write_json(path: &Path, records: &[Record]) -> Result<()> {
     std::fs::rename(&temporary, path).with_context(|| format!("cannot replace {}", path.display()))
 }
 
+/// Names, in each record of an unanswered submission, the task pueued may
+/// have started for it; `claimed` holds the tasks already spoken for. Each
+/// match is claimed before the next record looks: two submissions with the
+/// same label would otherwise both take the first task, and the second
+/// would run on with nothing to account for it.
+pub(crate) fn claim_orphans(
+    records: &mut [Record],
+    tasks: &BTreeMap<usize, Task>,
+    mut claimed: BTreeSet<usize>,
+) {
+    for record in records
+        .iter_mut()
+        .filter(|r| r.pueue_task_id.is_none() && r.submitted_at_unix_ms.is_some())
+    {
+        if let Some(task_id) = orphan(tasks, &record.label, record.submitted_at(), &claimed) {
+            claimed.insert(task_id);
+            record.pueue_task_id = Some(task_id);
+        }
+    }
+}
+
 /// The task an unanswered submission may have started: it is in the
 /// `busybee` group, carries the label bzbd asked for, pueued created it no
 /// earlier than the submission (`since`), it is still alive, and no lease
 /// claims it. Anything else is somebody's task and is left alone.
-pub(crate) fn orphan(
+fn orphan(
     tasks: &BTreeMap<usize, Task>,
     label: &str,
     since: DateTime<Local>,
@@ -1211,6 +1234,40 @@ mod tests {
         theirs.group = "default".into();
         let state = tasks(vec![theirs]);
         assert_eq!(orphan(&state, "cargo build", since, &BTreeSet::new()), None);
+    }
+
+    /// Two submissions with the same label whose answers were both lost, and
+    /// two tasks pueued started for them: each claims its own. Were the
+    /// first match not claimed before the second record looked, both would
+    /// take the first task and its teardown, and the second task would run
+    /// on with nothing to account for it.
+    #[test]
+    fn each_unanswered_submission_claims_a_task_of_its_own() {
+        let since = Local::now();
+        let state = tasks(vec![
+            task(3, "cargo build", since, running()),
+            task(4, "cargo build", since, running()),
+            task(5, "cargo build", since, running()),
+        ]);
+        let submitted = |id: u64| Record {
+            id,
+            label: "cargo build".into(),
+            argv: vec!["cargo".into(), "build".into()],
+            class: Class::Static,
+            cores_held: 1,
+            pueue_task_id: None,
+            started_at_unix_ms: 0,
+            submitted_at_unix_ms: Some(since.timestamp_millis() as u64),
+            fifo: None,
+            killing: true,
+        };
+        let mut records = vec![submitted(10), submitted(11), submitted(12)];
+
+        // 3 is already being torn down.
+        claim_orphans(&mut records, &state, BTreeSet::from([3]));
+
+        let claimed: Vec<Option<usize>> = records.iter().map(|r| r.pueue_task_id).collect();
+        assert_eq!(claimed, vec![Some(4), Some(5), None]);
     }
 
     const PARAMS: Params = Params {
