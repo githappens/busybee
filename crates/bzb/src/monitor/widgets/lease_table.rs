@@ -8,6 +8,7 @@ use bzb_core::protocol::LeaseView;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::style::{Color, Style};
+use ratatui::text::Span;
 use ratatui::widgets::{Row, Table, Widget};
 
 use crate::status::{cores, elapsed, printable};
@@ -44,10 +45,12 @@ fn widths(leases: &[&LeaseView]) -> [Constraint; 7] {
     widths
 }
 
+/// A column is measured in the cells the table draws it in, which is what
+/// `Span::width` counts: a character can fill two of them.
 fn fit(leases: &[&LeaseView], least: u16, cell: impl Fn(&LeaseView) -> String) -> Constraint {
     let widest = leases
         .iter()
-        .map(|lease| cell(lease).chars().count() as u16)
+        .map(|lease| Span::raw(cell(lease)).width() as u16)
         .max()
         .unwrap_or(0);
     Constraint::Length(widest.max(least))
@@ -228,6 +231,26 @@ mod tests {
         let lines = draw(&leases, 90, 1);
         assert!(lines[0].starts_with("#10000"), "row was {:?}", lines[0]);
         assert!(lines[0].contains("xcodebuild") || lines[0].contains("cargo"));
+    }
+
+    /// A column is measured in terminal cells, and the basename is not bound to
+    /// ASCII: a wide character takes two cells, so counting scalar values would
+    /// hand the tool half the room it draws in and clip it again.
+    #[test]
+    fn a_tool_of_wide_characters_is_measured_in_cells() {
+        let mut leases = vec![lease(1, "running", "static")];
+        leases[0].tool = "ビルドランナー".into();
+
+        let lines = draw(&leases, 90, 1);
+
+        // A wide character owns two cells and the second reads back blank, so
+        // the tool comes out of the buffer interleaved with the cells it fills.
+        assert!(
+            lines[0].contains("ビ ル ド ラ ン ナ ー"),
+            "row was {:?}",
+            lines[0]
+        );
+        assert!(lines[0].contains("static"), "row was {:?}", lines[0]);
     }
 
     /// The tool is the basename of whatever the caller wrapped, so it is as
