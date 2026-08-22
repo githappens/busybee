@@ -19,7 +19,10 @@ permissions:
 env:
   PROJECT_OWNER: githappens
   PROJECT_NUMBER: 2
-  MARKER_LABEL: sortie
+
+concurrency:
+  group: project-sync-${{ github.event.issue.number }}
+  cancel-in-progress: false
 
 jobs:
   sync:
@@ -29,6 +32,7 @@ jobs:
       - name: Map labels to Status and update the board
         env:
           GH_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
           ISSUE_URL: ${{ github.event.issue.html_url }}
           LABELS: ${{ join(github.event.issue.labels.*.name, ',') }}
           STATE: ${{ github.event.issue.state }}
@@ -45,13 +49,22 @@ jobs:
           fi
           echo "target status: $status"
 
-          project_id=$(gh project view "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --format json --jq .id)
-          fields=$(gh project field-list "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --format json)
-          field_id=$(echo "$fields" | jq -r '.fields[] | select(.name=="Status") | .id')
-          option_id=$(echo "$fields" | jq -r --arg s "$status" '.fields[] | select(.name=="Status") | .options[] | select(.name==$s) | .id')
-          if [ -z "$option_id" ]; then echo "Status option '$status' not found on the project" >&2; exit 1; fi
+          # All GraphQL via `viewer` (the token's own user): a classic PAT with
+          # only the `project` scope is enough, and no owner-type lookup is needed.
+          meta=$(gh api graphql -F n="$PROJECT_NUMBER" -f query='
+            query($n: Int!) { viewer { projectV2(number: $n) { id
+              field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } } } } }')
+          project_id=$(jq -r '.data.viewer.projectV2.id' <<<"$meta")
+          field_id=$(jq -r '.data.viewer.projectV2.field.id' <<<"$meta")
+          option_id=$(jq -r --arg s "$status" '.data.viewer.projectV2.field.options[] | select(.name==$s) | .id' <<<"$meta")
+          [ -n "$project_id" ] && [ "$project_id" != null ] || { echo "project $PROJECT_NUMBER not found for token owner" >&2; exit 1; }
+          [ -n "$option_id" ] || { echo "Status option '$status' not found on the project" >&2; exit 1; }
 
-          # item-add is idempotent: it returns the existing item if already present.
-          item_id=$(gh project item-add "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --url "$ISSUE_URL" --format json --jq .id)
-          gh project item-edit --project-id "$project_id" --id "$item_id" --field-id "$field_id" --single-select-option-id "$option_id"
+          # addProjectV2ItemById is idempotent: returns the existing item if present.
+          item_id=$(gh api graphql -f p="$project_id" -f c="$ISSUE_NODE_ID" -f query='
+            mutation($p: ID!, $c: ID!) { addProjectV2ItemById(input: {projectId: $p, contentId: $c}) { item { id } } }' \
+            --jq '.data.addProjectV2ItemById.item.id')
+          gh api graphql -f p="$project_id" -f i="$item_id" -f f="$field_id" -f o="$option_id" -f query='
+            mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) {
+              updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i, fieldId: $f, value: {singleSelectOptionId: $o}}) { projectV2Item { id } } }' >/dev/null
           echo "$ISSUE_URL -> $status"
