@@ -485,11 +485,16 @@ async fn a_restarted_daemon_finishes_the_teardown_it_was_killed_in() {
     // sleeps far longer than the test runs: the point is a task that is still
     // there when the daemon is killed, so one that could end on its own first
     // would make the test pass or fail on how busy the machine is.
-    let (conn, _, survivor) = run(&daemon, request(&["sh", "-c", "trap '' TERM; sleep 300"])).await;
-
-    // Established, not assumed: the signal has to reach a task pueued is
-    // actually running, or it ends the task rather than being ignored by it.
-    wait_for_task_to_run(&pueued.config_path, survivor, Duration::from_secs(5)).await;
+    //
+    // The marker is what says the trap is installed. pueued reports the task
+    // `Running` when it spawns the process, which is before the shell has run
+    // anything; a signal delivered in that gap kills a task that would
+    // otherwise have ignored it, and on a loaded runner that gap is tens of
+    // milliseconds wide.
+    let armed = daemon.state_dir().join("trap-armed");
+    let script = format!("trap '' TERM; touch {}; sleep 300", armed.display());
+    let (conn, _, survivor) = run(&daemon, request(&["sh", "-c", &script])).await;
+    wait_for(&armed, true);
 
     // The client hangs up; the daemon sends SIGTERM and waits for pueued to
     // confirm the task gone, which it will not while the task ignores it.
