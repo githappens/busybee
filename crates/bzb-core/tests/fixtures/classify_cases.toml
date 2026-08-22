@@ -109,6 +109,27 @@ tool = "make"
 no_notices = true
 
 [[case]]
+name = "make -f takes the next argument as its makefile, not as options"
+argv = ["make", "-f", "-kj"]
+class = "jobserver"
+tool = "make"
+no_notices = true
+
+[[case]]
+name = "make --file takes the next argument as its makefile too"
+argv = ["make", "--file", "-j8"]
+class = "jobserver"
+tool = "make"
+no_notices = true
+
+[[case]]
+name = "make treats everything after -- as targets"
+argv = ["make", "--", "-j8"]
+class = "jobserver"
+tool = "make"
+no_notices = true
+
+[[case]]
 name = "gmake is make"
 argv = ["gmake", "all"]
 class = "jobserver"

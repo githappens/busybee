@@ -44,10 +44,29 @@ const TOOL_UNKNOWN: &str = "<unknown>";
 
 const SHELLS: [&str; 4] = ["sh", "bash", "zsh", "dash"];
 
-/// GNU make short options that consume a value, which in a cluster is the rest
-/// of the token (`-Cout`, `-EFOO=1`) or, for the ones whose value is mandatory,
-/// the next argument (`-C out`).
-const MAKE_VALUE_OPTIONS: &str = "CEfIjloOW";
+/// GNU make short options whose value is mandatory: in a cluster it is the rest
+/// of the token (`-Cout`, `-EFOO=1`), and when the token ends there it is the
+/// next argument (`-C out`).
+const MAKE_REQUIRED_VALUE_OPTIONS: &str = "CEfIoW";
+/// Short options whose value is optional. It still swallows the rest of the
+/// token (`-Ojobs`), but never the next argument: `make -j 8` runs make with no
+/// job limit and a target named `8`.
+const MAKE_OPTIONAL_VALUE_OPTIONS: &str = "jlO";
+/// Long options whose value is mandatory, so it may be the next argument
+/// (`--file out.mk`). Only these can turn an option-shaped argument into an
+/// operand; the optional-value long forms need `=` (`--jobs=8`).
+const MAKE_REQUIRED_VALUE_LONG_OPTIONS: [&str; 10] = [
+    "--assume-new",
+    "--assume-old",
+    "--directory",
+    "--eval",
+    "--file",
+    "--include-dir",
+    "--makefile",
+    "--new-file",
+    "--old-file",
+    "--what-if",
+];
 
 /// How a task is admitted against the token pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,9 +290,12 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
     };
 
     let mut notices = Vec::new();
-    let user_flag = rule
-        .and_then(|r| find_parallel_flag(args, &r.parallel_flags))
-        .or_else(|| find_make_cluster_flag(&tool, args));
+    // Only make reads clusters and option operands; other tools take the plain
+    // scan, which is all their flags need.
+    let user_flag = rule.and_then(|r| match tool.as_str() {
+        "make" | "gmake" => find_make_jobs_flag(args),
+        _ => find_parallel_flag(args, &r.parallel_flags),
+    });
     if let (Some(flag), Some(rule)) = (&user_flag, rule) {
         notices.push(flag_notice(&tool, flag, rule.inject, class));
     }
@@ -395,31 +417,49 @@ fn flag_matches(flag: &str, arg: &str) -> bool {
     !flag.starts_with("--") && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
 }
 
-/// GNU make clusters short options, so `make -ksj8` puts `-j8` in `MAKEFLAGS`
-/// and overrides the injected jobserver just as a standalone `-j8` would.
-/// Only make reads its own clusters; other tools keep the plain flag scan.
-fn find_make_cluster_flag<'a>(tool: &str, args: &'a [String]) -> Option<&'a str> {
-    if tool != "make" && tool != "gmake" {
-        return None;
+/// The jobs flag GNU make itself will see, which the plain scan cannot find:
+/// make clusters short options, so `make -ksj8` puts `-j8` in `MAKEFLAGS` and
+/// overrides the injected jobserver just as a standalone `-j8` would. Walking
+/// argv the way getopt does is what keeps the cluster reading honest — `--`
+/// ends the options, and an option whose value is mandatory takes the next
+/// argument as an operand, so it is not a cluster at all (`make -f -kj` builds
+/// a makefile named `-kj`).
+fn find_make_jobs_flag(args: &[String]) -> Option<&str> {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        // Targets and variable assignments select nothing.
+        let Some(option) = arg.strip_prefix('-') else {
+            continue;
+        };
+        if option == "-" {
+            return None; // `--`: only operands follow
+        }
+        if option.starts_with('-') {
+            if flag_matches("--jobs", arg) {
+                return Some(arg);
+            }
+            if MAKE_REQUIRED_VALUE_LONG_OPTIONS.contains(&arg.as_str()) {
+                rest.next();
+            }
+            continue;
+        }
+        // The first option in a cluster that takes a value swallows the rest of
+        // the token (`-Cjobs` is `-C jobs`, not a job count), so the cluster
+        // ends there — either at `-j` or at an option that hides it.
+        let Some((at, opt)) = option.char_indices().find(|(_, c)| {
+            MAKE_REQUIRED_VALUE_OPTIONS.contains(*c) || MAKE_OPTIONAL_VALUE_OPTIONS.contains(*c)
+        }) else {
+            continue;
+        };
+        if opt == 'j' {
+            return Some(arg);
+        }
+        // The option is ASCII, so the token ends right after it at `at + 1`.
+        if MAKE_REQUIRED_VALUE_OPTIONS.contains(opt) && at + 1 == option.len() {
+            rest.next(); // the value is the next argument
+        }
     }
-    args.iter()
-        .find(|arg| cluster_sets_jobs(arg))
-        .map(String::as_str)
-}
-
-fn cluster_sets_jobs(arg: &str) -> bool {
-    let Some(cluster) = arg.strip_prefix('-') else {
-        return false;
-    };
-    if cluster.starts_with('-') {
-        return false; // a long option, already covered by `--jobs`
-    }
-    // The first option that takes a value swallows the rest of the token
-    // (`-Cjobs` is `-C jobs`, not a job count), so the scan ends there.
-    cluster
-        .chars()
-        .find(|c| MAKE_VALUE_OPTIONS.contains(*c))
-        .is_some_and(|c| c == 'j')
+    None
 }
 
 fn flag_notice(tool: &str, flag: &str, inject: Inject, class: Class) -> String {
