@@ -19,7 +19,7 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use bzb_core::{
     daemon::{log_path, pid_path, socket_path, state_dir},
-    protocol::{read_line, Hello, Line, Request, Response, MAX_LINE_BYTES, PROTOCOL_VERSION},
+    protocol::{read_line, Hello, Line, Request, Response, PROTOCOL_VERSION},
 };
 use tokio::{
     io::{AsyncWriteExt, BufReader},
@@ -141,9 +141,11 @@ async fn handle(stream: UnixStream) -> Result<()> {
     let first = match next_line(&mut incoming).await? {
         Line::Text(line) => line,
         Line::Closed => return Ok(()),
-        // Dropping the writer closes the connection: a peer that ignores the
-        // limit has nothing left to say that we would read.
-        Line::TooLong => return reply(&mut writer, too_long()).await,
+        // Dropping the writer closes the connection: we cannot find the next
+        // message on a connection whose framing we have already lost.
+        Line::Malformed(reason) => {
+            return reply(&mut writer, Response::Error { message: reason }).await
+        }
     };
     match serde_json::from_str::<Hello>(&first) {
         Ok(hello) if hello.hello == PROTOCOL_VERSION => {}
@@ -176,7 +178,9 @@ async fn handle(stream: UnixStream) -> Result<()> {
         let line = match next_line(&mut incoming).await? {
             Line::Text(line) => line,
             Line::Closed => return Ok(()),
-            Line::TooLong => return reply(&mut writer, too_long()).await,
+            Line::Malformed(reason) => {
+                return reply(&mut writer, Response::Error { message: reason }).await
+            }
         };
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Ping) => pong(),
@@ -200,12 +204,6 @@ async fn handle(stream: UnixStream) -> Result<()> {
 
 async fn next_line(reader: &mut BufReader<OwnedReadHalf>) -> Result<Line> {
     read_line(reader).await.context("cannot read a request")
-}
-
-fn too_long() -> Response {
-    Response::Error {
-        message: format!("a line longer than {MAX_LINE_BYTES} bytes is not a request"),
-    }
 }
 
 fn pong() -> Response {

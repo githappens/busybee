@@ -277,6 +277,38 @@ async fn the_error_for_an_undecodable_request_stays_within_the_line_limit() {
     }
 }
 
+/// The frame ends at the newline. A hello that arrives without one was never
+/// finished, however complete its JSON looks, so the daemon must refuse it
+/// rather than serve a peer whose framing it cannot follow.
+#[tokio::test]
+async fn an_unterminated_hello_is_refused_instead_of_answered() {
+    let daemon = Fixture::start();
+    let stream = tokio::net::UnixStream::connect(daemon.socket_path())
+        .await
+        .expect("connect");
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    writer
+        .write_all(b"{\"hello\":1}")
+        .await
+        .expect("write hello");
+    writer.shutdown().await.expect("close the write half");
+
+    let reply = tokio::time::timeout(Duration::from_secs(3), lines.next_line())
+        .await
+        .expect("the daemon did not answer within 3s")
+        .expect("read")
+        .expect("a reply line");
+    match serde_json::from_str::<Response>(&reply).expect("decode reply") {
+        Response::Error { message } => assert!(
+            message.contains("newline"),
+            "expected a framing error, got {message:?}"
+        ),
+        other => panic!("expected an Error, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn a_protocol_version_mismatch_gets_an_error_and_the_connection_closes() {
     let daemon = Fixture::start();

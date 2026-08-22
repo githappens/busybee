@@ -19,9 +19,7 @@ use tokio::{
 };
 
 use crate::errors::BusybeeError;
-use crate::protocol::{
-    read_line, Hello, LeaseEvent, Line, Request, Response, MAX_LINE_BYTES, PROTOCOL_VERSION,
-};
+use crate::protocol::{read_line, Hello, LeaseEvent, Line, Request, Response, PROTOCOL_VERSION};
 
 /// Directory holding `bzbd.sock`, `bzbd.pid` and `bzbd.log`.
 pub fn state_dir() -> Result<PathBuf, BusybeeError> {
@@ -147,11 +145,11 @@ impl Connection {
         let line = match read {
             Line::Text(line) => line,
             Line::Closed => return Ok(None),
-            // The same bound the daemon reads under: a peer that ignores it is
+            // The same framing the daemon reads under: a peer that breaks it is
             // not speaking this protocol, and we cannot find the next message.
-            Line::TooLong => {
+            Line::Malformed(reason) => {
                 return Err(BusybeeError::Protocol(format!(
-                    "bzbd sent a line longer than {MAX_LINE_BYTES} bytes"
+                    "bzbd broke the protocol framing: {reason}"
                 )))
             }
         };
