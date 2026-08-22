@@ -216,9 +216,11 @@ stopped. If a PR already exists, push to the same branch.
 
 ### Review feedback to address
 
-{{ range .review_comments }}- {{ .reviewer }}{{ if .file }} on `{{ .file }}`{{ if .start_line }}:{{ .start_line }}{{ end }}{{ end }}: {{ .body }}
+{{ range .review_comments }}- (comment id {{ .id }}) {{ .reviewer }}{{ if .file }} on `{{ .file }}`{{ if .start_line }}:{{ .start_line }}{{ end }}{{ end }}: {{ .body }}
 {{ end }}
-Address every point, push, and reply on the PR with what changed.
+First react 👀 on each comment (`gh api -X POST repos/githappens/busybee/pulls/comments/<id>/reactions -f content=eyes`)
+so the reviewer sees you are on it. Address every point, reply on each thread with
+what changed, and push.
 {{ end }}
 {{ if .merge_conflict }}
 
@@ -237,10 +239,15 @@ squash merge. Keep the PR's scope unchanged.
 
 ### Automated review findings to address (Codex)
 
-{{ range .bot_review_comments }}- {{ if .file }}`{{ .file }}`{{ if .start_line }}:{{ .start_line }}{{ end }}: {{ end }}{{ .body }}
+{{ range .bot_review_comments }}- (comment id {{ .id }}) {{ if .file }}`{{ .file }}`{{ if .start_line }}:{{ .start_line }}{{ end }}: {{ end }}{{ .body }}
 {{ end }}
-For each finding either fix it or reply on its PR thread with the reason it does
-not apply; then push. A new push triggers a fresh automated review; the PR merges
+First, acknowledge every finding so humans can see you are on it: for each comment
+id above run
+`gh api -X POST repos/githappens/busybee/pulls/comments/<id>/reactions -f content=eyes`.
+Then, for each finding, either fix it or reply on its thread
+(`gh api -X POST repos/githappens/busybee/pulls/<pr>/comments -F in_reply_to=<id> -f body='…'`)
+with the reason it does not apply; reply on the thread with a one-line summary of
+the fix as well. Then push. A new push triggers a fresh automated review; the PR merges
 automatically once that review reports no findings and CI is green.
 {{ end }}
 {{ end }}
