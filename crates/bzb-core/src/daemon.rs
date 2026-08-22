@@ -26,10 +26,15 @@ use crate::protocol::{
 /// Directory holding `bzbd.sock`, `bzbd.pid` and `bzbd.log`.
 pub fn state_dir() -> Result<PathBuf, BusybeeError> {
     if let Some(dir) = env::var_os("BUSYBEE_STATE_DIR") {
-        if dir.is_empty() {
-            return Err(BusybeeError::Other(
-                "BUSYBEE_STATE_DIR is set but empty; unset it or give it a directory".into(),
-            ));
+        // A relative override resolves against the working directory, so
+        // clients started from different directories would reach different
+        // sockets and each auto-start a daemon of its own.
+        if !Path::new(&dir).is_absolute() {
+            return Err(BusybeeError::Other(format!(
+                "BUSYBEE_STATE_DIR must be an absolute path, got {:?}; \
+                 unset it or give it a directory",
+                Path::new(&dir)
+            )));
         }
         return Ok(PathBuf::from(dir));
     }
@@ -353,12 +358,20 @@ mod tests {
             assert_eq!(state_dir().unwrap(), PathBuf::from("/tmp/override"));
         });
 
-        // An empty override is a misconfiguration, not a request for the
-        // default: falling back silently would hide it.
-        temp_env(&[("BUSYBEE_STATE_DIR", Some(""))], || {
-            let err = state_dir().unwrap_err().to_string();
-            assert!(err.contains("BUSYBEE_STATE_DIR"), "message was {err:?}");
-        });
+        // An empty or relative override is a misconfiguration, not a request
+        // for the default: falling back silently would hide it, and a relative
+        // one would resolve per working directory, so callers started from
+        // different directories would each reach a different socket and
+        // auto-start a daemon of their own.
+        for value in ["", "relative/state"] {
+            temp_env(&[("BUSYBEE_STATE_DIR", Some(value))], || {
+                let err = state_dir().unwrap_err().to_string();
+                assert!(
+                    err.contains("BUSYBEE_STATE_DIR"),
+                    "BUSYBEE_STATE_DIR={value:?} message was {err:?}"
+                );
+            });
+        }
 
         temp_env(
             &[
