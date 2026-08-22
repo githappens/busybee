@@ -42,11 +42,18 @@ mkdir -p build/sortie-workspaces
 
 # Sidecar: release dependents whose blockers have merged (sortie 1.21 does not
 # gate on blocked-by itself; see sortie/unblock.sh). Skipped for --dry-run.
-unblock_pid=""
+# Sidecar 2: nudge the review gate. A clean Codex verdict is a reaction, which
+# raises no workflow event, and the gate's cron trigger is throttled on quiet
+# repositories; a lone clean PR would otherwise wait for the next unrelated
+# event. A dispatch with no PR argument evaluates every open PR and exits
+# quickly when nothing needs judging.
+unblock_pid=""; gate_pid=""
 case " $* " in *" --dry-run "*) ;; *)
   ( while sleep 60; do "$REPO_ROOT/sortie/unblock.sh" 2>/dev/null | sed 's/^/unblock: /'; done ) &
   unblock_pid=$!
-  trap '[ -n "$unblock_pid" ] && kill "$unblock_pid" 2>/dev/null' EXIT
+  ( while sleep 600; do gh workflow run codex-gate.yml --repo githappens/busybee >/dev/null 2>&1 || echo "gate nudge: dispatch failed"; done ) &
+  gate_pid=$!
+  trap 'for p in "$unblock_pid" "$gate_pid"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done' EXIT
   ;;
 esac
 
