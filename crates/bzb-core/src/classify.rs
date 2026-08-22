@@ -323,13 +323,21 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
     };
 
     apply_injection(&mut plan, inject, user_flag.is_some());
+    // Injected before the row's own variables are layered on, so that the
+    // collision guard below covers them too: these two report the bargain the
+    // task was admitted under, and a row that replaced them would describe
+    // itself to the task as something other than what the scheduler booked.
+    plan.env_set
+        .push(("BUSYBEE_CLASS".to_string(), class.as_str().to_string()));
+    plan.env_set
+        .push(("BUSYBEE_CORES".to_string(), "{cores}".to_string()));
     // A row's own variables ride along with whichever recipe it kept: they are
     // core counts and tool-specific knobs, so they stay useful under a forced
     // class the way an injected `GOMAXPROCS` does. What they may not do is
-    // take a variable the recipe already set: `MAKEFLAGS` is how a jobserver
+    // take a variable busybee already set: `MAKEFLAGS` is how a jobserver
     // task reaches the fifo, and a row that replaced it would keep the class
-    // that reserves no tokens while running outside the pool. The recipe wins,
-    // and the dropped value is named.
+    // that reserves no tokens while running outside the pool. Busybee's value
+    // wins, and the dropped one is named.
     if let Some(rule) = rule {
         for (name, value) in &rule.env_set {
             if plan.env_set.iter().any(|(set, _)| set == name) {
@@ -351,11 +359,6 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
         ),
         (_, cores) => plan.cores_wanted = cores,
     }
-
-    plan.env_set
-        .push(("BUSYBEE_CLASS".to_string(), class.as_str().to_string()));
-    plan.env_set
-        .push(("BUSYBEE_CORES".to_string(), "{cores}".to_string()));
 
     drop_shadowed_env(&mut plan, &env_assigned);
 
@@ -727,6 +730,53 @@ mod tests {
             plan.env_set
         );
         assert!(plan.notices.iter().any(|n| n.contains("MAKEFLAGS")));
+    }
+
+    /// `BUSYBEE_CLASS` and `BUSYBEE_CORES` are how a task reports the bargain
+    /// it was admitted under, so a row's own variables may not take them
+    /// either. They are injected for every class, not by a recipe, so the
+    /// collision has to be caught for them by name rather than by whatever
+    /// [`apply_injection`] happened to set.
+    #[test]
+    fn a_rows_own_env_cannot_take_the_busybee_variables() {
+        let table = Table {
+            rows: vec![Rule {
+                tool: "mytool".to_string(),
+                requires: None,
+                class: Class::Static,
+                inject: Inject::None,
+                parallel_flags: Vec::new(),
+                env_set: vec![
+                    ("BUSYBEE_CLASS".to_string(), "none".to_string()),
+                    ("BUSYBEE_CORES".to_string(), "64".to_string()),
+                ],
+            }],
+        };
+
+        let plan = classify(&["mytool".to_string()], &Overrides::default(), &table);
+
+        assert_eq!(
+            plan.env_set
+                .iter()
+                .filter(|(k, _)| k == "BUSYBEE_CLASS")
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>(),
+            vec!["static"],
+            "env_set was {:?}",
+            plan.env_set
+        );
+        assert_eq!(
+            plan.env_set
+                .iter()
+                .filter(|(k, _)| k == "BUSYBEE_CORES")
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>(),
+            vec!["{cores}"],
+            "env_set was {:?}",
+            plan.env_set
+        );
+        assert!(plan.notices.iter().any(|n| n.contains("BUSYBEE_CLASS")));
+        assert!(plan.notices.iter().any(|n| n.contains("BUSYBEE_CORES")));
     }
 
     #[test]

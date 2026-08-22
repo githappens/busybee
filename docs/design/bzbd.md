@@ -187,7 +187,10 @@ available to a config file too. A row's `env` is layered on top of that
 injection and never replaces it: `MAKEFLAGS` on a jobserver row is the fifo the
 task is accounted through, so busybee's value stays and the row's is dropped
 with a notice rather than leaving a task that reserves no tokens running
-outside the pool.
+outside the pool. The same holds for the `BUSYBEE_CLASS` and `BUSYBEE_CORES`
+of point 4 above, which every class injects: they are how a task reads back the
+bargain it was admitted under, so a row cannot describe itself to the task as
+something other than what the scheduler booked.
 
 Reload is SIGHUP or `busybee config reload`, which is the same reload over the
 socket so the client can report a refusal instead of leaving it in the log. New
