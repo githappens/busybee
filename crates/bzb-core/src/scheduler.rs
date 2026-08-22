@@ -23,13 +23,13 @@
 //! be fully free, and everything behind it waits too. Priorities, preemption
 //! and reordering are out of scope.
 //!
-//! Every [`Action::Admit`] also carries `cores`, the lease's fair share of the
-//! pool at that admission — the daemon's `{cores}` substitution value. It
-//! equals `drain_target` for static and none; for jobserver it is `fair`
-//! rather than 0. The machine reports it per admission because it is
-//! count-sensitive: one batch (a [`Scheduler::set_params`] reload, or a
-//! [`Event::Finished`] freeing several slots) can admit leases whose shares
-//! differ, so the daemon cannot recover it from the queue afterwards.
+//! `drain_target` is a target, not a grant: the daemon drains up to that many
+//! tokens within its deadline and starts the task with whatever it collected,
+//! the implicit token providing the minimum of one. The `{cores}` number a
+//! static or none task is told is therefore the *collected* count, which only
+//! the daemon knows — so [`Action::Admit`] carries `cores: None` for those,
+//! and `Some(fair)` only for jobserver, which drains nothing. See
+//! [`Action::Admit`].
 //!
 //! The machine is driven by [`Event`]s and answers with [`Action`]s; the
 //! daemon performs the IO (draining fifo tokens, submitting to pueued,
@@ -86,8 +86,16 @@ pub enum Event {
     /// The task exited or was killed. The daemon has already returned the
     /// lease's tokens to the fifo, so no [`Action::Drop`] is emitted for it.
     Finished(LeaseId),
-    /// The daemon could not collect a single token in time. Should not happen
-    /// (the implicit token guarantees one); keeps the machine honest.
+    /// The daemon could not launch the task at all — the fifo was unreadable,
+    /// or the submission to pueued failed. The lease ends without ever
+    /// running; keeps the machine honest.
+    ///
+    /// A drain that collects fewer tokens than `drain_target`, or none at all,
+    /// is *not* this: a static task starts with whatever it collected, the
+    /// implicit token providing the minimum of one, and the daemon reports
+    /// [`Event::Started`] with the count it got (possibly 0). Ending the lease
+    /// there would mean a second static task never runs whenever the first one
+    /// already drained the pool.
     DrainFailed(LeaseId),
 }
 
@@ -102,14 +110,24 @@ pub enum Action {
         id: LeaseId,
         class: Class,
         drain_target: u32,
-        /// The lease's fair share of the pool at this admission: the value the
-        /// daemon substitutes for the `{cores}` placeholder (and `{cores-1}`,
-        /// `BUSYBEE_CORES`, `RUST_TEST_THREADS`). Equal to `drain_target` for
-        /// [`Class::Static`]/[`Class::None`]; for [`Class::Jobserver`] it is
-        /// `ceil(pool_size / (admitted_count + 1))`, because a jobserver task
-        /// still spawns threads that do not speak the protocol and need
-        /// bounding, even though it holds no tokens of its own.
-        cores: u32,
+        /// The value the daemon substitutes for the `{cores}` placeholder (and
+        /// `{cores-1}`, `BUSYBEE_CORES`, `RUST_TEST_THREADS`) — when the
+        /// machine is the one that knows it.
+        ///
+        /// `Some(ceil(pool_size / (admitted_count + 1)))` for
+        /// [`Class::Jobserver`]: it drains nothing, so this fair share is the
+        /// only number available, and its threads that do not speak the
+        /// protocol still need bounding. It is reported per admission because
+        /// it is count-sensitive — one batch can admit leases whose shares
+        /// differ, so the daemon cannot recover it from the queue afterwards.
+        ///
+        /// `None` for [`Class::Static`]/[`Class::None`]: those are told the
+        /// tokens the drain actually collected, `max(1, collected)` with the
+        /// implicit token as the minimum, which only the daemon knows.
+        /// `drain_target` is that number's upper bound, not a substitute for
+        /// it: a drain that comes up short and still reports `drain_target`
+        /// would let the running tasks demand more cores than the pool has.
+        cores: Option<u32>,
     },
     /// The lease's queue position changed; tell the client `ahead` tasks
     /// are in front of it.
@@ -251,8 +269,9 @@ impl Scheduler {
                 break;
             };
             let cores = match head.class {
-                Class::Jobserver => self.fair_share(None),
-                Class::Static | Class::None => drain_target,
+                Class::Jobserver => Some(self.fair_share(None)),
+                // The drain decides this one; see [`Action::Admit::cores`].
+                Class::Static | Class::None => None,
             };
             let r = self.queue.pop_front().expect("front() just returned Some");
             actions.push(Action::Admit {
@@ -386,7 +405,7 @@ mod tests {
         let mut s = Scheduler::new(params(8, 4));
         // fair = ceil(8 / 1), ceil(8 / 2), ceil(8 / 3): the share shrinks as
         // more leases are admitted, even though none of them holds a token.
-        for (id, cores) in [(1, 8), (2, 4), (3, 3)] {
+        for (id, cores) in [(1, Some(8)), (2, Some(4)), (3, Some(3))] {
             let actions = submit_and_start(&mut s, req(id, Class::Jobserver, None), 0);
             assert_eq!(
                 actions,
@@ -417,13 +436,13 @@ mod tests {
                     id: LeaseId(2),
                     class: Class::Jobserver,
                     drain_target: 0,
-                    cores: 4,
+                    cores: Some(4),
                 },
                 Action::Admit {
                     id: LeaseId(3),
                     class: Class::Jobserver,
                     drain_target: 0,
-                    cores: 3,
+                    cores: Some(3),
                 },
             ]
         );
@@ -439,7 +458,67 @@ mod tests {
                 id: LeaseId(1),
                 class: Class::Static,
                 drain_target: 8,
-                cores: 8,
+                cores: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_static_admission_leaves_the_core_count_to_the_drain_result() {
+        let mut s = Scheduler::new(params(8, 2));
+        // One lease already holds six of the eight tokens.
+        submit_and_start(&mut s, req(1, Class::Static, Some(6)), 6);
+
+        let actions = s.handle(Event::Submit(req(2, Class::Static, None)));
+        // fair = ceil(8 / 2) = 4, but only two tokens are actually in the fifo.
+        // The machine cannot know that, so it names the target and no `cores`:
+        // telling the daemon to substitute `{cores}` = 4 would let the two
+        // tasks demand ten cores from an eight-token pool.
+        assert_eq!(
+            actions,
+            vec![Action::Admit {
+                id: LeaseId(2),
+                class: Class::Static,
+                drain_target: 4,
+                cores: None,
+            }]
+        );
+
+        // The drain comes up short; `{cores}` is the two tokens it collected.
+        s.handle(Event::Started {
+            id: LeaseId(2),
+            cores_held: 2,
+        });
+        assert_eq!(s.snapshot().free_estimate, 0);
+    }
+
+    #[test]
+    fn a_drain_that_collects_no_tokens_still_runs_on_the_implicit_core() {
+        let mut s = Scheduler::new(params(8, 2));
+        submit_and_start(&mut s, req(1, Class::Static, Some(8)), 8);
+        s.handle(Event::Submit(req(2, Class::Static, None)));
+
+        // The pool is empty, so the second drain reaches its deadline without
+        // reading a token. That is ordinary token exhaustion, not a failure:
+        // the task starts on the implicit core and keeps its slot.
+        assert_eq!(
+            s.handle(Event::Started {
+                id: LeaseId(2),
+                cores_held: 0
+            }),
+            vec![]
+        );
+        let snap = s.snapshot();
+        assert_eq!(
+            snap.admitted.iter().map(|l| l.id).collect::<Vec<_>>(),
+            vec![LeaseId(1), LeaseId(2)]
+        );
+        // Still admitted, so it holds its slot and blocks an exclusive lease.
+        assert_eq!(
+            s.handle(Event::Submit(req(3, Class::None, None))),
+            vec![Action::Notify {
+                id: LeaseId(3),
+                ahead: 0
             }]
         );
     }
@@ -457,7 +536,7 @@ mod tests {
                 id: LeaseId(3),
                 class: Class::Static,
                 drain_target: 3,
-                cores: 3,
+                cores: None,
             }]
         );
     }
@@ -472,7 +551,7 @@ mod tests {
                 id: LeaseId(1),
                 class: Class::Static,
                 drain_target: 2,
-                cores: 2,
+                cores: None,
             }]
         );
     }
@@ -489,7 +568,7 @@ mod tests {
                 id: LeaseId(2),
                 class: Class::Static,
                 drain_target: 4,
-                cores: 4,
+                cores: None,
             }]
         );
     }
@@ -504,7 +583,7 @@ mod tests {
                 id: LeaseId(1),
                 class: Class::Static,
                 drain_target: 1,
-                cores: 1,
+                cores: None,
             }]
         );
     }
@@ -538,7 +617,7 @@ mod tests {
                 id: LeaseId(3),
                 class: Class::None,
                 drain_target: 8,
-                cores: 8,
+                cores: None,
             }]
         );
     }
@@ -568,7 +647,7 @@ mod tests {
                     id: LeaseId(2),
                     class: Class::None,
                     drain_target: 8,
-                    cores: 8,
+                    cores: None,
                 },
                 Action::Notify {
                     id: LeaseId(3),
@@ -617,7 +696,7 @@ mod tests {
                     id: LeaseId(2),
                     class: Class::Jobserver,
                     drain_target: 0,
-                    cores: 8,
+                    cores: Some(8),
                 },
             ]
         );
@@ -639,7 +718,7 @@ mod tests {
                     id: LeaseId(2),
                     class: Class::Jobserver,
                     drain_target: 0,
-                    cores: 8,
+                    cores: Some(8),
                 },
             ]
         );
@@ -686,7 +765,7 @@ mod tests {
                     id: LeaseId(2),
                     class: Class::Jobserver,
                     drain_target: 0,
-                    cores: 8,
+                    cores: Some(8),
                 },
             ]
         );
@@ -762,7 +841,7 @@ mod tests {
                 id: LeaseId(2),
                 class: Class::Static,
                 drain_target: 4,
-                cores: 4,
+                cores: None,
             }]
         );
     }
@@ -784,7 +863,7 @@ mod tests {
                     id: LeaseId(2),
                     class: Class::Jobserver,
                     drain_target: 0,
-                    cores: 4,
+                    cores: Some(4),
                 },
                 Action::Notify {
                     id: LeaseId(3),
@@ -819,7 +898,7 @@ mod tests {
                 id: LeaseId(2),
                 class: Class::None,
                 drain_target: 8,
-                cores: 8,
+                cores: None,
             }]
         );
         assert_eq!(s.snapshot().free_estimate, 8);
