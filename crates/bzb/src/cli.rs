@@ -1,3 +1,4 @@
+use bzb_core::classify::Class;
 use clap::{Parser, Subcommand};
 
 /// busybee — queued runner for resource-heavy tasks, with a live monitor.
@@ -12,6 +13,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub detach: bool,
 
+    /// Admission class to use instead of the one busybee infers.
+    #[arg(long, global = true, value_name = "jobserver|static|none")]
+    pub class: Option<Class>,
+
+    /// Cores to hold for a static task; ignored for jobserver tasks.
+    #[arg(long, global = true, value_name = "N")]
+    pub cores: Option<u32>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 
@@ -24,6 +33,12 @@ pub struct Cli {
 pub enum Command {
     /// Launch the live TUI monitor (CPU + queue).
     Monitor,
+
+    /// End a lease `--detach` left running (Ctrl-C cannot reach those).
+    Cancel {
+        /// The lease id `--detach` printed.
+        lease: u64,
+    },
 
     /// Print the token pool and one row per lease, then exit.
     ///
@@ -49,6 +64,7 @@ impl Cli {
         match (&self.command, self.detach, self.cmd.is_empty()) {
             (Some(Command::Monitor), _, _) => Mode::Monitor,
             (Some(Command::Status { json }), _, _) => Mode::Status { json: *json },
+            (Some(Command::Cancel { lease }), _, _) => Mode::Cancel(*lease),
             (None, true, false) => Mode::Detach,
             (None, false, false) => Mode::Blocking,
             (None, _, true) => Mode::MissingCommand,
@@ -62,6 +78,7 @@ pub enum Mode {
     Detach,
     Monitor,
     Status { json: bool },
+    Cancel(u64),
     MissingCommand,
 }
 
@@ -110,6 +127,36 @@ mod tests {
             parse(&["status", "--json"]).mode(),
             Mode::Status { json: true }
         );
+    }
+
+    #[test]
+    fn cancel_subcommand_takes_a_lease_id() {
+        assert_eq!(parse(&["cancel", "7"]).mode(), Mode::Cancel(7));
+    }
+
+    #[test]
+    fn class_and_cores_are_captured() {
+        let cli = parse(&["--class", "static", "--cores", "2", "--", "xcodebuild"]);
+        assert_eq!(cli.mode(), Mode::Blocking);
+        assert_eq!(cli.class, Some(Class::Static));
+        assert_eq!(cli.cores, Some(2));
+        assert_eq!(cli.cmd, vec!["xcodebuild"]);
+    }
+
+    /// The class vocabulary is closed, so a typo is refused rather than
+    /// silently ignored on the way to the daemon.
+    #[test]
+    fn an_unknown_class_is_refused() {
+        let parsed = Cli::try_parse_from(["busybee", "--class", "statik", "--", "make"]);
+        assert!(parsed.is_err(), "an unknown class was accepted");
+    }
+
+    /// Neither flag is required: `busybee -- <cmd>` stays the whole API.
+    #[test]
+    fn class_and_cores_default_to_unset() {
+        let cli = parse(&["--", "make"]);
+        assert_eq!(cli.class, None);
+        assert_eq!(cli.cores, None);
     }
 
     #[test]

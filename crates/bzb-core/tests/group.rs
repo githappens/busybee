@@ -48,6 +48,24 @@ async fn the_group_is_created_with_pueue_scheduling_disabled() {
     assert_eq!(parallel_tasks(&mut client).await, 0);
 }
 
+/// Every invocation re-enforces the group, so creating one that already exists
+/// has to be a no-op rather than an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn ensure_group_is_idempotent() {
+    let Some(p) = PueuedFixture::try_start() else {
+        return;
+    };
+    std::env::set_var("PUEUE_CONFIG_PATH", &p.config_path);
+    let mut client = client::connect_or_spawn().await.expect("connect");
+    group::ensure_busybee_group(&mut client)
+        .await
+        .expect("create the group");
+    group::ensure_busybee_group(&mut client)
+        .await
+        .expect("create the group again");
+}
+
 /// bzbd admits tasks itself and submits them with `start_immediately`. A limit
 /// someone raised by hand (`pueue parallel -g busybee 4`) would leave pueue
 /// dispatching queued tasks behind bzbd's back, so it is put back on every

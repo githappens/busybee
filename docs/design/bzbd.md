@@ -43,7 +43,7 @@ busybee (client)  ──unix socket──▶  bzbd (broker)  ──pueue-lib─�
                                       └ group `busybee` now parallel_tasks = 0
 ```
 
-**bzbd** (new crate `crates/bzbd`) is the only thing clients talk to and the only thing that talks to pueued. Auto-started by the client on demand, exactly as pueued is today (`bzb-core/src/client.rs::connect_or_spawn`). State dir: `$XDG_STATE_HOME/busybee/` (default `~/.local/state/busybee/`, overridden by `BUSYBEE_STATE_DIR`): `bzbd.sock`, `bzbd.pid` (also the single-instance `flock`), `bzbd.log`, `jobserver-<pid>` fifo, `leases.json`. The state dir is created mode `0700` and the socket is `0600`: the socket is bzbd's whole control surface, so on a shared machine it belongs to its owner alone.
+**bzbd** (new crate `crates/bzbd`) is the only thing clients ask to run anything, and the only thing that changes pueued's state. There is one read-only exception: a blocking client streams its own task's combined output straight from pueued (`bzb-core/src/log.rs::fetch_log_chunk`, by task id from the `Admitted` event) rather than through the broker, because pueued already serves that log from a byte offset and relaying it through bzbd would add a copy, a buffer to bound and a second place for the stream to stall. That connection reads and never spawns: bzbd has necessarily already started the task on its pueued, so an unreachable socket means the client's pueue configuration disagrees with the daemon's, and a client that quietly started a pueued of its own would read an empty queue and report missing output instead of the misconfiguration. Auto-started by the client on demand, exactly as pueued is today (`bzb-core/src/client.rs::connect_or_spawn`). State dir: `$XDG_STATE_HOME/busybee/` (default `~/.local/state/busybee/`, overridden by `BUSYBEE_STATE_DIR`): `bzbd.sock`, `bzbd.pid` (also the single-instance `flock`), `bzbd.log`, `jobserver-<pid>` fifo, `leases.json`. The state dir is created mode `0700` and the socket is `0600`: the socket is bzbd's whole control surface, so on a shared machine it belongs to its owner alone.
 
 Clients and bzbd speak newline-delimited JSON over `bzbd.sock`, one UTF-8 message per line. The client's first line is `{"hello": <protocol_version>}`; bzbd answers `Pong { version, pid }`, or `Error` when it does not speak that version, and closes. A line may not exceed 64 KiB in either direction; bzbd answers `Error` and closes rather than buffering a message that never ends, and a client that is sent an over-long line reports a protocol error rather than buffering it. An `Error` reporting an undecodable line does not echo it back, and its message is truncated to a kilobyte — a decoder quotes the input it choked on, so neither the echo nor the quote can turn a request that fit within the limit into an answer that does not.
 
@@ -57,10 +57,13 @@ Every `busybee -- cmd` is a lease request:
 
 ```
 LeaseRequest { argv: Vec<String>, cwd, env, label: Option<String>,
-               class_override: Option<Class>, cores_wanted: Option<u32> }
+               class_override: Option<Class>, cores_wanted: Option<u32>,
+               detached: bool }
 ```
 
 Lifecycle: `Queued` → `Admitted { pueue_task_id, class, cores }` → `Finished { exit_code }`. A lease ends when pueued reports the task `Done`, or when the requesting client's connection drops (before admission: dropped from the queue; after: task killed, tokens returned). The client holds its socket open for the lease's whole life; connection = lease.
+
+`detached: true` (`--detach`) is the one exception, and the reason the flag can keep its contract of returning immediately: the lease survives its connection, so bzbd runs it to completion whether or not anyone is still listening. Nothing holds it, so no Ctrl-C can reach it either — `Request::Cancel { lease }` (`busybee cancel <id>`) is the only way to end one early, and bzbd answers `Ack`, or `Error` when the lease is not there. A cancel that silently accepted an unknown id would report success for a task still on the machine.
 
 ## Admission policy (pure state machine, no IO)
 
@@ -113,11 +116,23 @@ Lines the client prints to **stderr** (stdout is reserved for the task's output)
 busybee: queued (2 ahead)
 busybee: running — cmake, jobserver, sharing 18-token pool with 1 other task
 busybee: running — xcodebuild, static, holding 9/18 cores (2 other tasks active)
+busybee: running — make, none, exclusive (18 cores)
 busybee: note: you passed -j8; ninja will ignore the shared pool
 busybee: command exited 0 (elapsed 2m14s)
 ```
 
+A `none` task reports the pool rather than a held count: it is admitted alone, so the cores it holds a token for understate what it was granted.
+
+Notices the daemon raises about the request itself (an override it will not honour) precede `Queued`, since a `--detach` client returns on that event and would never see one raised after it.
+
 Exit-code mapping is unchanged (`bzb-core/src/exit_code.rs`).
+
+`--detach` is the exception that owns stdout, because its lease id is the command's result and `busybee cancel <id>` is the only thing that can end the lease. It prints the lease id there, plus the pueue task id when the lease was admitted before the client returned:
+
+```
+busybee: lease 7 detached (pueue task assigned once admitted)
+busybee: lease 7 detached (pueue task 12)
+```
 
 ## Failure and recovery
 

@@ -9,6 +9,7 @@ mod common;
 use std::{collections::BTreeMap, path::Path, time::Duration};
 
 use bzb_core::{
+    classify::Class,
     daemon::Connection,
     protocol::{LeaseEvent, LeaseRequest, Request, Response, StatusReply},
 };
@@ -35,6 +36,7 @@ fn request(argv: &[&str]) -> LeaseRequest {
         label: None,
         class_override: None,
         cores_wanted: None,
+        detached: false,
     }
 }
 
@@ -129,6 +131,39 @@ async fn a_lease_runs_its_command_and_reports_the_exit_code() {
     match event(&mut conn).await {
         LeaseEvent::Finished { exit_code, .. } => assert_eq!(exit_code, 7),
         other => panic!("expected a Finished event, got {other:?}"),
+    }
+}
+
+/// `--class`/`--cores` reach the daemon on the wire before the injection work
+/// (#8) teaches it to classify. Until then every task is exclusive — but an
+/// override that is accepted and then quietly dropped is a silent fallback, so
+/// the lease says what it did with it — and says it *before* `Queued`, which
+/// is where a `--detach` client stops reading.
+#[tokio::test]
+async fn an_override_the_daemon_cannot_honour_yet_is_announced() {
+    let Some(pueued) = PueuedFixture::try_start() else {
+        return;
+    };
+    let daemon = Fixture::start_with_pueue(&pueued.config_path);
+
+    let mut conn = connect(&daemon).await;
+    let mut request = request(&["true"]);
+    request.class_override = Some(Class::Static);
+    request.cores_wanted = Some(2);
+    conn.send(Request::Submit(request))
+        .await
+        .expect("send a submit request");
+
+    match event(&mut conn).await {
+        LeaseEvent::Notice { text } => assert!(
+            text.contains("--class") && text.contains("--cores"),
+            "notice was {text:?}"
+        ),
+        other => panic!("expected a Notice about the override first, got {other:?}"),
+    }
+    match event(&mut conn).await {
+        LeaseEvent::Queued { .. } => {}
+        other => panic!("expected a Queued event, got {other:?}"),
     }
 }
 

@@ -1,88 +1,228 @@
-use std::time::{Duration, Instant};
+//! Blocking mode: take a lease from bzbd, stream the task's output, mirror
+//! its exit code.
+//!
+//! The connection is the lease (`docs/design/bzbd.md` §Lease model), so it is
+//! held open for the command's whole life and closing it is how Ctrl-C
+//! cancels. The task's own output is not on that connection: bzbd hands back
+//! the pueue task id, and the log is read straight from pueued, which is the
+//! one thing the client still talks to directly — read-only, and over the same
+//! pueue configuration the daemon used to start the task
+//! (`docs/design/bzbd.md` §Components).
+//!
+//! Everything busybee says goes to stderr; stdout carries the task's output
+//! and nothing else.
 
-use anyhow::{Context, Result};
-use bzb_core::{
-    client,
-    enqueue::{self as core_enqueue, shell_escape_join},
-    exit_code::task_result_to_exit_code,
-    group,
-    kill::kill,
-    log::fetch_log_chunk,
-    wait::{WaitEvent, WaitState},
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
 };
-use pueue_lib::message::{Request, Response, Signal};
-use pueue_lib::state::State;
-use pueue_lib::task::TaskStatus;
+
+use anyhow::{bail, Context, Result};
+use bzb_core::{
+    classify::{classify, default_table, Class, Overrides},
+    client,
+    daemon::connect_or_spawn_bzbd,
+    log::fetch_log_chunk,
+    protocol::{LeaseEvent, LeaseRequest, Request},
+    wait::QueueLines,
+};
 use pueue_lib::Client;
-use tokio::{io::AsyncWriteExt, time::sleep};
+use tokio::{
+    io::{AsyncWriteExt, Stdout},
+    sync::mpsc,
+    time::interval,
+};
 
 use crate::signals::{self, SignalEvent};
 
-pub async fn run(cmd: Vec<String>, name: Option<String>) -> Result<()> {
-    let mut client = client::connect_or_spawn().await?;
-    group::ensure_busybee_group(&mut client).await?;
+/// How often the task's log is swept while it runs, and the tick the queue
+/// heartbeat counts in.
+const POLL: Duration = Duration::from_secs(1);
 
-    let cmd_string = shell_escape_join(&cmd);
-    let display_label = name.clone().unwrap_or_else(|| cmd_string.clone());
-    let spec = core_enqueue::TaskSpec::from_current_env(cmd_string, name)?;
-    let task_id = core_enqueue::enqueue(&mut client, spec).await?;
+/// What the client asks bzbd for. `detached` decides whether the lease
+/// outlives this process.
+pub fn lease_request(
+    cmd: Vec<String>,
+    name: Option<String>,
+    class: Option<Class>,
+    cores: Option<u32>,
+    detached: bool,
+) -> Result<LeaseRequest> {
+    Ok(LeaseRequest {
+        argv: cmd,
+        cwd: std::env::current_dir().context("cannot read the working directory")?,
+        // The daemon runs the task, so it needs the environment the caller
+        // would have run it in. Colour variables are added on that side.
+        env: std::env::vars().collect::<BTreeMap<_, _>>(),
+        label: name,
+        class_override: class,
+        cores_wanted: cores,
+        detached,
+    })
+}
 
-    let mut wait_state = WaitState::new(task_id, display_label);
+pub async fn run(
+    cmd: Vec<String>,
+    name: Option<String>,
+    class: Option<Class>,
+    cores: Option<u32>,
+) -> Result<()> {
+    let request = lease_request(cmd, name, class, cores, false)?;
+    // Only for the running line: the class the task is admitted under is the
+    // daemon's to decide and comes back in the event.
+    let tool = classify(
+        &request.argv,
+        &Overrides { class, cores: None },
+        &default_table(),
+    )
+    .tool;
+
+    let mut conn = connect_or_spawn_bzbd().await?;
+    conn.send(Request::Submit(request)).await?;
+    // The socket is read on its own task: `read_line` buffers, so cancelling
+    // it in a `select!` would lose half a message and break the framing. A
+    // channel receive is cancel-safe; this one also gives Ctrl-C a way to
+    // close the connection, by dropping the task that owns it.
+    let (events, mut incoming) = mpsc::unbounded_channel();
+    let mut reader = tokio::spawn(async move {
+        loop {
+            let event = conn.events().next().await;
+            let last = !matches!(event, Ok(Some(ref event)) if !finished(event));
+            if events.send(event).is_err() || last {
+                return;
+            }
+        }
+    });
+
+    let mut queue = QueueLines::new();
     let mut signals = signals::install();
-    let mut log_offset: u64 = 0;
-    let mut started = false;
-    let mut started_at: Option<Instant> = None;
+    let mut ticker = interval(POLL);
     let mut stdout = tokio::io::stdout();
+    let mut task: Option<Task> = None;
+    let mut started_at: Option<Instant> = None;
     let mut tick: u64 = 0;
 
     loop {
         tokio::select! {
-            sig = signals.recv() => match sig {
-                Some(SignalEvent::SoftCancel) => {
-                    soft_cancel(&mut client, task_id).await;
+            event = incoming.recv() => match event {
+                Some(Ok(Some(LeaseEvent::Queued { ahead, .. }))) => {
+                    if let Some(line) = queue.queued(ahead) {
+                        eprintln!("busybee: {line}");
+                    }
                 }
-                Some(SignalEvent::HardKill) => {
-                    hard_kill(&mut client, task_id).await;
-                    std::process::exit(130);
+                Some(Ok(Some(LeaseEvent::Notice { text }))) => eprintln!("busybee: note: {text}"),
+                Some(Ok(Some(LeaseEvent::Admitted {
+                    pueue_task_id, class, cores, pool_size, peers, ..
+                }))) => {
+                    eprintln!("busybee: {}", running_line(&tool, &class, cores, pool_size, peers));
+                    started_at = Some(Instant::now());
+                    task = Some(Task {
+                        // pueued is already up: bzbd needed it to start the
+                        // task we were just told about. Not being able to
+                        // reach it means this process's pueue configuration
+                        // points somewhere else, which is worth hearing —
+                        // spawning a daemon of our own would only give us an
+                        // empty queue to look the task up in.
+                        pueue: client::connect().await.context(
+                            "cannot read the task's log: bzbd started it on a pueued this \
+                             client cannot reach (check PUEUE_CONFIG_PATH)",
+                        )?,
+                        id: pueue_task_id,
+                        log_offset: 0,
+                    });
                 }
-                None => {}
+                Some(Ok(Some(LeaseEvent::Finished { exit_code, .. }))) => {
+                    if let Some(task) = task.as_mut() {
+                        task.sweep(&mut stdout).await?;
+                    }
+                    eprintln!("{}", exit_line(exit_code, started_at.map(|t| t.elapsed())));
+                    std::process::exit(exit_code);
+                }
+                Some(Ok(None)) | None => bail!("bzbd stopped streaming the lease before it finished"),
+                Some(Err(err)) => return Err(err.into()),
             },
-            _ = sleep(Duration::from_millis(1000)) => {
+            _ = ticker.tick() => {
                 tick += 1;
-                let state = fetch_state(&mut client).await?;
-                let events = wait_state.observe(tick, state.tasks.values());
-                let mut finished = false;
-                for e in events {
-                    match e {
-                        WaitEvent::Line(l) => eprintln!("busybee: {l}"),
-                        WaitEvent::Started => {
-                            started = true;
-                            started_at = Some(Instant::now());
-                        }
-                        WaitEvent::Finished { .. } => { finished = true; }
-                    }
-                }
-                if started {
-                    let (bytes, new_off) = fetch_log_chunk(&mut client, task_id, log_offset).await?;
-                    if !bytes.is_empty() {
-                        stdout.write_all(&bytes).await.context("write stdout")?;
-                        stdout.flush().await.ok();
-                    }
-                    log_offset = new_off;
-                }
-                if finished {
-                    // Final sweep for any buffered bytes.
-                    let (bytes, _) = fetch_log_chunk(&mut client, task_id, log_offset).await?;
-                    if !bytes.is_empty() {
-                        stdout.write_all(&bytes).await.ok();
-                        stdout.flush().await.ok();
-                    }
-                    let code = final_exit_code(&state, task_id);
-                    eprintln!("{}", exit_line(code, started_at.map(|t| t.elapsed())));
-                    std::process::exit(code);
+                match task.as_mut() {
+                    Some(task) => task.sweep(&mut stdout).await?,
+                    None => if let Some(line) = queue.tick(tick) {
+                        eprintln!("busybee: {line}");
+                    },
                 }
             }
+            signal = signals.recv() => match signal {
+                // Connection = lease: dropping the reader closes the socket,
+                // which is what tells bzbd to drop the lease and kill the task.
+                // Whatever the task wrote since the last sweep stays in
+                // `pueue log`; waiting for it here is what the second Ctrl-C
+                // would be for.
+                Some(SignalEvent::SoftCancel) => {
+                    eprintln!("busybee: cancelling…");
+                    reader.abort();
+                    let _ = (&mut reader).await;
+                    eprintln!("{}", exit_line(CANCELLED, started_at.map(|t| t.elapsed())));
+                    std::process::exit(CANCELLED);
+                }
+                Some(SignalEvent::HardKill) => std::process::exit(CANCELLED),
+                None => {}
+            },
         }
+    }
+}
+
+/// The exit code of a command its caller cancelled, by convention SIGINT's.
+const CANCELLED: i32 = 130;
+
+fn finished(event: &LeaseEvent) -> bool {
+    matches!(event, LeaseEvent::Finished { .. })
+}
+
+/// The running task's log, as far as the client has read it.
+struct Task {
+    pueue: Client,
+    id: usize,
+    log_offset: u64,
+}
+
+impl Task {
+    /// Writes whatever the task has produced since the last sweep.
+    async fn sweep(&mut self, stdout: &mut Stdout) -> Result<()> {
+        let (bytes, offset) = fetch_log_chunk(&mut self.pueue, self.id, self.log_offset).await?;
+        self.log_offset = offset;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        stdout.write_all(&bytes).await.context("write stdout")?;
+        stdout.flush().await.context("flush stdout")
+    }
+}
+
+/// The line the client prints when its lease is admitted
+/// (`docs/design/bzbd.md` §Client output contract). A jobserver task holds no
+/// tokens of its own — it shares the pool at compile-job granularity — so
+/// there is no held count to report for it. A `none` task is exclusive: it has
+/// the whole pool because nothing else is admitted beside it, and a held count
+/// would read as a share of something it is not sharing.
+fn running_line(tool: &str, class: &str, cores: u32, pool_size: u32, peers: usize) -> String {
+    if class == Class::Jobserver.as_str() {
+        format!(
+            "running — {tool}, {class}, sharing {pool_size}-token pool with {}",
+            others(peers)
+        )
+    } else if class == Class::None.as_str() {
+        format!("running — {tool}, {class}, exclusive ({pool_size} cores)")
+    } else {
+        format!(
+            "running — {tool}, {class}, holding {cores}/{pool_size} cores ({} active)",
+            others(peers)
+        )
+    }
+}
+
+fn others(peers: usize) -> String {
+    match peers {
+        1 => "1 other task".into(),
+        n => format!("{n} other tasks"),
     }
 }
 
@@ -107,49 +247,9 @@ fn format_elapsed(d: Duration) -> String {
     }
 }
 
-async fn fetch_state(client: &mut Client) -> Result<State> {
-    client
-        .send_request(Request::Status)
-        .await
-        .map_err(|e| anyhow::anyhow!("status request: {e}"))?;
-    match client
-        .receive_response()
-        .await
-        .map_err(|e| anyhow::anyhow!("status response: {e}"))?
-    {
-        Response::Status(state) => Ok(*state),
-        other => anyhow::bail!("unexpected response to Status: {other:?}"),
-    }
-}
-
-fn final_exit_code(state: &State, task_id: usize) -> i32 {
-    let Some(task) = state.tasks.get(&task_id) else {
-        return 1;
-    };
-    match &task.status {
-        TaskStatus::Done { result, .. } => task_result_to_exit_code(result),
-        _ => 1,
-    }
-}
-
-async fn soft_cancel(client: &mut Client, task_id: usize) {
-    match kill(client, task_id, Signal::SigTerm).await {
-        Ok(()) => eprintln!("busybee: cancelling task {task_id}…"),
-        // Saying "cancelling" over a signal that never landed would leave the
-        // user waiting for an exit that is not coming.
-        Err(err) => eprintln!("busybee: cannot cancel task {task_id}: {err}"),
-    }
-}
-
-async fn hard_kill(client: &mut Client, task_id: usize) {
-    if let Err(err) = kill(client, task_id, Signal::SigKill).await {
-        eprintln!("busybee: cannot kill task {task_id}: {err}");
-    }
-}
 #[cfg(test)]
 mod tests {
-    use super::{exit_line, format_elapsed};
-    use std::time::Duration;
+    use super::*;
 
     #[test]
     fn format_elapsed_under_a_minute() {
@@ -177,5 +277,40 @@ mod tests {
     #[test]
     fn exit_line_omits_elapsed_when_never_started() {
         assert_eq!(exit_line(130, None), "busybee: command exited 130");
+    }
+
+    /// Both shapes are quoted from `docs/design/bzbd.md` §Client output
+    /// contract.
+    #[test]
+    fn the_running_line_matches_the_output_contract() {
+        assert_eq!(
+            running_line("cmake", "jobserver", 9, 18, 1),
+            "running — cmake, jobserver, sharing 18-token pool with 1 other task"
+        );
+        assert_eq!(
+            running_line("xcodebuild", "static", 9, 18, 2),
+            "running — xcodebuild, static, holding 9/18 cores (2 other tasks active)"
+        );
+    }
+
+    /// The one running task has no peers, and the line still has to read like
+    /// a sentence.
+    #[test]
+    fn a_task_running_alone_reports_no_peers() {
+        assert_eq!(
+            running_line("xcodebuild", "static", 8, 8, 0),
+            "running — xcodebuild, static, holding 8/8 cores (0 other tasks active)"
+        );
+    }
+
+    /// A `none` lease blocks every other task, so it has the machine whatever
+    /// its token count says. Reporting a held count would read as a share of a
+    /// pool it is in fact not sharing.
+    #[test]
+    fn an_exclusive_lease_reports_the_whole_machine() {
+        assert_eq!(
+            running_line("make", "none", 1, 18, 0),
+            "running — make, none, exclusive (18 cores)"
+        );
     }
 }

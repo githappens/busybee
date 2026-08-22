@@ -63,8 +63,15 @@ pub enum Command {
         events: Events,
         id: oneshot::Sender<LeaseId>,
     },
-    /// The connection went away; the lease goes with it.
+    /// The connection went away; the lease goes with it, unless it is
+    /// detached.
     Hangup(LeaseId),
+    /// `busybee cancel <id>`: end the lease whoever asked for it. `false` says
+    /// there is no such lease.
+    Cancel {
+        lease: LeaseId,
+        known: oneshot::Sender<bool>,
+    },
     Status(oneshot::Sender<StatusReply>),
 }
 
@@ -86,6 +93,13 @@ impl Handle {
 
     pub async fn hangup(&self, lease: LeaseId) -> Result<()> {
         self.send(Command::Hangup(lease)).await
+    }
+
+    /// Ends a lease on request. `false` means no lease of that id is live.
+    pub async fn cancel(&self, lease: LeaseId) -> Result<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::Cancel { lease, known: tx }).await?;
+        rx.await.context("the lease actor dropped a cancellation")
     }
 
     pub async fn status(&self) -> Result<StatusReply> {
@@ -214,6 +228,15 @@ impl Leases {
                 id,
             } => self.submit(*request, events, id).await,
             Command::Hangup(lease) => self.hangup(lease).await,
+            Command::Cancel { lease, known } => {
+                let live = self.leases.contains_key(&lease);
+                if live {
+                    self.end(lease).await;
+                }
+                // The receiver is gone only if the connection died while we
+                // were cancelling; the lease is over either way.
+                let _ = known.send(live);
+            }
             Command::Status(reply) => {
                 // The receiver is gone only if the connection died while we
                 // were composing the answer.
@@ -236,6 +259,8 @@ impl Leases {
         // Classification arrives with the injection work; until then every
         // task is exclusive, which is what busybee did before the broker.
         let class = Class::None;
+        let unhonoured_override =
+            request.class_override.is_some() || request.cores_wanted.is_some();
         let lease = Lease {
             request,
             conn: events,
@@ -259,6 +284,21 @@ impl Leases {
             self.persist();
             return;
         }
+        // An override the daemon cannot act on yet is said out loud: accepting
+        // one and running the task exclusive anyway would tell the caller their
+        // scheduling choice took effect when it did not. It goes out before
+        // `Queued`, because that event is where a `--detach` client stops
+        // reading — a notice after it would never reach one.
+        if unhonoured_override {
+            self.send(
+                id,
+                LeaseEvent::Notice {
+                    text: "--class/--cores are not in effect yet (the injection work is #8); \
+                           this task runs exclusive"
+                        .into(),
+                },
+            );
+        }
         self.send(id, LeaseEvent::Queued { id: id.0, ahead });
 
         let actions = self.scheduler.handle(Event::Submit(spec));
@@ -272,7 +312,18 @@ impl Leases {
     }
 
     /// The connection is gone: drop the lease, killing its task if it has one.
+    /// A detached lease stays: `--detach` asked for a task that outlives the
+    /// client, and `busybee cancel <id>` is what ends it.
     async fn hangup(&mut self, id: LeaseId) {
+        if self.leases.get(&id).is_some_and(|l| l.request.detached) {
+            tracing::info!(lease = id.0, "the client detached; the lease stays");
+            return;
+        }
+        self.end(id).await;
+    }
+
+    /// Ends a lease, killing its task if it has one.
+    async fn end(&mut self, id: LeaseId) {
         let actions = self.scheduler.handle(Event::Cancel(id));
         self.drive(actions).await;
         // A queued lease gets no `Drop` action — there is nothing to tear
@@ -892,6 +943,7 @@ mod tests {
                     label: None,
                     class_override: None,
                     cores_wanted: None,
+                    detached: false,
                 },
                 events,
                 id,

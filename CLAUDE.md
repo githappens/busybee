@@ -120,7 +120,8 @@ nix develop -c cargo test -p bzb --test smoke
 - **stdout belongs to the wrapped task.** busybee's own messages go to stderr,
   prefixed `busybee: ` — except a fatal error, which `main` returns as an
   `anyhow::Result` for Rust to print unprefixed as `Error: …`. Two commands own
-  stdout as their result: `--detach` prints `busybee: enqueued task <id>` there
+  stdout as their result: `--detach` prints `busybee: lease <id> detached (…)`
+  there — the lease id, because that is what `busybee cancel <id>` takes
   (`crates/bzb/tests/smoke.rs` asserts that channel), and `monitor` renders its
   ratatui TUI to it.
 - **`exit_code.rs` is the single source of truth** for translating a task

@@ -26,7 +26,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bzb_core::{
     daemon::{log_path, pid_path, socket_path, state_dir},
     protocol::{read_line, Hello, LeaseEvent, Line, Request, Response, PROTOCOL_VERSION},
-    scheduler::Params,
+    scheduler::{LeaseId, Params},
 };
 use tokio::{
     io::{AsyncWriteExt, BufReader},
@@ -266,9 +266,12 @@ async fn handle(stream: UnixStream, leases: Handle) -> Result<()> {
             Ok(Request::Submit(request)) => {
                 return stream_lease(&mut incoming, &mut writer, &leases, request).await
             }
-            // Cancelling someone else's lease arrives with the client work;
-            // one's own lease is cancelled by hanging up.
-            Ok(Request::Cancel { .. }) => Response::error("not implemented"),
+            // How a detached lease is ended: its own client is long gone, so
+            // there is no connection left to hang up.
+            Ok(Request::Cancel { lease }) => match leases.cancel(LeaseId(lease)).await? {
+                true => Response::Ack,
+                false => Response::error(format!("there is no lease {lease}")),
+            },
             // Not echoing the request: escaping it and then JSON-encoding the
             // message quadruples it, so a line that fit within MAX_LINE_BYTES
             // would be answered with one that does not. The decoder still
