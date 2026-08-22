@@ -44,6 +44,10 @@ const TOOL_UNKNOWN: &str = "<unknown>";
 
 const SHELLS: [&str; 4] = ["sh", "bash", "zsh", "dash"];
 
+/// GNU make short options that consume a value, which in a cluster is the rest
+/// of the token (`-Cout`) or the next argument (`-C out`).
+const MAKE_VALUE_OPTIONS: &str = "CfIjloW";
+
 /// How a task is admitted against the token pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
@@ -132,11 +136,28 @@ impl Table {
         self.rows.iter().find(|row| {
             row.tool == tool
                 && match &row.requires {
-                    Some(needle) => args.iter().any(|a| a == needle),
+                    Some(needle) => in_leading_options(needle, args),
                     None => true,
                 }
         })
     }
+}
+
+/// Whether `needle` is one of the tool's own leading arguments: the scan stops
+/// at the first token that is not an option, because that token selects a mode
+/// and everything after it belongs to the mode, not to the tool. `cmake -E env
+/// ./x --build` is command mode handing `--build` to another program, and
+/// `docker buildx bake` is not `docker build`.
+fn in_leading_options(needle: &str, args: &[String]) -> bool {
+    for arg in args {
+        if arg == needle {
+            return true;
+        }
+        if !arg.starts_with('-') {
+            return false;
+        }
+    }
+    false
 }
 
 /// User-supplied overrides (`--class`, `--cores`).
@@ -262,7 +283,9 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
     };
 
     let mut notices = Vec::new();
-    let user_flag = rule.and_then(|r| find_parallel_flag(args, &r.parallel_flags));
+    let user_flag = rule
+        .and_then(|r| find_parallel_flag(args, &r.parallel_flags))
+        .or_else(|| find_make_cluster_flag(&tool, args));
     if let (Some(flag), Some(rule)) = (&user_flag, rule) {
         notices.push(flag_notice(&tool, flag, rule.inject, class));
     }
@@ -382,6 +405,33 @@ fn flag_matches(flag: &str, arg: &str) -> bool {
     }
     // Only short flags glue their value on: `-j8`, never `--jobs8`.
     !flag.starts_with("--") && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+}
+
+/// GNU make clusters short options, so `make -ksj8` puts `-j8` in `MAKEFLAGS`
+/// and overrides the injected jobserver just as a standalone `-j8` would.
+/// Only make reads its own clusters; other tools keep the plain flag scan.
+fn find_make_cluster_flag<'a>(tool: &str, args: &'a [String]) -> Option<&'a str> {
+    if tool != "make" && tool != "gmake" {
+        return None;
+    }
+    args.iter()
+        .find(|arg| cluster_sets_jobs(arg))
+        .map(String::as_str)
+}
+
+fn cluster_sets_jobs(arg: &str) -> bool {
+    let Some(cluster) = arg.strip_prefix('-') else {
+        return false;
+    };
+    if cluster.starts_with('-') {
+        return false; // a long option, already covered by `--jobs`
+    }
+    // The first option that takes a value swallows the rest of the token
+    // (`-Cjobs` is `-C jobs`, not a job count), so the scan ends there.
+    cluster
+        .chars()
+        .find(|c| MAKE_VALUE_OPTIONS.contains(*c))
+        .is_some_and(|c| c == 'j')
 }
 
 fn flag_notice(tool: &str, flag: &str, inject: Inject, class: Class) -> String {

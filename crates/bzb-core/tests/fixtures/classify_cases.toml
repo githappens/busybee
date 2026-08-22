@@ -43,11 +43,47 @@ env_set_absent = ["MAKEFLAGS"]
 no_notices = true
 
 [[case]]
+name = "cmake -E command mode passes --build to another program"
+argv = ["cmake", "-E", "env", "./x", "--build"]
+class = "none"
+tool = "cmake"
+env_set_absent = ["MAKEFLAGS"]
+no_notices = true
+
+[[case]]
 name = "plain make"
 argv = ["make", "-C", "out"]
 class = "jobserver"
 tool = "make"
 env_set_contains = ["MAKEFLAGS=--jobserver-auth=fifo:{fifo}"]
+no_notices = true
+
+[[case]]
+name = "make -j4 is flagged"
+argv = ["make", "-j4", "all"]
+class = "jobserver"
+tool = "make"
+notices_contain = ["-j4"]
+
+[[case]]
+name = "make -j clustered with other short options is flagged"
+argv = ["make", "-ksj8"]
+class = "jobserver"
+tool = "make"
+notices_contain = ["-ksj8"]
+
+[[case]]
+name = "make -kj without a count is flagged"
+argv = ["make", "-kj"]
+class = "jobserver"
+tool = "make"
+notices_contain = ["-kj"]
+
+[[case]]
+name = "make -C with a glued directory is not a job count"
+argv = ["make", "-Cjobs", "all"]
+class = "jobserver"
+tool = "make"
 no_notices = true
 
 [[case]]

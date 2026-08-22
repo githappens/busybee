@@ -81,9 +81,9 @@ Operates on the argv the client received (the shell has already handled `|`, `&&
 
 | tool | class | injection | notes |
 |---|---|---|---|
-| `make`, `gmake` | jobserver | `MAKEFLAGS` | notice if argv has `-j` |
+| `make`, `gmake` | jobserver | `MAKEFLAGS` | notice if argv has `-j`, including inside a short-option cluster (`-ksj8`) |
 | `ninja` | jobserver | `MAKEFLAGS` | notice if argv has `-j` (ninja then ignores the pool) |
-| `cmake` with `--build` | jobserver | `MAKEFLAGS`; remove `CMAKE_BUILD_PARALLEL_LEVEL` | notice if `--parallel`/`-j` |
+| `cmake` with `--build` (build mode only) | jobserver | `MAKEFLAGS`; remove `CMAKE_BUILD_PARALLEL_LEVEL` | notice if `--parallel`/`-j` |
 | `cargo` | jobserver | `MAKEFLAGS`, `CARGO_MAKEFLAGS`; plus `RUST_TEST_THREADS=<fair share>` | test threads are not token-accounted |
 | `xcodebuild` | static | argv `-jobs max(1, n−1)` | measured: `-jobs N` yields N+1 concurrent `clang -cc1` in steady state on a large legacy project; skip if argv already has `-jobs` |
 | `go` | static | `GOMAXPROCS=n` | |
@@ -91,6 +91,8 @@ Operates on the argv the client received (the shell has already handled `|`, `&&
 | `pytest` | static | `PYTEST_ADDOPTS` += `-n n` | effective only with xdist; harmless otherwise |
 | `docker` with `build` | none | — | the VM has its own CPU cap |
 | everything else | none | — | |
+
+A required token (`--build`, `build`) counts only among the tool's own leading arguments: the scan stops at the first token that is not an option, because that token selects a mode and the rest belongs to the mode. `cmake -E env ./x --build` is command mode passing `--build` to another program, so it is **none**, as are cmake's other non-build modes.
 
 3. Overrides: `--class jobserver|static|none`, `--cores N` (static target; ignored with a notice for jobserver class). A user-supplied parallelism flag always wins over injection and produces a one-line notice.
 4. Every task additionally gets `BUSYBEE_CLASS=<class>` and `BUSYBEE_CORES=<fair share>` in its env so opaque scripts can cooperate (`xcodebuild ... -jobs "${BUSYBEE_CORES:-8}"`). This is the only remedy for argv-only tools hidden inside scripts.
