@@ -55,14 +55,20 @@ sortie:ready ──dispatch──▶ sortie:working ──PR opened──▶ sor
                                   └─ agent writes `blocked` ──▶ parked (needs-human)
 ```
 
-Dependencies use GitHub's native *blocked by* relationships; an issue is never
-dispatched while a blocker is open. Ordering is by creation date.
+Dependencies use GitHub's native *blocked by* relationships. **sortie 1.21 does
+not honour them** (its GitHub adapter only loads blockers for single-issue
+fetches, not for the candidate list), so the `sortie` marker label is the
+readiness gate: blocked issues carry `sortie:ready` for the board but no
+marker, and `sortie/unblock.sh` adds the marker once every blocker is closed.
+Run it from a loop (or after each merge). Ordering is by creation date.
 
 The board (Projects → "busybee · bzbd", Kanban view) mirrors these labels through
 `.github/workflows/project-sync.yml`, using the `PROJECT_TOKEN` secret.
 
 ## Common operations
 
+- **Release dependents after a merge**: `sortie/unblock.sh` (idempotent;
+  `VERBOSE=1` shows what each issue still waits on).
 - **Re-run an issue** (failed, parked, or you want another attempt): fix whatever
   blocked it, remove `needs-human` if present, set the label back to
   `sortie:ready`. The existing workspace and branch are reused.
