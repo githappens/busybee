@@ -258,11 +258,17 @@ the fix as well.
 A finding listed here may already have been handled in an earlier turn: the list
 is regenerated whenever the set of open comments changes, so threads that already
 carry your reply come back. Check each thread first; if the code already reflects
-the reply, there is nothing to do for it. **Push only if you changed files.** If
-nothing needed changing, do not commit, amend, rebase or push — a push discards
-the current review and restarts the cycle. Stop after the replies. A new push
-triggers a fresh automated review; the PR merges automatically once that review
-reports no findings and CI is green.
+the reply, there is nothing to do for it.
+
+**The scope of this turn is exactly the findings listed above that have no reply
+yet — nothing else.** Do not hunt for further defects, harden adjacent code, or
+polish: every push discards the review in flight and restarts the cycle, and a
+PR that keeps moving never merges. Anything you notice beyond the listed findings
+goes into a follow-up issue, not this PR. **Push only if you changed files for a
+listed finding.** If every finding already has your reply, end the turn without
+committing, amending, rebasing or pushing. A new push triggers a fresh automated
+review; the PR merges automatically once that review reports no findings and CI
+is green.
 {{ end }}
 {{ end }}
 {{ if and .attempt (not .run.is_continuation) (not .review_comments) (not .bot_review_comments) (not .merge_conflict) }}
