@@ -42,7 +42,7 @@ impl PueuedFixture {
         );
         std::fs::write(&config_path, config).unwrap();
 
-        let child = Command::new("pueued")
+        let mut child = Command::new("pueued")
             .arg("--config")
             .arg(&config_path)
             .stdout(Stdio::null())
@@ -50,7 +50,8 @@ impl PueuedFixture {
             .spawn()
             .expect("spawn pueued");
 
-        // Wait up to 3s for the socket to appear.
+        // Wait up to 3s for the socket to appear. A `pueued` that spawns but
+        // never binds is a broken fixture, not a reason to skip the test.
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             if socket_path.exists() {
@@ -63,9 +64,9 @@ impl PueuedFixture {
             }
             sleep(Duration::from_millis(50));
         }
-        // Didn't come up; clean up and return None.
-        let _ = child.wait_with_output();
-        None
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("pueued did not create {} within 3s", socket_path.display());
     }
 }
 

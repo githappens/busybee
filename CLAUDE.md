@@ -33,7 +33,7 @@ setting and do not commit `build/` — it is gitignored.
 
 CI runs the format check, that clippy line and the test suite on Linux and
 macOS, so all three gate a merge. Format the files you touch; do not reformat
-the workspace as a side effect of an unrelated change.
+the workspace as a side effect of something else.
 
 The dev shell gains `gnumake` and `ninja` when the jobserver work lands — add
 them to `flake.nix` in that change, not ahead of it.
@@ -43,9 +43,8 @@ them to `flake.nix` in that change, not ahead of it.
 ```
 crates/bzb-core/   library: pueue-lib wrapper plus pure helpers
 crates/bzb/        binaries `busybee` and `bzb` (same entry point), monitor TUI
-crates/bzbd/       planned: the broker daemon; file layout is fixed by
-                   the design document's module-layout section — follow it
-                   so parallel work does not collide
+crates/bzbd/       planned: the broker daemon; its file layout is fixed by the
+                   design document's module-layout section — follow it
 ```
 
 `crates/bzb-core/src/`:
@@ -86,8 +85,9 @@ async fn my_test() {
 }
 ```
 
-`try_start` returns `None` when `pueued` is not on `PATH`, so the test
-self-skips outside the dev shell. `PUEUE_CONFIG_PATH` is process-wide, hence
+`try_start` returns `None` only when `pueued` is not on `PATH`, so the test
+self-skips outside the dev shell; a daemon that spawns but never binds its
+socket panics rather than skipping. `PUEUE_CONFIG_PATH` is process-wide, hence
 `#[serial_test::serial]` on every test that sets it. Run just these with:
 
 ```sh
@@ -103,11 +103,12 @@ nix develop -c cargo test -p bzb --test smoke
   be loud — logged and visible in the result — never the quiet default. The
   design document applies this to the daemon too: if it cannot create its fifo
   or socket it refuses to start rather than running the command ungoverned.
-  Two paths predate the rule and are not patterns to copy:
-  `group::enforce_parallel` drops the daemon's reply, so a hand-raised
-  `parallel_tasks` is silently not restored; and `monitor/app.rs` turns a
-  failed connect or status poll into `None`, redrawing the last snapshot
-  instead of surfacing that the daemon is gone. New code propagates.
+  Pre-broker code does not all obey it: `group::enforce_parallel` drops the
+  daemon's reply, so a hand-raised `parallel_tasks` is silently not restored;
+  `monitor/app.rs` turns a failed poll into `None` and redraws the stale
+  snapshot; `bzb/src/enqueue.rs`'s `soft_cancel`/`hard_kill` discard the kill
+  response yet still report cancelling. Those are examples, not an audit —
+  assume more exist. New code propagates.
 - **Pure state machines, IO at the edges.** `wait.rs` is the model: it takes a
   status snapshot and returns events, with no sockets or clocks inside, so it
   is testable without a daemon. New scheduling and classification logic follows
@@ -132,8 +133,8 @@ between the build script and the test harness.
 under `nix develop`, checks `build/release/busybee` and `build/release/bzb`
 exist, then installs them into the nix profile from the flake's binary-only
 derivation (`--impure`, with `BUSYBEE_REPO` pointing the flake at the working
-tree, because `build/` is gitignored and so absent from the flake source). It
-is deliberately non-hermetic. Do not change it as part of unrelated work.
+tree, since `build/` is gitignored and so absent from the flake source). It is
+deliberately non-hermetic; do not change it as part of unrelated work.
 
 ## What not to do
 
