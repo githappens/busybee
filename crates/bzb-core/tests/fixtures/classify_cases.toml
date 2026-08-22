@@ -43,11 +43,104 @@ env_set_absent = ["MAKEFLAGS"]
 no_notices = true
 
 [[case]]
+name = "cmake -E command mode passes --build to another program"
+argv = ["cmake", "-E", "env", "./x", "--build"]
+class = "none"
+tool = "cmake"
+env_set_absent = ["MAKEFLAGS"]
+no_notices = true
+
+[[case]]
+name = "cmake --install takes --build as its directory operand"
+argv = ["cmake", "--install", "--build"]
+class = "none"
+tool = "cmake"
+env_set_absent = ["MAKEFLAGS"]
+no_notices = true
+
+[[case]]
 name = "plain make"
 argv = ["make", "-C", "out"]
 class = "jobserver"
 tool = "make"
 env_set_contains = ["MAKEFLAGS=--jobserver-auth=fifo:{fifo}"]
+no_notices = true
+
+[[case]]
+name = "make -j4 is flagged"
+argv = ["make", "-j4", "all"]
+class = "jobserver"
+tool = "make"
+notices_contain = ["-j4"]
+
+[[case]]
+name = "make -j clustered with other short options is flagged"
+argv = ["make", "-ksj8"]
+class = "jobserver"
+tool = "make"
+notices_contain = ["-ksj8"]
+
+[[case]]
+name = "make -kj without a count is flagged"
+argv = ["make", "-kj"]
+class = "jobserver"
+tool = "make"
+notices_contain = ["-kj"]
+
+[[case]]
+name = "make -C with a glued directory is not a job count"
+argv = ["make", "-Cjobs", "all"]
+class = "jobserver"
+tool = "make"
+no_notices = true
+
+[[case]]
+name = "make -E with a glued expression is not a job count"
+argv = ["make", "-EFOO=j", "all"]
+class = "jobserver"
+tool = "make"
+no_notices = true
+
+[[case]]
+name = "make -O with a glued sync type is not a job count"
+argv = ["make", "-Ojobs", "all"]
+class = "jobserver"
+tool = "make"
+no_notices = true
+
+[[case]]
+name = "make -f takes the next argument as its makefile, not as options"
+argv = ["make", "-f", "-kj"]
+class = "jobserver"
+tool = "make"
+no_notices = true
+
+[[case]]
+name = "make --file takes the next argument as its makefile too"
+argv = ["make", "--file", "-j8"]
+class = "jobserver"
+tool = "make"
+no_notices = true
+
+[[case]]
+name = "an abbreviated make long option still takes the next argument"
+argv = ["make", "--inc", "-j8"]
+class = "jobserver"
+tool = "make"
+no_notices = true
+
+[[case]]
+name = "an abbreviated make --jobs is flagged"
+argv = ["make", "--jo=8"]
+class = "jobserver"
+tool = "make"
+notices_contain = ["--jo=8"]
+
+[[case]]
+name = "make treats everything after -- as targets"
+argv = ["make", "--", "-j8"]
+class = "jobserver"
+tool = "make"
 no_notices = true
 
 [[case]]

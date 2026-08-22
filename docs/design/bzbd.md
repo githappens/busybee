@@ -81,9 +81,9 @@ Operates on the argv the client received (the shell has already handled `|`, `&&
 
 | tool | class | injection | notes |
 |---|---|---|---|
-| `make`, `gmake` | jobserver | `MAKEFLAGS` | notice if argv has `-j` |
+| `make`, `gmake` | jobserver | `MAKEFLAGS` | notice if make's own option parsing sees `-j`, including inside a short-option cluster (`-ksj8`) |
 | `ninja` | jobserver | `MAKEFLAGS` | notice if argv has `-j` (ninja then ignores the pool) |
-| `cmake` with `--build` | jobserver | `MAKEFLAGS`; remove `CMAKE_BUILD_PARALLEL_LEVEL` | notice if `--parallel`/`-j` |
+| `cmake` with `--build` (build mode only) | jobserver | `MAKEFLAGS`; remove `CMAKE_BUILD_PARALLEL_LEVEL` | notice if `--parallel`/`-j` |
 | `cargo` | jobserver | `MAKEFLAGS`, `CARGO_MAKEFLAGS`; plus `RUST_TEST_THREADS=<fair share>` | test threads are not token-accounted |
 | `xcodebuild` | static | argv `-jobs max(1, n−1)` | measured: `-jobs N` yields N+1 concurrent `clang -cc1` in steady state on a large legacy project; skip if argv already has `-jobs` |
 | `go` | static | `GOMAXPROCS=n` | |
@@ -91,6 +91,10 @@ Operates on the argv the client received (the shell has already handled `|`, `&&
 | `pytest` | static | `PYTEST_ADDOPTS` += `-n n` | effective only with xdist; harmless otherwise |
 | `docker` with `build` | none | — | the VM has its own CPU cap |
 | everything else | none | — | |
+
+A required token (`--build`, `build`) counts only as the tool's *first* argument, the position that selects a mode. cmake dispatches on that position exactly — `--build`, `--install`, `--open`, `-E` — so a `--build` anywhere else is another mode's operand (`cmake --install --build` installs into a directory named `--build`) or an argument of a payload command (`cmake -E env ./x --build`). Those, and cmake's other non-build modes, are **none**.
+
+For `make`/`gmake` the parallelism scan walks argv the way make's own option parser does, because only the `-j` make actually sees overrides the injected jobserver: short options cluster (`-ksj8` puts `-j8` in `MAKEFLAGS`), the first value-taking option in a cluster swallows the rest of the token (`-Cjobs` is a directory, `-EFOO=j` an expression) and, when that value is mandatory, the next argument too (`make -f -kj` builds a makefile named `-kj`), and `--` ends the options. Other tools keep the plain scan for the flags their row lists.
 
 3. Overrides: `--class jobserver|static|none`, `--cores N` (static target; ignored with a notice for jobserver class). A user-supplied parallelism flag always wins over injection and produces a one-line notice.
 4. Every task additionally gets `BUSYBEE_CLASS=<class>` and `BUSYBEE_CORES=<fair share>` in its env so opaque scripts can cooperate (`xcodebuild ... -jobs "${BUSYBEE_CORES:-8}"`). This is the only remedy for argv-only tools hidden inside scripts.

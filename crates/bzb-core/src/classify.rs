@@ -44,6 +44,30 @@ const TOOL_UNKNOWN: &str = "<unknown>";
 
 const SHELLS: [&str; 4] = ["sh", "bash", "zsh", "dash"];
 
+/// GNU make short options whose value is mandatory: in a cluster it is the rest
+/// of the token (`-Cout`, `-EFOO=1`), and when the token ends there it is the
+/// next argument (`-C out`).
+const MAKE_REQUIRED_VALUE_OPTIONS: &str = "CEfIoW";
+/// Short options whose value is optional. It still swallows the rest of the
+/// token (`-Ojobs`), but never the next argument: `make -j 8` runs make with no
+/// job limit and a target named `8`.
+const MAKE_OPTIONAL_VALUE_OPTIONS: &str = "jlO";
+/// Long options whose value is mandatory, so it may be the next argument
+/// (`--file out.mk`). Only these can turn an option-shaped argument into an
+/// operand; the optional-value long forms need `=` (`--jobs=8`).
+const MAKE_REQUIRED_VALUE_LONG_OPTIONS: [&str; 10] = [
+    "--assume-new",
+    "--assume-old",
+    "--directory",
+    "--eval",
+    "--file",
+    "--include-dir",
+    "--makefile",
+    "--new-file",
+    "--old-file",
+    "--what-if",
+];
+
 /// How a task is admitted against the token pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
@@ -108,8 +132,8 @@ pub enum Inject {
 pub struct Rule {
     /// Basename the row matches, after wrapper unwrapping.
     pub tool: String,
-    /// Extra token that must appear in the tool's arguments for the row to
-    /// match (`--build` for cmake, `build` for docker).
+    /// Token that must be the tool's first argument for the row to match
+    /// (`--build` for cmake, `build` for docker).
     pub requires: Option<String>,
     pub class: Class,
     pub inject: Inject,
@@ -126,13 +150,17 @@ pub struct Table {
 }
 
 impl Table {
-    /// First row matching `tool` whose `requires` token (if any) appears in
-    /// `args` (the tokens after the tool).
+    /// First row matching `tool` whose `requires` token (if any) is the tool's
+    /// first argument — the position that selects a mode. cmake dispatches on
+    /// it exactly (`--build`, `--install`, `--open`, `-E`), so a `--build`
+    /// anywhere else is another mode's operand (`cmake --install --build`) or
+    /// an argument of a payload command (`cmake -E env ./x --build`), and every
+    /// non-build cmake mode falls through to `none`.
     pub fn lookup(&self, tool: &str, args: &[String]) -> Option<&Rule> {
         self.rows.iter().find(|row| {
             row.tool == tool
                 && match &row.requires {
-                    Some(needle) => args.iter().any(|a| a == needle),
+                    Some(needle) => args.first().is_some_and(|arg| arg == needle),
                     None => true,
                 }
         })
@@ -262,7 +290,12 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
     };
 
     let mut notices = Vec::new();
-    let user_flag = rule.and_then(|r| find_parallel_flag(args, &r.parallel_flags));
+    // Only make reads clusters and option operands; other tools take the plain
+    // scan, which is all their flags need.
+    let user_flag = rule.and_then(|r| match tool.as_str() {
+        "make" | "gmake" => find_make_jobs_flag(args),
+        _ => find_parallel_flag(args, &r.parallel_flags),
+    });
     if let (Some(flag), Some(rule)) = (&user_flag, rule) {
         notices.push(flag_notice(&tool, flag, rule.inject, class));
     }
@@ -382,6 +415,69 @@ fn flag_matches(flag: &str, arg: &str) -> bool {
     }
     // Only short flags glue their value on: `-j8`, never `--jobs8`.
     !flag.starts_with("--") && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
+}
+
+/// The jobs flag GNU make itself will see, which the plain scan cannot find:
+/// make clusters short options, so `make -ksj8` puts `-j8` in `MAKEFLAGS` and
+/// overrides the injected jobserver just as a standalone `-j8` would. Walking
+/// argv the way getopt does is what keeps the cluster reading honest — `--`
+/// ends the options, and an option whose value is mandatory takes the next
+/// argument as an operand, so it is not a cluster at all (`make -f -kj` builds
+/// a makefile named `-kj`).
+fn find_make_jobs_flag(args: &[String]) -> Option<&str> {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        // Targets and variable assignments select nothing.
+        let Some(option) = arg.strip_prefix('-') else {
+            continue;
+        };
+        if option == "-" {
+            return None; // `--`: only operands follow
+        }
+        if option.starts_with('-') {
+            // An empty value is not a job count; `--jobs=` never runs anyway.
+            if make_long_option_matches("--jobs", arg) && !arg.ends_with('=') {
+                return Some(arg);
+            }
+            // Without `=` the mandatory value is the next argument, whatever it
+            // looks like (`make --inc -j8` includes a directory named `-j8`).
+            if !arg.contains('=')
+                && MAKE_REQUIRED_VALUE_LONG_OPTIONS
+                    .iter()
+                    .any(|long| make_long_option_matches(long, arg))
+            {
+                rest.next();
+            }
+            continue;
+        }
+        // The first option in a cluster that takes a value swallows the rest of
+        // the token (`-Cjobs` is `-C jobs`, not a job count), so the cluster
+        // ends there — either at `-j` or at an option that hides it.
+        let Some((at, opt)) = option.char_indices().find(|(_, c)| {
+            MAKE_REQUIRED_VALUE_OPTIONS.contains(*c) || MAKE_OPTIONAL_VALUE_OPTIONS.contains(*c)
+        }) else {
+            continue;
+        };
+        if opt == 'j' {
+            return Some(arg);
+        }
+        // The option is ASCII, so the token ends right after it at `at + 1`.
+        if MAKE_REQUIRED_VALUE_OPTIONS.contains(opt) && at + 1 == option.len() {
+            rest.next(); // the value is the next argument
+        }
+    }
+    None
+}
+
+/// Whether `arg` names the long option `name`. GNU make takes any unambiguous
+/// prefix (`--inc` is `--include-dir`, `--jo` is `--jobs`), optionally with a
+/// glued `=value`. Prefixes that are ambiguous in real make (`--j` is both
+/// `--jobs` and `--just-print`) are matched here too, but make rejects those
+/// command lines outright, so nothing runs on the wrong reading.
+fn make_long_option_matches(name: &str, arg: &str) -> bool {
+    let option = arg.split_once('=').map_or(arg, |(option, _)| option);
+    // `--` alone is the option terminator, not an abbreviation of everything.
+    option.len() > 2 && name.starts_with(option)
 }
 
 fn flag_notice(tool: &str, flag: &str, inject: Inject, class: Class) -> String {
