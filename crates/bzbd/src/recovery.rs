@@ -23,10 +23,7 @@ use chrono::{DateTime, Local};
 use pueue_lib::task::{Task, TaskStatus};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    leases::{orphan, Unreconciled},
-    submit::Pueue,
-};
+use crate::{leases::orphan, submit::Pueue};
 
 /// What one lease looks like in `leases.json`: enough to take it back after a
 /// restart and to keep reporting it.
@@ -63,6 +60,16 @@ pub struct Record {
     /// written before this field.
     #[serde(default)]
     pub killing: bool,
+}
+
+impl Record {
+    /// When the submission went out, for matching it to a task pueued made
+    /// of it: one created before then is somebody else's. The epoch for a
+    /// record that says it never went.
+    pub fn submitted_at(&self) -> DateTime<Local> {
+        let ms = self.submitted_at_unix_ms.unwrap_or(0);
+        DateTime::<Local>::from(UNIX_EPOCH + Duration::from_millis(ms))
+    }
 }
 
 /// What the lease actor starts from.
@@ -192,17 +199,10 @@ struct Reconciled {
 fn reconcile(mut records: Vec<Record>, tasks: &BTreeMap<usize, Task>) -> Reconciled {
     let mut claimed: BTreeSet<usize> = records.iter().filter_map(|r| r.pueue_task_id).collect();
     for record in &mut records {
-        let Some(sent) = record
-            .submitted_at_unix_ms
-            .filter(|_| record.pueue_task_id.is_none())
-        else {
+        if record.pueue_task_id.is_some() || record.submitted_at_unix_ms.is_none() {
             continue;
-        };
-        let pending = Unreconciled {
-            label: record.label.clone(),
-            since: DateTime::<Local>::from(UNIX_EPOCH + Duration::from_millis(sent)),
-        };
-        if let Some(task_id) = orphan(tasks, &pending, &claimed) {
+        }
+        if let Some(task_id) = orphan(tasks, &record.label, record.submitted_at(), &claimed) {
             claimed.insert(task_id);
             record.pueue_task_id = Some(task_id);
         }

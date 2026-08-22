@@ -395,21 +395,30 @@ async fn a_restarted_daemon_leaves_an_orphaned_make_on_the_old_fifo() {
     );
 }
 
-/// Polls `leases.json` until a record says `killing`, or fails after
-/// `patience`: the teardown goes on record the moment the hangup is seen.
-fn wait_for_teardown_record(daemon: &Fixture, patience: Duration) {
+/// Polls `leases.json` until its records satisfy `want`, or fails after
+/// `patience`.
+fn wait_for_records(daemon: &Fixture, want: impl Fn(&[Value]) -> bool, patience: Duration) {
     let deadline = std::time::Instant::now() + patience;
     loop {
         let records = leases_json(daemon);
-        if records.iter().any(|r| r["killing"] == true) {
+        if want(&records) {
             return;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "no teardown was recorded within {patience:?}; records were {records:?}"
+            "leases.json was not as expected within {patience:?}; records were {records:?}"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// The teardown goes on record the moment the hangup is seen.
+fn wait_for_teardown_record(daemon: &Fixture, patience: Duration) {
+    wait_for_records(
+        daemon,
+        |records| records.iter().any(|r| r["killing"] == true),
+        patience,
+    );
 }
 
 /// The `Done` task's start and end as pueued recorded them.
@@ -484,6 +493,58 @@ async fn a_restarted_daemon_finishes_the_teardown_it_was_killed_in() {
         "leases.json still holds {:?}",
         leases_json(&daemon)
     );
+}
+
+/// Table row "client disconnects while running", interrupted by "bzbd dies"
+/// in the moment between booking the teardown and sending SIGTERM: the
+/// record says `killing`, but the task never heard a thing. The restarted
+/// daemon sends SIGTERM itself before the escalation, so a task that would
+/// honour the signal gets to — here by leaving a marker behind — instead of
+/// only ever meeting the SIGKILL.
+#[tokio::test]
+#[serial_test::serial]
+async fn a_restarted_daemon_resends_sigterm_for_a_teardown_it_booked_but_never_signalled() {
+    let Some(pueued) = PueuedFixture::try_start() else {
+        return;
+    };
+    let mut daemon = pool_of_four(&pueued.config_path);
+    let marker = daemon.state_dir().join("got-term");
+    // The shell notes SIGTERM and leaves; a SIGKILL leaves no note.
+    let script = format!(
+        "trap 'touch {}; exit 0' TERM; sleep 5 & wait",
+        marker.display()
+    );
+    let (conn, _, task) = run(&daemon, request(&["sh", "-c", &script])).await;
+
+    daemon.kill();
+    // What `leases.json` says when the daemon dies between `book_teardown`
+    // and the signal: the client is gone, the record is a teardown, and the
+    // task is still running, untouched.
+    drop(conn);
+    stage_record(&daemon, |record| {
+        record["killing"] = Value::from(true);
+    });
+    assert!(
+        matches!(
+            task_status(&pueued.config_path, task).await,
+            Some(TaskStatus::Running { .. })
+        ),
+        "the task did not outlive the daemon"
+    );
+    daemon.restart();
+
+    wait_for_task_to_end(&pueued.config_path, task, Duration::from_secs(4)).await;
+    assert!(
+        marker.exists(),
+        "the task never saw SIGTERM: the restarted daemon went straight to SIGKILL"
+    );
+    // The poll that confirms the task gone is up to a tick behind pueued.
+    wait_for_records(
+        &daemon,
+        |records| records.is_empty(),
+        Duration::from_secs(3),
+    );
+    assert_eq!(fifo_tokens(&daemon.fifo_path()), 4);
 }
 
 /// Table row "pueued dies": the lease is lost rather than left waiting for a

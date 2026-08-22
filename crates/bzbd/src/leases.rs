@@ -28,6 +28,7 @@ use bzb_core::{
     enqueue::{shell_escape_join, TaskSpec},
     errors::BusybeeError,
     exit_code::task_result_to_exit_code,
+    group::BUSYBEE_GROUP,
     jobserver::Jobserver,
     protocol::{LeaseEvent, LeaseRequest, LeaseView, StatusReply},
     scheduler::{Action, Event, LeaseId, Params, Request as LeaseSpec, Scheduler},
@@ -207,8 +208,15 @@ pub struct Leases {
     pueue: Pueue,
     /// pueue tasks being torn down, until pueued confirms they are gone.
     killing: BTreeMap<usize, Kill>,
-    /// Submissions pueued may or may not have started; see [`Unreconciled`].
-    unreconciled: Vec<Unreconciled>,
+    /// Submissions whose answer never arrived. The task id comes back in
+    /// that answer, so without it bzbd cannot tell a submission that never
+    /// landed from one pueued has already started — and it starts them on
+    /// arrival. The next poll settles it, and admissions wait until it has.
+    /// Each is the lease's record, kept in `leases.json` meanwhile as a
+    /// teardown with no task named yet: a daemon restarted before the poll
+    /// finds it and goes looking the same way (`crate::recovery`), rather
+    /// than seeding a whole pool over a task nothing accounts for.
+    unreconciled: Vec<Record>,
     /// Fifos of previous daemons that adopted tasks were pointed at. Each is
     /// unlinked once no task that uses it is left.
     old_fifos: BTreeSet<PathBuf>,
@@ -244,20 +252,6 @@ impl Kill {
     fn cores_held(&self) -> u32 {
         self.record.as_ref().map_or(0, |r| r.cores_held)
     }
-}
-
-/// A submission whose answer never arrived. The task id comes back in that
-/// answer, so without it bzbd cannot tell a submission that never landed from
-/// one pueued has already started — and it starts them on arrival. The next
-/// poll settles it, and admissions wait until it has. A restarted daemon
-/// builds one from a record that says when its submission went out but not
-/// what came back (`crate::recovery`).
-pub(crate) struct Unreconciled {
-    /// The label the task would carry.
-    pub(crate) label: String,
-    /// When the submission went out: a task created before it is somebody
-    /// else's.
-    pub(crate) since: DateTime<Local>,
 }
 
 impl Leases {
@@ -361,6 +355,7 @@ impl Leases {
     }
 
     pub async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
+        self.resume_teardowns().await;
         let mut ticker = tokio::time::interval(POLL);
         loop {
             tokio::select! {
@@ -371,6 +366,23 @@ impl Leases {
                     None => break,
                 },
                 _ = ticker.tick() => self.poll().await,
+            }
+        }
+    }
+
+    /// Signals the teardowns taken over from the previous daemon. It booked
+    /// each before it sent SIGTERM, so the signal may never have gone out,
+    /// and a task that never heard it would otherwise only ever meet the
+    /// SIGKILL that follows the grace. A task that did hear it gets a second
+    /// one, which is what a second Ctrl-C did before the broker.
+    async fn resume_teardowns(&mut self) {
+        let resumed: Vec<usize> = self.killing.keys().copied().collect();
+        for task_id in resumed {
+            if let Err(err) = self.pueue.kill(task_id, Signal::SigTerm).await {
+                tracing::error!(
+                    task = task_id,
+                    "cannot signal a recovered teardown: {err:#}"
+                );
             }
         }
     }
@@ -551,12 +563,11 @@ impl Leases {
             tracing::error!(lease = id.0, "admitted a lease that no longer exists");
             return self.scheduler.handle(Event::DrainFailed(id));
         };
-        let label = lease.label();
         let spec = TaskSpec {
             command: shell_escape_join(&lease.request.argv),
             cwd: lease.request.cwd.clone(),
             env: lease.request.env.clone(),
-            label: Some(label.clone()),
+            label: Some(lease.label()),
             // The group is at `parallel_tasks = 0`, so pueue's dispatcher will
             // never start it: admission is bzbd's decision and it has been made.
             start_immediately: true,
@@ -576,13 +587,6 @@ impl Leases {
             Ok(task_id) => task_id,
             Err(err) => {
                 tracing::error!(lease = id.0, "cannot submit to pueued: {err:#}");
-                // pueued may have started it anyway — the id is in the answer
-                // that did not arrive — so the next poll goes looking before
-                // anything else is admitted.
-                self.unreconciled.push(Unreconciled {
-                    label,
-                    since: sent_at.into(),
-                });
                 let actions = self.scheduler.handle(Event::DrainFailed(id));
                 // The machine's teardown has no task id to act on; the lease
                 // ends here instead, and never silently: the client hears why
@@ -597,7 +601,7 @@ impl Leases {
                         text: format!("bzbd could not start the task: {err}"),
                     },
                 );
-                self.finish(id, 1);
+                self.hold_unanswered(id);
                 return actions;
             }
         };
@@ -624,6 +628,28 @@ impl Leases {
             },
         );
         self.scheduler.handle(Event::Started { id, cores_held })
+    }
+
+    /// Ends a lease whose submission went unanswered. pueued may have started
+    /// the task anyway — the id is in the answer that did not arrive — so the
+    /// lease leaves the books but not the file: it stays in `leases.json` as
+    /// a teardown with no task named, holding admissions back and its tokens
+    /// with it, until the next poll goes looking. A daemon killed before
+    /// then finds the record and looks the same way; without it, it would
+    /// seed a whole pool and admit the next exclusive lease beside a task
+    /// nothing accounts for.
+    fn hold_unanswered(&mut self, id: LeaseId) {
+        let Some(lease) = self.leases.remove(&id) else {
+            return;
+        };
+        self.unreconciled.push(lease.record(id, true));
+        self.persist();
+        if let Some(conn) = &lease.conn {
+            let _ = conn.send(LeaseEvent::Finished {
+                id: id.0,
+                exit_code: 1,
+            });
+        }
     }
 
     /// Tears a lease down: its task is killed and its client told the lease is
@@ -760,26 +786,34 @@ impl Leases {
 
         // A submission whose answer was lost: if pueued did start the task, it
         // is running with nothing to account for it, so it is killed like any
-        // other orphan. Either way the admission it held up may go ahead.
+        // other orphan — the record goes with it, tokens and all, and comes
+        // back once pueued confirms the task gone. If not, the record and its
+        // tokens are released here. Either way the admission it held up may
+        // go ahead.
         if !self.unreconciled.is_empty() {
             let tracked: BTreeSet<usize> = self
                 .leases
                 .values()
                 .filter_map(|l| l.pueue_task_id)
                 .collect();
-            for pending in std::mem::take(&mut self.unreconciled) {
-                match orphan(&state.tasks, &pending, &tracked) {
+            for mut record in std::mem::take(&mut self.unreconciled) {
+                match orphan(&state.tasks, &record.label, record.submitted_at(), &tracked) {
                     Some(task_id) => {
                         tracing::error!(
                             task = task_id,
                             "pueued started a task whose submission failed; stopping it"
                         );
-                        self.kill_task(task_id, None).await;
+                        record.pueue_task_id = Some(task_id);
+                        self.kill_task(task_id, Some(record)).await;
                     }
-                    None => tracing::info!(
-                        label = pending.label,
-                        "the failed submission never reached pueued"
-                    ),
+                    None => {
+                        tracing::info!(
+                            label = record.label,
+                            "the failed submission never reached pueued"
+                        );
+                        self.release(record.cores_held);
+                        self.persist();
+                    }
                 }
             }
         }
@@ -860,7 +894,9 @@ impl Leases {
             for (_, kill) in std::mem::take(&mut self.killing) {
                 self.release(kill.cores_held());
             }
-            self.unreconciled.clear();
+            for record in std::mem::take(&mut self.unreconciled) {
+                self.release(record.cores_held);
+            }
             self.persist();
         }
         let running: Vec<LeaseId> = self
@@ -959,14 +995,15 @@ impl Leases {
     }
 
     /// Rewrites `leases.json`, which is what a restarted bzbd reads to find the
-    /// tasks it left running: the leases, and the teardowns it has not seen
-    /// through.
+    /// tasks it left running: the leases, the teardowns it has not seen
+    /// through, and the submissions it has not heard back on.
     fn persist(&self) {
         let records: Vec<Record> = self
             .leases
             .iter()
             .map(|(id, lease)| lease.record(*id, false))
             .chain(self.killing.values().filter_map(|k| k.record.clone()))
+            .chain(self.unreconciled.iter().cloned())
             .collect();
         if let Err(err) = write_json(&self.leases_path, &records) {
             // Not fatal to the leases themselves, but a restart would forget
@@ -986,20 +1023,22 @@ fn write_json(path: &Path, records: &[Record]) -> Result<()> {
     std::fs::rename(&temporary, path).with_context(|| format!("cannot replace {}", path.display()))
 }
 
-/// The task an unanswered submission may have started: it carries the label
-/// bzbd asked for, pueued created it no earlier than the submission, it is
-/// still alive, and no lease claims it. Anything else is somebody's task and
-/// is left alone.
+/// The task an unanswered submission may have started: it is in the
+/// `busybee` group, carries the label bzbd asked for, pueued created it no
+/// earlier than the submission (`since`), it is still alive, and no lease
+/// claims it. Anything else is somebody's task and is left alone.
 pub(crate) fn orphan(
     tasks: &BTreeMap<usize, Task>,
-    pending: &Unreconciled,
+    label: &str,
+    since: DateTime<Local>,
     tracked: &BTreeSet<usize>,
 ) -> Option<usize> {
     tasks
         .values()
         .find(|task| {
-            task.label.as_deref() == Some(pending.label.as_str())
-                && task.created_at >= pending.since
+            task.group == BUSYBEE_GROUP
+                && task.label.as_deref() == Some(label)
+                && task.created_at >= since
                 && !tracked.contains(&task.id)
                 && !matches!(task.status, TaskStatus::Done { .. })
         })
@@ -1129,11 +1168,10 @@ mod tests {
     fn an_unanswered_submission_finds_the_task_pueued_started() {
         let since = Local::now();
         let state = tasks(vec![task(4, "cargo build", since, running())]);
-        let pending = Unreconciled {
-            label: "cargo build".into(),
-            since,
-        };
-        assert_eq!(orphan(&state, &pending, &BTreeSet::new()), Some(4));
+        assert_eq!(
+            orphan(&state, "cargo build", since, &BTreeSet::new()),
+            Some(4)
+        );
     }
 
     /// The task a live lease is watching is accounted for, even when its label
@@ -1143,11 +1181,10 @@ mod tests {
     fn a_task_a_lease_holds_is_not_an_orphan() {
         let since = Local::now();
         let state = tasks(vec![task(4, "cargo build", since, running())]);
-        let pending = Unreconciled {
-            label: "cargo build".into(),
-            since,
-        };
-        assert_eq!(orphan(&state, &pending, &BTreeSet::from([4])), None);
+        assert_eq!(
+            orphan(&state, "cargo build", since, &BTreeSet::from([4])),
+            None
+        );
     }
 
     /// Nor is one that predates the submission: it cannot be the task the
@@ -1161,11 +1198,19 @@ mod tests {
             since - chrono::Duration::seconds(1),
             running(),
         )]);
-        let pending = Unreconciled {
-            label: "cargo build".into(),
-            since,
-        };
-        assert_eq!(orphan(&state, &pending, &BTreeSet::new()), None);
+        assert_eq!(orphan(&state, "cargo build", since, &BTreeSet::new()), None);
+    }
+
+    /// Nor is one outside the `busybee` group, whatever its label: bzbd only
+    /// ever submits into its own group, so a task anywhere else is somebody
+    /// else's, and adopting it would let `busybee cancel` signal it.
+    #[test]
+    fn a_task_in_another_group_is_not_an_orphan() {
+        let since = Local::now();
+        let mut theirs = task(4, "cargo build", since, running());
+        theirs.group = "default".into();
+        let state = tasks(vec![theirs]);
+        assert_eq!(orphan(&state, "cargo build", since, &BTreeSet::new()), None);
     }
 
     const PARAMS: Params = Params {
@@ -1320,6 +1365,73 @@ mod tests {
         assert_eq!(records.len(), 1, "records were {records:?}");
         assert_eq!((records[0].id, records[0].pueue_task_id), (5, Some(9)));
         assert!(records[0].killing, "the teardown was recorded as a lease");
+    }
+
+    /// A submission pueued did not answer may have started a task all the
+    /// same, and the next poll goes looking for it. Until then it stays in
+    /// `leases.json` — a teardown with no task named yet — because a daemon
+    /// restarted before that poll would otherwise find nothing to account for
+    /// the task, seed a whole pool, and admit the next exclusive lease beside
+    /// it. Its tokens stay with it for the same reason: a task pueued did
+    /// start holds them.
+    #[test]
+    fn an_unanswered_submission_stays_on_record_until_the_poll_settles_it() {
+        let _umask = crate::tests::hold_umask(0o022);
+        let directory = tempfile::tempdir().expect("create a tempdir");
+        let mut actor = actor(directory.path(), |jobserver| {
+            // The two tokens the lease drained before its submission.
+            assert_eq!(jobserver.acquire(2, Duration::ZERO).expect("acquire"), 2);
+            (Vec::new(), Vec::new(), 0)
+        });
+        let id = LeaseId(5);
+        actor.leases.insert(
+            id,
+            Lease {
+                request: LeaseRequest {
+                    argv: vec!["make".into()],
+                    cwd: PathBuf::from("/tmp"),
+                    env: Default::default(),
+                    label: None,
+                    class_override: None,
+                    cores_wanted: None,
+                    detached: false,
+                },
+                conn: None,
+                class: Class::Static,
+                pueue_task_id: None,
+                cores_held: 2,
+                started_at: SystemTime::now(),
+                submitted_at: Some(SystemTime::now()),
+                fifo: None,
+            },
+        );
+
+        actor.hold_unanswered(id);
+
+        assert!(actor.leases.is_empty(), "the lease is over");
+        assert!(actor.holding(), "the submission holds nothing back");
+        assert_eq!(
+            free(&actor),
+            2,
+            "the tokens came back while the task may hold them"
+        );
+        let written = std::fs::read(directory.path().join("leases.json")).expect("read");
+        let records: Vec<Record> = serde_json::from_slice(&written).expect("decode");
+        assert_eq!(records.len(), 1, "records were {records:?}");
+        let record = &records[0];
+        assert_eq!(
+            (
+                record.id,
+                record.pueue_task_id,
+                record.killing,
+                record.cores_held
+            ),
+            (5, None, true, 2)
+        );
+        assert!(
+            record.submitted_at_unix_ms.is_some(),
+            "the restart matches the task by the submission time"
+        );
     }
 
     /// A recovered teardown holds admissions back like one of this daemon's
