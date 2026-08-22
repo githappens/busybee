@@ -273,10 +273,29 @@ yet — nothing else.** Do not hunt for further defects, harden adjacent code, o
 polish: every push discards the review in flight and restarts the cycle, and a
 PR that keeps moving never merges. Anything you notice beyond the listed findings
 goes into a follow-up issue, not this PR. **Push only if you changed files for a
-listed finding.** If every finding already has your reply, end the turn without
-committing, amending, rebasing or pushing. A new push triggers a fresh automated
-review; the PR merges automatically once that review reports no findings and CI
-is green.
+listed finding.**
+
+If you changed no files — every listed finding already carries your reply, or you
+are declining all of them as wrong or out of scope — do not commit, amend, rebase
+or push. Instead ask the reviewer to look at the current head again, so it
+reconsiders with your replies visible in the threads:
+
+```sh
+gh api -X POST repos/githappens/busybee/issues/<pr>/comments -f body='@codex review'
+```
+
+Ask at most once per head: read the PR's issue comments first and skip this if you
+already asked for the current head. A re-review that finds nothing posts a "no
+major issues" comment, and that is the signal the merge gate approves on. A reply
+on its own never lifts a block, so a turn that ends with replies and no re-review
+request leaves the PR blocked for good.
+
+If a finding you already declined on an earlier head comes back after a re-review,
+do not argue it a second time: write `blocked` to `.sortie/status` with one line
+naming the finding, and stop. A human settles it from there.
+
+A new push triggers a fresh automated review; the PR merges automatically once that
+review reports no findings and CI is green.
 {{ end }}
 {{ if .ci_failure }}
 

@@ -202,9 +202,11 @@ jobs:
               than 8 minutes old, a review may still be running for this head and an
               earlier clean signal may belong to a previous push — answer UNSURE.
             - REQUEST_CHANGES when Codex's latest review on this head has one or more
-              inline findings. Replies or rebuttals by the PR author do NOT lift a block:
-              the author must fix or justify and push, and Codex's re-review of the new
-              head is the signal. Summarise the open findings in the reason.
+              inline findings. Replies or rebuttals by the PR author do NOT lift a block
+              on their own: only a later clean Codex signal for this head does. That
+              signal is either a re-review requested on the same head (the author
+              justified the findings and asked Codex to look again) or Codex's review
+              of a new head after a fix. Summarise the open findings in the reason.
             - UNSURE when you cannot tell what Codex concluded about this head (for
               example only a "task started" or acknowledgement comment, a review whose
               commit differs from the head, or contradictory material). Say why.
