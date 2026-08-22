@@ -203,7 +203,9 @@ releasing or acquiring the delta on the fifo, never taking it below the tokens
 currently held — a shrink that cannot complete is logged, the rest booked as
 owed, and finishes as the holding leases end: a static grant is withheld as it
 is released, and what a jobserver build returns straight to the fifo is taken
-from there on the next poll. A token taken either way pays the shrink once.
+from there on the next poll, and before any admission — the poll that sees a
+build end drives the admission its end made room for, which would otherwise
+start on the returned tokens. A token taken either way pays the shrink once.
 `busybee config show` prints the effective configuration, defaults merged, as
 TOML.
 

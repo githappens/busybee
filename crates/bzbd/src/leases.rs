@@ -557,7 +557,9 @@ impl Leases {
     /// grant pays on its release; a jobserver build returns its tokens
     /// straight to the fifo, where `release` never sees them, so they are
     /// taken from there — on every poll while anything is owed, since a build
-    /// would otherwise run on them until the accounting check came round.
+    /// would otherwise run on them until the accounting check came round, and
+    /// before every admission, since the poll that sees a build end drives
+    /// the admission its end made room for before the tick is over.
     fn collect_debt(&mut self) {
         if self.debt == 0 {
             return;
@@ -765,6 +767,12 @@ impl Leases {
             tracing::error!(lease = id.0, "admitted a lease that no longer exists");
             return self.scheduler.handle(Event::DrainFailed(id));
         }
+
+        // What the pool is owed is taken before anything starts on it. The
+        // build whose end drove this admission has just returned its tokens
+        // to the fifo, old pool and all, and a task submitted now would read
+        // them before the tick's collection came round.
+        self.collect_debt();
 
         // The drain blocks, for up to the deadline; nothing else the actor
         // could do meanwhile may run ahead of an admission anyway.
@@ -1843,6 +1851,75 @@ mod tests {
         actor.finish(LeaseId(5), 0);
 
         assert_eq!(free(&actor), 4, "the pool grew past its size");
+        assert_eq!(actor.debt, 0);
+    }
+
+    /// A shrink owed by a jobserver build is in the fifo the moment the
+    /// build ends, and so is the admission its end drives, in the same poll.
+    /// What is owed is collected before that admission goes out, not after
+    /// the tick: a build started on the excess would run at the old pool's
+    /// width.
+    // Multi-threaded: the drain in `admit` is a `block_in_place`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shrink_is_collected_before_the_admission_it_made_room_for() {
+        let _umask = crate::tests::hold_umask(0o022);
+        let directory = tempfile::tempdir().expect("create a tempdir");
+        let mut actor = actor(directory.path(), |_| (Vec::new(), Vec::new(), 0));
+        // A teardown in flight holds the admission back, so that it can be
+        // driven by hand once the pool is in the state a build's end leaves
+        // it in.
+        actor.killing.insert(
+            9,
+            Kill {
+                deadline: Instant::now() + TEST_KILL_GRACE,
+                escalated: false,
+                record: None,
+            },
+        );
+        let (events, _stream) = mpsc::unbounded_channel();
+        let (id, asked) = oneshot::channel();
+        actor
+            .submit(
+                LeaseRequest {
+                    argv: vec!["make".into()],
+                    cwd: PathBuf::from("/tmp"),
+                    env: Default::default(),
+                    label: None,
+                    class_override: None,
+                    cores_wanted: None,
+                    detached: false,
+                },
+                events,
+                id,
+            )
+            .await;
+        asked.await.expect("the submission names its lease");
+        assert!(
+            matches!(actor.deferred.front(), Some(Action::Admit { .. })),
+            "the admission was not held back: {:?}",
+            actor.deferred
+        );
+
+        // The pool shrank from four to two under a build holding all four;
+        // the build has ended and its tokens are back, two more than the
+        // pool has room for.
+        actor.params.pool_size = 2;
+        actor.debt = 2;
+        assert_eq!(free(&actor), 4);
+        // Stops the admission short of pueued: a record that cannot be
+        // written refuses the lease, leaving the fifo as it was when the
+        // submission would have gone out.
+        std::fs::create_dir(directory.path().join("leases.json.tmp")).expect("plant the directory");
+
+        actor.killing.clear();
+        let waiting = std::mem::take(&mut actor.deferred);
+        actor.drive(waiting.into()).await;
+
+        assert_eq!(
+            free(&actor),
+            2,
+            "the admission went out on a pool the shrink had not been collected from"
+        );
         assert_eq!(actor.debt, 0);
     }
 
