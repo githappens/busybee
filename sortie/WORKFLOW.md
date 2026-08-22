@@ -89,7 +89,9 @@ reactions:
     escalation: label
     escalation_label: needs-human
     poll_interval_ms: 60000
-    max_continuation_turns: 5
+    # Every new review body (Codex summary, gate verdict) changes the comment
+    # set and re-triggers a turn, so rounds are cheap no-ops more often than not.
+    max_continuation_turns: 12
   # Merge once the review decision is APPROVED (codex-gate approves as
   # github-actions[bot] when Codex reports no findings on the head commit; the
   # main ruleset requires that approval) and every check is green.
