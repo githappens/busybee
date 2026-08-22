@@ -376,6 +376,14 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
             "--cores is ignored for jobserver commands; the shared pool rebalances on its own"
                 .to_string(),
         ),
+        // An exclusive lease drains the whole pool by definition
+        // (`Scheduler::drain_target`), so a count cannot be honoured. Left
+        // unset rather than carried, so `busybee status` cannot report a
+        // number nothing acts on.
+        (Class::None, Some(_)) => plan.notices.push(
+            "--cores is ignored for an exclusive command; it holds the whole pool until it ends"
+                .to_string(),
+        ),
         (_, cores) => plan.cores_wanted = cores,
     }
 
@@ -830,6 +838,35 @@ mod tests {
                 plan.env_set
             );
         }
+    }
+
+    /// A count an exclusive lease cannot honour is said out loud rather than
+    /// dropped: `drain_target` gives `Class::None` the whole pool whatever the
+    /// caller asked for, and a request that quietly did something other than
+    /// what was typed is the failure this project calls a silent fallback.
+    #[test]
+    fn a_cores_count_an_exclusive_lease_cannot_honour_is_announced() {
+        let plan = classify(
+            &["unknown-tool".to_string()],
+            &Overrides {
+                class: None,
+                cores: Some(2),
+            },
+            &default_table(),
+        );
+
+        assert_eq!(plan.class, Class::None);
+        assert_eq!(
+            plan.cores_wanted, None,
+            "a count nothing acts on is not carried"
+        );
+        assert!(
+            plan.notices
+                .iter()
+                .any(|n| n.contains("--cores is ignored")),
+            "the caller was not told: {:?}",
+            plan.notices
+        );
     }
 
     #[test]
