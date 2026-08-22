@@ -67,7 +67,7 @@ claude-code:
   permission_mode: dontAsk
   allowed_tools: "Bash Edit MultiEdit Write Read Glob Grep Agent TodoWrite WebFetch(domain:docs.rs) WebFetch(domain:github.com)"
   disallowed_tools: "mcp__sortie-tools__tracker_api WebSearch"
-  max_budget_usd: 5
+  max_budget_usd: 20   # per turn; an estimate under subscription auth, a runaway guard not a bill
   session_persistence: true
 
 reactions:
