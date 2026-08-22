@@ -277,18 +277,29 @@ listed finding.**
 
 If you changed no files — every listed finding already carries your reply, or you
 are declining all of them as wrong or out of scope — do not commit, amend, rebase
-or push. Instead ask the reviewer to look at the current head again, so it
-reconsiders with your replies visible in the threads:
+or push.
+
+**First check whether the current head is already clean.** If the reviewer has left
+a 👍 reaction on the PR, or a "no major issues" comment dated after the head commit,
+it has nothing outstanding against this head and the merge gate approves on that
+signal by itself: end the turn now. Asking for another review replaces the 👍 with
+👀, and the gate answers UNSURE while a review is in flight, so the request throws
+away an approval that was about to land.
+
+Only when the head carries findings and no clean signal, ask the reviewer to look
+at it again, so it reconsiders with your replies visible in the threads:
 
 ```sh
-gh api -X POST repos/githappens/busybee/issues/<pr>/comments -f body='@codex review'
+gh api -X POST repos/githappens/busybee/issues/<pr>/comments -f body='@codex review
+
+<one line per declined finding: which thread it is, and why it does not apply>'
 ```
 
 Ask at most once per head: read the PR's issue comments first and skip this if you
 already asked for the current head. A re-review that finds nothing posts a "no
 major issues" comment, and that is the signal the merge gate approves on. A reply
-on its own never lifts a block, so a turn that ends with replies and no re-review
-request leaves the PR blocked for good.
+on its own never lifts a block, so a turn that ends with replies, no clean signal
+and no re-review request leaves the PR blocked for good.
 
 If a finding you already declined on an earlier head comes back after a re-review,
 do not argue it a second time: write `blocked` to `.sortie/status` with one line
