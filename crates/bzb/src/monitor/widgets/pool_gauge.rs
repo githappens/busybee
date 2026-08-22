@@ -21,6 +21,9 @@ pub enum PoolView<'a> {
         reply: &'a StatusReply,
         stale: Option<Duration>,
     },
+    /// A poll is out and none has come back yet, so nothing is known about the
+    /// pool — including whether there is one.
+    Pending,
     /// Nothing is listening on bzbd's socket: no daemon, so no pool.
     Absent,
     /// A daemon is there and is not answering, and none has answered yet — so
@@ -44,8 +47,12 @@ impl Widget for PoolGauge<'_> {
         let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
         let (reply, stale) = match self.view {
             PoolView::Known { reply, stale } => (*reply, *stale),
-            // Both of these are reports, not degraded renderings of a pool: say
-            // which one it is and draw no bar, because there is no pool to draw.
+            // None of these are degraded renderings of a pool: say which one it
+            // is and draw no bar, because there is no pool to draw.
+            PoolView::Pending => {
+                Paragraph::new("pool unknown (waiting for bzbd)").render(rows[0], buf);
+                return;
+            }
             PoolView::Absent => {
                 Paragraph::new("pool idle (daemon not running)").render(rows[0], buf);
                 return;
@@ -264,6 +271,16 @@ mod tests {
         assert!(lines[1].contains("stale 3s"), "legend was {:?}", lines[1]);
     }
 
+    /// Before the first poll comes back the monitor has not asked anyone
+    /// anything yet, and "idle" would be a claim about a pool it has not looked
+    /// at.
+    #[test]
+    fn a_pool_that_has_not_answered_yet_is_not_reported_as_idle() {
+        let lines = draw(&PoolView::Pending, 60);
+        assert_eq!(lines[0].trim_end(), "pool unknown (waiting for bzbd)");
+        assert_eq!(lines[1].trim_end(), "");
+    }
+
     #[test]
     fn no_daemon_is_reported_as_an_idle_pool_with_the_reason() {
         let lines = draw(&PoolView::Absent, 60);
@@ -300,6 +317,7 @@ mod tests {
                 width,
             );
             draw(&PoolView::Absent, width);
+            draw(&PoolView::Pending, width);
         }
     }
 

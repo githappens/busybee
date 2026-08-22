@@ -51,22 +51,21 @@ async fn run_loop<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> R
     let mut prev_samples: Vec<CoreSample> = cpu::sample();
     let mut usages: Vec<u8> = vec![0; prev_samples.len()];
 
-    // Polled before the first draw so the panel reports the pool it found
-    // rather than a pool it has not asked about yet.
     let mut pool = Pool::default();
-    pool.record(poll().await, Instant::now());
 
-    // Polling runs off the interactive loop, which only receives finished
-    // polls: a daemon that is slow to accept a connection or slow to answer
-    // would otherwise hold the loop for the length of its timeouts, freezing
-    // the redraws and the `q` key exactly when the pool needs looking at. One
-    // poll is in flight at a time, because the poller awaits its own answer
-    // before the next tick, and it stops when the loop drops the receiver.
+    // Every poll runs off the interactive loop, which only receives finished
+    // ones — including the first, which is why the loop is entered before any
+    // answer exists. A daemon that is slow to accept a connection or slow to
+    // answer would otherwise hold the loop for the length of its timeouts,
+    // freezing the redraws and the `q` key exactly when the pool needs looking
+    // at, and at startup that freeze is a blank screen. One poll is in flight at
+    // a time, because the poller awaits its own answer before the next tick, and
+    // it stops when the loop drops the receiver.
     let (polls_tx, mut polls) = tokio::sync::mpsc::channel(1);
     tokio::spawn(async move {
-        let period = Duration::from_millis(1000);
-        // Delayed by one period: the poll above already asked, just now.
-        let mut status_tick = time::interval_at(time::Instant::now() + period, period);
+        // `interval` fires its first tick immediately, so the first poll leaves
+        // as the loop starts.
+        let mut status_tick = time::interval(Duration::from_millis(1000));
         status_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
             status_tick.tick().await;
@@ -181,10 +180,14 @@ struct Pool {
     last_good: Option<(StatusReply, Instant)>,
     /// Why the most recent poll produced no reply, when it produced none.
     failure: Option<String>,
+    /// False until a poll has come back. The first one is in flight while the
+    /// monitor is already drawing, and "no daemon" is a finding, not a default.
+    answered: bool,
 }
 
 impl Pool {
     fn record(&mut self, poll: Poll, now: Instant) {
+        self.answered = true;
         match poll {
             Poll::Reply(reply) => {
                 self.last_good = Some((reply, now));
@@ -212,14 +215,16 @@ impl Pool {
     }
 
     fn view(&self, now: Instant) -> PoolView<'_> {
+        if !self.answered {
+            return PoolView::Pending;
+        }
         match (&self.last_good, &self.failure) {
             (Some((reply, at)), failure) => PoolView::Known {
                 reply,
                 stale: failure.as_ref().map(|_| now.saturating_duration_since(*at)),
             },
             (None, Some(reason)) => PoolView::Unreachable(reason),
-            // Nothing listening, and nothing polled yet before the first poll
-            // the loop makes: either way the monitor knows of no pool.
+            // A poll came back and found nothing listening.
             (None, None) => PoolView::Absent,
         }
     }
@@ -233,7 +238,7 @@ fn draw<B: ratatui::backend::Backend>(
     terminal.draw(|frame| {
         let leases: &[_] = match view {
             PoolView::Known { reply, .. } => &reply.leases,
-            PoolView::Absent | PoolView::Unreachable(_) => &[],
+            PoolView::Pending | PoolView::Absent | PoolView::Unreachable(_) => &[],
         };
         // The pool panel is the bar, its legend and the two borders; the lease
         // table takes a row per lease and the CPU gauges keep the rest.
@@ -388,6 +393,16 @@ mod tests {
             pool.view(start + Duration::from_secs(1)),
             PoolView::Unreachable(reason) if reason.contains("2 leases")
         ));
+    }
+
+    /// The first poll runs off the interactive loop like every later one, so the
+    /// monitor draws before it has an answer. Until one arrives it knows nothing
+    /// about the pool, and an idle pool is something it would have had to check.
+    #[test]
+    fn a_pool_polled_but_not_yet_answered_is_not_reported_as_idle() {
+        let pool = Pool::default();
+
+        assert!(matches!(pool.view(Instant::now()), PoolView::Pending));
     }
 
     /// With no reply to fall back on there is nothing to mark stale, and a
