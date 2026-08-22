@@ -18,8 +18,11 @@ tokio.workspace = true
 pueue-lib.workspace = true
 snap.workspace = true
 libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
+tempfile = "3"
 toml = "0.8"

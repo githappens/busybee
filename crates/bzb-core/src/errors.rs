@@ -17,6 +17,9 @@ pub enum BusybeeError {
     #[error("unexpected response from pueued: {0}")]
     UnexpectedResponse(String),
 
+    #[error("bzbd protocol error: {0}")]
+    Protocol(String),
+
     #[error("{0}")]
     Other(String),
 }
