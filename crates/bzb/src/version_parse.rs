@@ -59,3 +59,11 @@ mod tests {
         assert!(parse_describe("just-a-string").is_none());
     }
 }
+
+#[cfg(test)]
+mod ci_red_check {
+    #[test]
+    fn deliberately_fails_to_prove_ci_turns_red() {
+        assert_eq!(2 + 2, 5);
+    }
+}
