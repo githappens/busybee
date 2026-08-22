@@ -2,7 +2,7 @@
 
 A queued runner for resource-heavy tasks, with a live CPU + queue TUI.
 
-![busybee monitor TUI — per-core CPU gauges with a single-line queue status at the bottom](docs/images/monitor.png)
+![busybee monitor TUI — per-core CPU gauges above a token-pool bar and one row per lease](docs/images/monitor.png)
 
 ## Why
 
@@ -56,6 +56,8 @@ busybee status --json                       # the same, for scripts and agents
 `busybee status` prints the token pool and one row per task; `--json` prints
 the daemon's reply as a single JSON line. With no daemon running it reports an
 idle pool on stderr and exits 0, unless the daemon died leaving tasks behind.
+`busybee monitor` shows the same pool and leases live under the CPU gauges;
+like `status`, it is a viewer and never starts the daemon.
 
 Press `q` in the monitor to quit. Press `Ctrl-C` while blocked to cancel — the
 queued or running task is killed and busybee exits 130.

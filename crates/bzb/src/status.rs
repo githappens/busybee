@@ -155,7 +155,7 @@ fn row(lease: &LeaseView) -> String {
 /// rewrite what the terminal has already drawn: control characters are shown as
 /// their escape (`\n`, `\u{1b}`) instead of being sent through. `--json` still
 /// carries them verbatim — a decoder is not a terminal.
-fn printable(text: &str) -> String {
+pub(crate) fn printable(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {
         if character.is_control() {
@@ -169,7 +169,7 @@ fn printable(text: &str) -> String {
 
 /// What the lease is doing with the pool: waiting for it, sharing it, holding
 /// a slice of it, or owning the whole machine.
-fn cores(lease: &LeaseView) -> String {
+pub(crate) fn cores(lease: &LeaseView) -> String {
     match lease.ahead {
         Some(ahead) => format!("{ahead} ahead"),
         // A jobserver task takes and returns tokens as its compile jobs come
@@ -186,7 +186,7 @@ fn cores(lease: &LeaseView) -> String {
     }
 }
 
-fn elapsed(ms: u64) -> String {
+pub(crate) fn elapsed(ms: u64) -> String {
     let seconds = ms / 1000;
     format!("{}m{:02}s", seconds / 60, seconds % 60)
 }
