@@ -11,6 +11,10 @@
 //! lease ends when pueued reports the task `Done`, or when the requesting
 //! client's connection drops — before admission it is simply dropped from the
 //! queue, after admission its task is killed first.
+//!
+//! A lease adopted from a previous daemon (`crate::recovery`) is the one
+//! kind with no connection: it is already running, nobody is listening, and
+//! only `busybee cancel` or the task's own exit ends it.
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -24,15 +28,15 @@ use bzb_core::{
     enqueue::{shell_escape_join, TaskSpec},
     errors::BusybeeError,
     exit_code::task_result_to_exit_code,
+    jobserver::Jobserver,
     protocol::{LeaseEvent, LeaseRequest, LeaseView, StatusReply},
     scheduler::{Action, Event, LeaseId, Params, Request as LeaseSpec, Scheduler},
 };
 use chrono::{DateTime, Local};
 use pueue_lib::{message::Signal, task::Task, task::TaskStatus};
-use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::submit::Pueue;
+use crate::{recovery::Record, submit::Pueue};
 
 /// How often pueued is asked what its tasks are doing. `docs/design/bzbd.md`
 /// §Failure and recovery fixes the cadence at one second — the same one the
@@ -47,11 +51,6 @@ const KILL_GRACE: Duration = Duration::from_secs(1);
 /// The exit code a lease reports when its own client hung up: nobody is left
 /// to read it, but the code has to say the task did not finish on its own.
 const KILLED: i32 = 130;
-
-/// How many polls in a row may fail before pueued counts as gone. A failed
-/// request drops the connection and the next poll reconnects — spawning pueued
-/// if it has to — so a run of failures means it is not coming back.
-const LOST_AFTER_FAILED_POLLS: u32 = 5;
 
 /// Where a lease's events go: the connection that asked for it.
 pub type Events = mpsc::UnboundedSender<LeaseEvent>;
@@ -79,6 +78,9 @@ pub enum Command {
         params: Params,
         done: oneshot::Sender<()>,
     },
+    /// The daemon is stopping. Its tasks are not: `leases.json` is written
+    /// for the daemon that takes them over, and the fifo is left to them.
+    Shutdown(oneshot::Sender<()>),
 }
 
 /// Talks to the actor. Cloneable; one per connection.
@@ -123,6 +125,14 @@ impl Handle {
             .context("the lease actor dropped a set-params request")
     }
 
+    /// Has the actor write its books down and hand the fifo to the tasks
+    /// that hold it; returns once it has.
+    pub async fn shutdown(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Command::Shutdown(tx)).await?;
+        rx.await.context("the lease actor dropped the shutdown")
+    }
+
     async fn send(&self, command: Command) -> Result<()> {
         self.0
             .send(command)
@@ -135,12 +145,17 @@ impl Handle {
 struct Lease {
     request: LeaseRequest,
     /// The connection that owns it: dropping this end is how the client says
-    /// the lease is over.
-    conn: Events,
+    /// the lease is over. `None` for a lease adopted from a previous daemon,
+    /// whose client went with that daemon.
+    conn: Option<Events>,
     class: Class,
     pueue_task_id: Option<usize>,
     cores_held: u32,
     started_at: SystemTime,
+    /// The fifo its task was pointed at: this daemon's, or a previous
+    /// daemon's for an adopted lease. `None` only for a record written
+    /// before the field existed.
+    fifo: Option<PathBuf>,
 }
 
 impl Lease {
@@ -163,6 +178,8 @@ impl Lease {
 pub struct Leases {
     scheduler: Scheduler,
     params: Params,
+    /// The token pool every task shares.
+    jobserver: Jobserver,
     leases: BTreeMap<LeaseId, Lease>,
     next_id: u64,
     pueue: Pueue,
@@ -170,8 +187,9 @@ pub struct Leases {
     killing: BTreeMap<usize, Kill>,
     /// Submissions pueued may or may not have started; see [`Unreconciled`].
     unreconciled: Vec<Unreconciled>,
-    /// Consecutive failed polls. Enough of them and pueued counts as gone.
-    failed_polls: u32,
+    /// Fifos of previous daemons that adopted tasks were pointed at. Each is
+    /// unlinked once no task that uses it is left.
+    old_fifos: BTreeSet<PathBuf>,
     /// Admissions held back while a task bzbd cannot account for may still be
     /// on the machine — one being killed, or one submitted without an answer.
     /// The admission machine has already forgotten its lease, so starting the
@@ -187,6 +205,9 @@ struct Kill {
     /// Whether it already has: the escalation happens once delivered, and then
     /// the wait is for pueued to report the task gone.
     escalated: bool,
+    /// The tokens the task holds, returned once pueued reports it gone: until
+    /// then it is still running at that width.
+    cores_held: u32,
 }
 
 /// A submission whose answer never arrived. The task id comes back in that
@@ -202,21 +223,71 @@ struct Unreconciled {
 }
 
 impl Leases {
-    /// Builds the actor and the handle connections use to reach it.
-    pub fn new(params: Params, leases_path: PathBuf) -> (Self, Handle, mpsc::Receiver<Command>) {
+    /// Builds the actor and the handle connections use to reach it, with the
+    /// leases a previous daemon left running already on its books
+    /// (`crate::recovery`): they hold their slots and tokens from the first
+    /// admission on, and ids carry on from after theirs.
+    pub fn new(
+        params: Params,
+        jobserver: Jobserver,
+        leases_path: PathBuf,
+        adopted: Vec<Record>,
+    ) -> (Self, Handle, mpsc::Receiver<Command>) {
         let (tx, rx) = mpsc::channel(64);
-        let actor = Self {
+        let mut actor = Self {
             scheduler: Scheduler::new(params),
             params,
+            jobserver,
             leases: BTreeMap::new(),
             next_id: 1,
             pueue: Pueue::default(),
             killing: BTreeMap::new(),
             unreconciled: Vec::new(),
-            failed_polls: 0,
+            old_fifos: BTreeSet::new(),
             deferred: VecDeque::new(),
             leases_path,
         };
+        for record in adopted {
+            let id = LeaseId(record.id);
+            actor.next_id = actor.next_id.max(record.id + 1);
+            actor.scheduler.adopt(
+                LeaseSpec {
+                    id,
+                    class: record.class,
+                    cores_wanted: None,
+                    label: record.label.clone(),
+                },
+                record.cores_held,
+            );
+            actor.old_fifos.extend(record.fifo.clone());
+            actor.leases.insert(
+                id,
+                Lease {
+                    // Only the command line survives a restart, and nothing
+                    // else is needed: the task is past admission, and
+                    // `detached` is what an orphan is — a lease no connection
+                    // holds, ended by `busybee cancel` or its own exit.
+                    request: LeaseRequest {
+                        argv: record.argv,
+                        cwd: PathBuf::new(),
+                        env: BTreeMap::new(),
+                        label: Some(record.label),
+                        class_override: None,
+                        cores_wanted: None,
+                        detached: true,
+                    },
+                    conn: None,
+                    class: record.class,
+                    pueue_task_id: record.pueue_task_id,
+                    cores_held: record.cores_held,
+                    started_at: UNIX_EPOCH + Duration::from_millis(record.started_at_unix_ms),
+                    fifo: record.fifo,
+                },
+            );
+        }
+        // The file now says what was actually taken back, not what the
+        // previous daemon last knew.
+        actor.persist();
         (actor, Handle(tx), rx)
     }
 
@@ -267,6 +338,15 @@ impl Leases {
                 // were composing the answer.
                 let _ = reply.send(self.status());
             }
+            Command::Shutdown(done) => {
+                self.persist();
+                // The tasks keep running and keep the fifo open; a sub-make
+                // opens it by path. The next daemon unlinks it once they are
+                // gone.
+                self.jobserver.leave();
+                // The server is the one waiting, and it is on its way out.
+                let _ = done.send(());
+            }
         }
     }
 
@@ -288,11 +368,12 @@ impl Leases {
             request.class_override.is_some() || request.cores_wanted.is_some();
         let lease = Lease {
             request,
-            conn: events,
+            conn: Some(events),
             class,
             pueue_task_id: None,
             cores_held: 0,
             started_at: SystemTime::now(),
+            fifo: Some(self.jobserver.path().to_path_buf()),
         };
         let spec = LeaseSpec {
             id,
@@ -480,18 +561,21 @@ impl Leases {
         self.deferred
             .retain(|a| !matches!(a, Action::Admit { id: held, .. } if *held == id));
         if let Some(task_id) = lease.pueue_task_id {
-            self.kill_task(task_id).await;
+            self.kill_task(task_id, lease.cores_held).await;
         }
-        let _ = lease.conn.send(LeaseEvent::Finished {
-            id: id.0,
-            exit_code: KILLED,
-        });
+        if let Some(conn) = &lease.conn {
+            let _ = conn.send(LeaseEvent::Finished {
+                id: id.0,
+                exit_code: KILLED,
+            });
+        }
     }
 
     /// Signals a task and waits for pueued to confirm it is gone; SIGKILL
     /// follows on the poll after the grace period, for a task that ignores the
-    /// first signal.
-    async fn kill_task(&mut self, task_id: usize) {
+    /// first signal. Its `cores_held` go back to the pool with that
+    /// confirmation.
+    async fn kill_task(&mut self, task_id: usize, cores_held: u32) {
         if let Err(err) = self.pueue.kill(task_id, Signal::SigTerm).await {
             tracing::error!(task = task_id, "cannot stop the task: {err:#}");
         }
@@ -500,8 +584,20 @@ impl Leases {
             Kill {
                 deadline: Instant::now() + KILL_GRACE,
                 escalated: false,
+                cores_held,
             },
         );
+    }
+
+    /// Returns tokens to the pool. Loud on failure: the pool is then short by
+    /// that many until the daemon restarts.
+    fn release(&self, tokens: u32) {
+        if tokens == 0 {
+            return;
+        }
+        if let Err(err) = self.jobserver.release(tokens) {
+            tracing::error!(tokens, "cannot return the tokens to the pool: {err}");
+        }
     }
 
     /// One tick: ask pueued about every task we are waiting on, and act on the
@@ -512,19 +608,16 @@ impl Leases {
             return;
         }
         let state = match self.pueue.status().await {
-            Ok(state) => {
-                self.failed_polls = 0;
-                state
-            }
+            Ok(state) => state,
             Err(err) => {
-                // Loud, and retried on the next tick: a poll that cannot run
-                // leaves leases running, not finished.
-                self.failed_polls += 1;
-                tracing::error!(failures = self.failed_polls, "cannot poll pueued: {err:#}");
-                if self.failed_polls >= LOST_AFTER_FAILED_POLLS {
-                    self.failed_polls = 0;
-                    self.lose_running_leases(&err).await;
-                }
+                // pueued is gone: a request over its socket fails only when
+                // it is. Nothing it was running can be accounted for any
+                // more, and a poll that waited for it to come back would
+                // leave the clients waiting on completions that cannot
+                // arrive. The connection went with the failure; the next
+                // submission reconnects, spawning pueued if it has to.
+                tracing::error!("cannot poll pueued: {err:#}");
+                self.lose_running_leases(&err).await;
                 return;
             }
         };
@@ -532,9 +625,12 @@ impl Leases {
 
         for (task_id, mut kill) in std::mem::take(&mut self.killing) {
             match status(task_id) {
-                // Gone or done: the teardown is over either way, and whatever
-                // was waiting on it may go ahead.
-                None | Some(TaskStatus::Done { .. }) => continue,
+                // Gone or done: the teardown is over either way, its tokens
+                // are nobody's, and whatever was waiting on it may go ahead.
+                None | Some(TaskStatus::Done { .. }) => {
+                    self.release(kill.cores_held);
+                    continue;
+                }
                 // Signalled but still there: SIGKILL is not sent twice, so all
                 // that is left is to wait for pueued to report it gone.
                 _ if kill.escalated => {}
@@ -571,7 +667,7 @@ impl Leases {
                             task = task_id,
                             "pueued started a task whose submission failed; stopping it"
                         );
-                        self.kill_task(task_id).await;
+                        self.kill_task(task_id, 0).await;
                     }
                     None => tracing::info!(
                         label = pending.label,
@@ -606,13 +702,43 @@ impl Leases {
             let waiting = std::mem::take(&mut self.deferred);
             self.drive(waiting.into()).await;
         }
+        self.sweep_old_fifos();
     }
 
-    /// pueued has stopped answering for long enough to count as gone
-    /// (`docs/design/bzbd.md` §Failure and recovery). Nothing it was running
-    /// can be accounted for any more, so the leases that depend on it are
-    /// marked lost and their clients told why; bzbd keeps serving, and the next
-    /// submission spawns pueued again.
+    /// Unlinks the fifos of previous daemons once no task pointed at them is
+    /// left. Not before: a sub-make opens the path anew. And not while a
+    /// teardown is unsettled, since the task being killed may be one of them.
+    fn sweep_old_fifos(&mut self) {
+        if self.old_fifos.is_empty() || self.holding() {
+            return;
+        }
+        let in_use: BTreeSet<&PathBuf> = self
+            .leases
+            .values()
+            .filter_map(|l| l.fifo.as_ref())
+            .collect();
+        let (keep, done): (BTreeSet<PathBuf>, BTreeSet<PathBuf>) =
+            std::mem::take(&mut self.old_fifos)
+                .into_iter()
+                .partition(|path| in_use.contains(path));
+        self.old_fifos = keep;
+        for path in done {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    tracing::info!(fifo = %path.display(), "removed the previous daemon's fifo")
+                }
+                Err(err) => {
+                    tracing::error!(fifo = %path.display(), "cannot remove the previous daemon's fifo: {err}")
+                }
+            }
+        }
+    }
+
+    /// pueued is gone (`docs/design/bzbd.md` §Failure and recovery). Nothing
+    /// it was running can be accounted for any more, so the leases that
+    /// depend on it are marked lost and their clients told why; their tokens
+    /// go back, because nothing can tell when a task that outlived pueued
+    /// exits. bzbd keeps serving, and the next submission spawns pueued again.
     async fn lose_running_leases(&mut self, err: &BusybeeError) {
         // Confirmations that will never arrive. Waiting for them would hold
         // every remaining admission behind a task nobody can ask about.
@@ -635,9 +761,7 @@ impl Leases {
             self.send(
                 id,
                 LeaseEvent::Notice {
-                    text: format!(
-                        "bzbd lost contact with pueued: {err}; this task is no longer tracked"
-                    ),
+                    text: format!("pueued went away ({err}); task state unknown"),
                 },
             );
             self.finish(id, 1);
@@ -655,18 +779,22 @@ impl Leases {
         let Some(lease) = self.leases.remove(&id) else {
             return;
         };
+        self.release(lease.cores_held);
         self.persist();
-        let _ = lease.conn.send(LeaseEvent::Finished {
-            id: id.0,
-            exit_code,
-        });
+        if let Some(conn) = &lease.conn {
+            let _ = conn.send(LeaseEvent::Finished {
+                id: id.0,
+                exit_code,
+            });
+        }
     }
 
     fn send(&self, id: LeaseId, event: LeaseEvent) {
-        let Some(lease) = self.leases.get(&id) else {
+        // An orphan has nobody to tell.
+        let Some(conn) = self.leases.get(&id).and_then(|l| l.conn.as_ref()) else {
             return;
         };
-        if lease.conn.send(event).is_err() {
+        if conn.send(event).is_err() {
             // The connection task is on its way out and will hang up; nothing
             // to do here but note it.
             tracing::debug!(lease = id.0, "the client is no longer reading its events");
@@ -689,13 +817,21 @@ impl Leases {
                 // executing. What is ahead of it is what precedes it here.
                 let pueue_task_id = lease.and_then(|l| l.pueue_task_id);
                 let running = pueue_task_id.is_some();
+                // An orphan runs like any other lease, but `busybee cancel` is
+                // the only thing that can end it early, which is worth a
+                // word of its own.
+                let state = match lease {
+                    Some(lease) if running && lease.conn.is_none() => "orphaned",
+                    _ if running => "running",
+                    _ => "queued",
+                };
                 LeaseView {
                     id: id.0,
                     label: lease.map(Lease::label).unwrap_or_default(),
                     tool: lease.map(Lease::tool).unwrap_or_default(),
                     class: class.as_str().to_string(),
                     cores,
-                    state: if running { "running" } else { "queued" }.to_string(),
+                    state: state.to_string(),
                     elapsed_ms: lease.map_or(0, |l| elapsed_ms(l.started_at)),
                     ahead: (!running).then_some(position),
                     pueue_task_id,
@@ -719,10 +855,12 @@ impl Leases {
             .map(|(id, lease)| Record {
                 id: id.0,
                 label: lease.label(),
-                class: lease.class.as_str(),
+                argv: lease.request.argv.clone(),
+                class: lease.class,
                 cores_held: lease.cores_held,
                 pueue_task_id: lease.pueue_task_id,
                 started_at_unix_ms: unix_ms(lease.started_at),
+                fifo: lease.fifo.clone(),
             })
             .collect();
         if let Err(err) = write_json(&self.leases_path, &records) {
@@ -731,17 +869,6 @@ impl Leases {
             tracing::error!("cannot record the leases: {err:#}");
         }
     }
-}
-
-/// What one lease looks like in `leases.json`.
-#[derive(Serialize)]
-struct Record {
-    id: u64,
-    label: String,
-    class: &'static str,
-    cores_held: u32,
-    pueue_task_id: Option<usize>,
-    started_at_unix_ms: u64,
 }
 
 /// Writes through a temporary file: a half-written `leases.json` is worse than
@@ -941,19 +1068,28 @@ mod tests {
     /// status` must not say otherwise.
     #[tokio::test]
     async fn an_admission_held_back_is_reported_as_queued() {
+        // The actor creates a fifo and writes `leases.json`, under whatever
+        // mask the lifecycle tests have set meanwhile unless this is held.
+        let _umask = crate::tests::hold_umask(0o022);
         let directory = tempfile::tempdir().expect("create a tempdir");
         let params = Params {
             pool_size: 8,
             max_concurrent: 4,
         };
-        let (mut actor, _handle, _commands) =
-            Leases::new(params, directory.path().join("leases.json"));
+        let jobserver = Jobserver::create(directory.path(), params.pool_size).expect("a fifo");
+        let (mut actor, _handle, _commands) = Leases::new(
+            params,
+            jobserver,
+            directory.path().join("leases.json"),
+            Vec::new(),
+        );
         // A teardown in flight: what holds the admission back.
         actor.killing.insert(
             9,
             Kill {
                 deadline: Instant::now() + KILL_GRACE,
                 escalated: false,
+                cores_held: 0,
             },
         );
 

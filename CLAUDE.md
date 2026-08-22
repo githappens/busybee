@@ -69,8 +69,10 @@ escalation), `config.rs` (`config show` / `config reload`), `monitor/` (ratatui
 TUI plus per-OS CPU sampling), `version_parse.rs` (shared with `build.rs`).
 
 `crates/bzbd/src/`: `lib.rs` (state directory, socket server, lifecycle),
-`leases.rs` (the actor owning the scheduler, the live leases and the poll of
-pueue), `submit.rs` (the connection to pueued, reconnected on demand).
+`leases.rs` (the actor owning the scheduler, the token pool, the live leases
+and the poll of pueue), `recovery.rs` (startup: `leases.json` cross-checked
+against pueue, stale fifos swept, the pool seeded short of what adopted leases
+hold), `submit.rs` (the connection to pueued, reconnected on demand).
 
 ## Integration tests
 

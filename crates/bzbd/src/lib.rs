@@ -6,6 +6,7 @@
 //! [`leases`] actor and streams that lease's events back until it finishes or
 //! the client hangs up.
 pub mod leases;
+pub mod recovery;
 pub mod submit;
 
 use std::{
@@ -191,7 +192,15 @@ async fn serve(socket: &Path, ready: &mut Ready, config: SharedConfig) -> Result
     // The file the daemon refused to start without: the scheduler opens on the
     // pool it describes, not on a hardcoded one.
     let params = config.lock().await.params();
-    let (actor, leases, commands) = Leases::new(params, bzb_core::daemon::leases_path()?);
+    // Before the socket exists, and before the fifo: the tasks a previous
+    // daemon left running are on the machine, and a lease taken now would be
+    // sized as though it were idle — its persist overwriting the only record
+    // of them. A daemon that cannot create its pool refuses to start rather
+    // than running anything ungoverned.
+    let leases_path = bzb_core::daemon::leases_path()?;
+    let recovered = recovery::recover(&state_dir()?, &leases_path, params.pool_size).await?;
+    let (actor, leases, commands) =
+        Leases::new(params, recovered.jobserver, leases_path, recovered.adopted);
     tokio::spawn(actor.run(commands));
 
     // Nothing else can be listening: this process holds the pid-file lock.
@@ -232,6 +241,9 @@ async fn serve(socket: &Path, ready: &mut Ready, config: SharedConfig) -> Result
     }
 
     tracing::info!("shutting down");
+    // The tasks are not stopping with us: their record is written for the
+    // daemon that takes them over, and the fifo is left to them.
+    leases.shutdown().await?;
     drop(listener);
     std::fs::remove_file(socket)
         .with_context(|| format!("cannot remove the socket {}", socket.display()))?;
@@ -260,8 +272,9 @@ type SharedConfig = Arc<tokio::sync::Mutex<Config>>;
 ///
 /// `drain_deadline_ms` is read per drain rather than pushed anywhere, so the
 /// stored [`Config`] is the whole of its application. The pool-size delta on
-/// the fifo is the other half of this and arrives with the drain (#8): bzbd
-/// owns no [`bzb_core::jobserver::Jobserver`] yet, so there are no tokens to
+/// the fifo is the other half of this and arrives with the drain (#8): until
+/// admission takes tokens from the [`bzb_core::jobserver::Jobserver`] bzbd
+/// seeds at startup, nothing holds any, so there is nothing a resize could
 /// release or acquire and nothing that could be clamped below what is held.
 async fn reload(config: &SharedConfig, leases: &Handle) -> Result<Applied, String> {
     let mut running = config.lock().await;
@@ -646,23 +659,24 @@ fn open_log(log: &Path) -> Result<File> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::leases::Command;
+    use bzb_core::jobserver::Jobserver;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc, MutexGuard, PoisonError,
     };
 
-    /// Every test here that creates a file or a directory takes this. `umask`
-    /// is process-wide, and the test harness runs these on threads of one
-    /// process: a mask leaking out of the test that set it would give a
-    /// neighbour's `tempdir` no execute bit, and nothing can be created inside
-    /// a directory that cannot be traversed.
+    /// Every test in this crate that creates a file or a directory takes
+    /// this. `umask` is process-wide, and the test harness runs these on
+    /// threads of one process: a mask leaking out of the test that set it
+    /// would give a neighbour's `tempdir` no execute bit, and nothing can be
+    /// created inside a directory that cannot be traversed.
     static UMASK: Mutex<()> = Mutex::new(());
 
     /// Holds [`UMASK`] and puts the process-wide mask back on the way out.
-    struct Umask {
+    pub(crate) struct Umask {
         _lock: MutexGuard<'static, ()>,
         previous: libc::mode_t,
     }
@@ -676,7 +690,7 @@ mod tests {
     /// Sets the umask for the rest of the test, excluding the other tests
     /// meanwhile. A panic while it is held poisons nothing that matters — the
     /// mask is restored by the drop either way — so the poison is ignored.
-    fn hold_umask(mask: libc::mode_t) -> Umask {
+    pub(crate) fn hold_umask(mask: libc::mode_t) -> Umask {
         let lock = UMASK.lock().unwrap_or_else(PoisonError::into_inner);
         Umask {
             previous: restrict_umask(mask),
@@ -818,7 +832,12 @@ mod tests {
         // command the handle sends fails the way it would on a daemon that is
         // already on its way down.
         let params = running.lock().await.params();
-        let (_actor, leases, commands) = Leases::new(params, tmp.path().join("leases.json"));
+        let (_actor, leases, commands) = Leases::new(
+            params,
+            Jobserver::create(tmp.path(), params.pool_size).expect("a fifo"),
+            tmp.path().join("leases.json"),
+            Vec::new(),
+        );
         drop(commands);
         std::fs::write(&path, "pool_size = 6\n").expect("rewrite the config");
 
@@ -857,7 +876,12 @@ mod tests {
         // a reload's parameters land and can keep one in flight while the next
         // one tries to start.
         let params = running.lock().await.params();
-        let (_actor, leases, mut commands) = Leases::new(params, tmp.path().join("leases.json"));
+        let (_actor, leases, mut commands) = Leases::new(
+            params,
+            Jobserver::create(tmp.path(), params.pool_size).expect("a fifo"),
+            tmp.path().join("leases.json"),
+            Vec::new(),
+        );
 
         std::fs::write(&path, "pool_size = 6\n").expect("rewrite the config");
         let first = tokio::spawn({

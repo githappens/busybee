@@ -203,6 +203,37 @@ fn drop_unlinks_fifo() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A daemon on its way out leaves the fifo to the builds that hold it open,
+/// tokens and all. The tokens live in the pipe, and the pipe lives as long as
+/// someone has it open, so a holder stands in for the build here: the
+/// daemon's own descriptors still close with the handle.
+#[test]
+fn leave_keeps_the_fifo_and_its_tokens_for_whoever_holds_it() {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let dir = fixture("leave", ".keep", "");
+    let mut js = Jobserver::create(&dir, 3).unwrap();
+    let path = js.path().to_path_buf();
+    let holder = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+        .unwrap();
+
+    js.leave();
+    drop(js);
+
+    assert!(path.exists());
+    let mut n: libc::c_int = 0;
+    assert_eq!(
+        unsafe { libc::ioctl(holder.as_raw_fd(), libc::FIONREAD, &mut n) },
+        0
+    );
+    assert_eq!(n, 3, "the tokens went with the daemon");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn close_reports_unlink_failure() {
     use std::os::unix::fs::PermissionsExt;

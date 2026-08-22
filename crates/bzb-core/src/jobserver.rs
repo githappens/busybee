@@ -219,6 +219,15 @@ impl Jobserver {
         self.closed = true;
         unlink(&self.path)
     }
+
+    /// Keep the fifo when `self` is dropped. A daemon shutting down leaves it
+    /// to the builds that hold it open — a recursive make opens the path
+    /// again for every sub-make — and the next daemon's recovery unlinks it
+    /// once they are gone (`docs/design/bzbd.md` §Failure and recovery). The
+    /// descriptors still close with `self`.
+    pub fn leave(&mut self) {
+        self.closed = true;
+    }
 }
 
 fn unlink(path: &Path) -> io::Result<()> {
