@@ -57,7 +57,7 @@ agent:
   command: sortie/agent.sh   # picks the model per issue; see the before_run hook
   max_turns: 20
   max_sessions: 3
-  max_concurrent_agents: 3
+  max_concurrent_agents: 1   # raise to 3 once one issue has reached a PR (hot-reloads)
   turn_timeout_ms: 7200000
   read_timeout_ms: 10000
   stall_timeout_ms: 900000
