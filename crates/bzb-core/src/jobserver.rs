@@ -46,6 +46,9 @@ pub struct Jobserver {
     /// Read-only handle for `read` and `FIONREAD`.
     fd_r: File,
     pool_size: u32,
+    /// Set by [`close`](Self::close), whose caller owns the unlink result;
+    /// `Drop` then neither retries nor reports it a second time.
+    closed: bool,
 }
 
 fn open_nonblocking(path: &Path, write: bool) -> io::Result<File> {
@@ -101,6 +104,7 @@ impl Jobserver {
             fd_rw,
             fd_r,
             pool_size,
+            closed: false,
         };
         js.release(pool_size)?;
         Ok(js)
@@ -132,20 +136,36 @@ impl Jobserver {
 
     /// Take up to `n` tokens, sleeping in `poll(2)` until tokens arrive or
     /// `deadline` elapses. Returns how many were taken (`0..=n`); the caller
-    /// owns them until it calls [`release`](Self::release).
+    /// owns them until it calls [`release`](Self::release). On error nothing
+    /// is owned: tokens read before the failure are written back first.
     pub fn acquire(&self, n: u32, deadline: Duration) -> io::Result<u32> {
-        let end = Instant::now() + deadline;
         let mut got = 0u32;
+        match self.read_tokens(n, deadline, &mut got) {
+            Ok(()) => Ok(got),
+            Err(err) => match self.release(got) {
+                Ok(()) => Err(err),
+                Err(rel) => Err(io::Error::new(
+                    err.kind(),
+                    format!("{err}; returning {got} partially acquired tokens also failed: {rel}"),
+                )),
+            },
+        }
+    }
+
+    /// Body of [`acquire`](Self::acquire); `got` counts tokens read so far
+    /// so the caller can return them when this fails.
+    fn read_tokens(&self, n: u32, deadline: Duration, got: &mut u32) -> io::Result<()> {
+        let end = Instant::now() + deadline;
         let mut buf = vec![0u8; n as usize];
-        while got < n {
-            match (&self.fd_r).read(&mut buf[..(n - got) as usize]) {
+        while *got < n {
+            match (&self.fd_r).read(&mut buf[..(n - *got) as usize]) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "jobserver fifo reported EOF despite the held write end",
                     ))
                 }
-                Ok(k) => got += k as u32,
+                Ok(k) => *got += k as u32,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                     let now = Instant::now();
@@ -169,7 +189,7 @@ impl Jobserver {
                 Err(e) => return Err(e),
             }
         }
-        Ok(got)
+        Ok(())
     }
 
     /// Write `n` tokens back into the pool.
@@ -186,10 +206,29 @@ impl Jobserver {
         }
         self.acquire(excess, Duration::ZERO)
     }
+
+    /// Unlink the fifo and report failure to do so. Prefer this over `Drop`
+    /// at daemon shutdown: `Drop` can only warn on stderr, and a stale
+    /// `jobserver-<pid>` makes a later process with that pid fail `create`
+    /// with `EEXIST`. The descriptors close when `self` is dropped either way.
+    pub fn close(mut self) -> io::Result<()> {
+        self.closed = true;
+        self.unlink()
+    }
+
+    fn unlink(&self) -> io::Result<()> {
+        fs::remove_file(&self.path)
+            .map_err(|e| io::Error::new(e.kind(), format!("unlink {}: {e}", self.path.display())))
+    }
 }
 
 impl Drop for Jobserver {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if self.closed {
+            return;
+        }
+        if let Err(e) = self.unlink() {
+            eprintln!("warning: jobserver fifo left behind: {e}");
+        }
     }
 }

@@ -1,7 +1,8 @@
 # bzb-core integration tests
 
 `jobserver.rs` drives real GNU make and ninja against a `Jobserver` fifo and
-measures the peak concurrency they reach. It needs **make >= 4.4** (fifo-style
+measures the peak concurrency they reach: at most `pool_size + 1` per build,
+because every jobserver client runs one job without a token. It needs **make >= 4.4** (fifo-style
 `--jobserver-auth`) and **ninja >= 1.13** (jobserver client support). Both are
 in the dev shell: run the suite under `nix develop`.
 

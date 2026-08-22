@@ -166,7 +166,7 @@ crates/bzb/src/monitor/            TUI on bzbd data                        (#19)
 |---|---|
 | classify | table-driven; synthetic fixture of invocation shapes (wrappers, opaque shell strings, explicit `-j`, scripts, `$VAR`-expanded binaries) |
 | scheduler | pure state machine tests, no IO (same style as `bzb-core/src/wait.rs`) |
-| jobserver | integration tests running real GNU make 4.4 from the dev shell on a Makefile of `sleep` targets; assert peak concurrency ≤ pool via a counter file; two makes sharing one fifo; FIONREAD accounting |
+| jobserver | integration tests running real GNU make 4.4 from the dev shell on a Makefile of `sleep` targets; assert peak concurrency ≤ pool + 1 via a counter file (the `+ 1` is the implicit job every participant runs without a token, see admission rule 1); two makes sharing one fifo, bound at pool + 2; FIONREAD accounting |
 | bzbd + pueue | isolated `pueued` + `bzbd` in a temp dir, extending `crates/bzb/tests/common/pueued.rs` |
 | client | `crates/bzb/tests/smoke.rs` extended: exit codes, Ctrl-C, detach, preamble lines |
 | recovery | kill bzbd mid-task; kill client mid-task; kill pueued |

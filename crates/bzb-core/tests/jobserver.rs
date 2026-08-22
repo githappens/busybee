@@ -204,6 +204,29 @@ fn drop_unlinks_fifo() {
 }
 
 #[test]
+fn close_reports_unlink_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    // SAFETY: geteuid has no preconditions.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: running as root, directory permissions are not enforced");
+        return;
+    }
+    let dir = fixture("close", ".keep", "");
+    let js = Jobserver::create(&dir, 1).unwrap();
+    let path = js.path().to_path_buf();
+
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+    let err = js
+        .close()
+        .expect_err("unlink in a read-only directory must fail");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    assert!(path.exists(), "fifo must survive a failed unlink");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn create_rejects_dir_makeflags_cannot_carry() {
     // MAKEFLAGS is split on whitespace, so make would open only "fifo:<prefix>".
     let dir = fixture("with space", ".keep", "");
