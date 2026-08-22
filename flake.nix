@@ -66,6 +66,10 @@
             pkgs.rustfmt
             pkgs.clippy
             pkgs.pueue
+            # Jobserver integration tests (crates/bzb-core/tests/jobserver.rs)
+            # need make >= 4.4 and ninja >= 1.13.
+            pkgs.gnumake
+            pkgs.ninja
             pkgs.git
             pkgs.pkg-config
           ];

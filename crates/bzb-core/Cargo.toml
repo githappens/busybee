@@ -17,6 +17,7 @@ thiserror.workspace = true
 tokio.workspace = true
 pueue-lib.workspace = true
 snap.workspace = true
+libc.workspace = true
 
 [dev-dependencies]
 chrono = "0.4"
