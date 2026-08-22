@@ -559,16 +559,32 @@ impl Leases {
             self.release(pool_size - old);
         } else if pool_size < old {
             let held = self.held();
+            let wanted = old - pool_size;
             match self.jobserver.drain_excess(pool_size.saturating_sub(held)) {
-                Ok(drained) if drained == old - pool_size => {}
-                Ok(drained) => tracing::warn!(
-                    old,
-                    new = pool_size,
-                    drained,
-                    held,
-                    "the pool shrank by more than was free; the rest is taken as the leases holding it end"
-                ),
-                Err(err) => tracing::error!("cannot shrink the pool: {err}"),
+                Ok(drained) if drained == wanted => {}
+                Ok(drained) => {
+                    // What could not be drained is owed: those tokens are out
+                    // with leases, and the pool has no room for them when they
+                    // come back. Booking the shortfall as debt is what makes
+                    // `release` withhold it — logging alone would hand the
+                    // whole grant back and let the next admission run on a
+                    // pool wider than the file now says, well before the
+                    // accounting check comes round.
+                    self.debt += wanted - drained;
+                    tracing::warn!(
+                        old,
+                        new = pool_size,
+                        drained,
+                        held,
+                        debt = self.debt,
+                        "the pool shrank by more than was free; the rest is owed as the leases holding it end"
+                    );
+                }
+                Err(err) => {
+                    // Nothing came out, so the whole shrink is owed.
+                    self.debt += wanted;
+                    tracing::error!(debt = self.debt, "cannot shrink the pool: {err}");
+                }
             }
         }
     }

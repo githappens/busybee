@@ -38,9 +38,6 @@ interleave token by token; when one finishes, the other grows back within a
 compile unit. No daemon decision is involved. The caveat is static tasks: their
 tools read the core count once at startup, so a static task is **locked at the
 number it was admitted with** until it exits, even if the machine empties out.
-(Injection lands with [#8](https://github.com/githappens/busybee/issues/8);
-until then every task is admitted `none`, `--class` and `--cores` only earn a
-notice, and busybee says as much on stderr.)
 
 ## Usage
 
@@ -115,9 +112,9 @@ at, so the tool oversubscribes it.
 benchmark, a render, an opaque `sh -c '…'`. It takes the whole pool and
 everything else waits — safe but wasteful, so name a better class when you can.
 
-[#8](https://github.com/githappens/busybee/issues/8) adds `BUSYBEE_CLASS` and
-`BUSYBEE_CORES` to every task's environment — the remedy for a tool hidden
-inside a script. Until it lands the script sees neither, so keep the fallback:
+Every task's environment carries `BUSYBEE_CLASS` and `BUSYBEE_CORES` — the
+remedy for a tool hidden inside a script. Keep a fallback anyway, so the script
+still runs when it is invoked outside busybee:
 
 ```bash
 busybee --class static --cores 4 -- ./scripts/bench.sh

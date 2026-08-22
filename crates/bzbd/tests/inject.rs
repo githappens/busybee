@@ -779,17 +779,27 @@ async fn a_reloaded_pool_size_resizes_the_fifo_around_what_is_held() {
     );
 
     assert_eq!(finished(&mut conn).await, 0);
-    let deadline = Instant::now() + PATIENCE;
+    // The lease's release finishes the shrink by itself: the undrained part
+    // was booked as debt, so those tokens are withheld as they come back. The
+    // deadline is deliberately shorter than the accounting check's interval —
+    // that check would also drain the excess eventually, and a test that
+    // allowed it to would pass while a queued admission could still run on a
+    // pool wider than the file says.
+    let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let status = status(&daemon).await;
+        assert!(
+            status.free <= 2,
+            "the whole grant went back to a pool that shrank under it: {status:?}"
+        );
         if status.free == 2 {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the shrink never finished after the lease ended: {status:?}"
+            "the release did not finish the shrink: {status:?}"
         );
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
