@@ -5,6 +5,7 @@
 //! add-requests, and pure helpers (color envs, exit-code mapping, queue
 //! snapshots).
 
+pub mod classify;
 pub mod client;
 pub mod enqueue;
 pub mod env;
