@@ -358,6 +358,8 @@ fn interrupting_a_queued_client_leaves_the_running_build_alone() {
         return;
     };
     let build = busybee.tmp.path().join("interrupted");
+    // Long enough that the interruption is done well before the build is, so
+    // the window that matters — everything after it — is most of the run.
     counter::make_build(&build, 40, "0.5");
 
     let make = busybee
@@ -392,15 +394,38 @@ fn interrupting_a_queued_client_leaves_the_running_build_alone() {
         status.leases.len() == 1 && status.leases[0].tool == "make"
     });
 
+    // The instant the interrupted lease was gone, in the same clock the samples
+    // are stamped in. The peak over the whole build would prove nothing: the
+    // build reaches the pool before the second client even queues, so a lease
+    // that took tokens with it would leave that early peak standing and the
+    // build throttled for the rest of the run. Only the samples after this
+    // point can tell the two apart.
+    let gone = busybee.tmp.path().join("gone");
+    fs::write(&gone, "").expect("mark when the interrupted lease was gone");
+    let gone = mtime(&gone);
+
     let make = make.wait_with_output().expect("wait for the build");
     assert!(make.status.success(), "stderr: {}", stderr(&make));
+    let samples = counter::samples(&build);
+    assert_eq!(samples.len(), 40, "every job must log exactly once");
+    let after: Vec<u32> = samples
+        .iter()
+        .filter(|s| s.at >= gone)
+        .map(|s| s.total)
+        .collect();
+    assert!(
+        after.len() >= 6,
+        "the build logged {} job(s) after the interruption; it has to still be \
+         going for this to mean anything",
+        after.len()
+    );
     // Two-sided on purpose: the interrupted lease taking tokens with it would
     // leave the build running under its share rather than over it.
-    let peak = counter::peak(&build, 40);
+    let peak = after.iter().copied().max().expect("samples after the wait");
     assert!(
         (5..=CEILING).contains(&peak),
-        "peak concurrency {peak}, expected 5..={CEILING}: the build kept the \
-         whole pool across the interruption"
+        "peak concurrency {peak} after the interruption, expected 5..={CEILING}: \
+         the build kept the whole pool across it"
     );
 }
 
