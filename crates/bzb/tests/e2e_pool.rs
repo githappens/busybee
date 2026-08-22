@@ -159,26 +159,22 @@ fn two_builds_share_the_pool_and_neither_starves() {
 
     let samples = counter::samples(&build);
     assert_eq!(samples.len(), 48, "both builds must run all their targets");
-    assert!(
-        samples.iter().any(|s| s.total > s.own),
-        "no job ever saw one of the other build's running beside it: the two \
-         builds were serialised, not sharing"
-    );
     let combined = samples.iter().map(|s| s.total).max().expect("samples");
     assert!(
         combined <= SHARED_CEILING,
         "combined peak concurrency {combined}, expected at most {SHARED_CEILING}"
     );
+    // Both halves in one sample on purpose. A build seen with two jobs — its
+    // implicit one plus a token — at some point, and the two builds seen
+    // overlapping at some other point, is also what taking turns looks like:
+    // sharing means each build holds a token *while* the other is running.
     for name in ["a", "b"] {
-        let own = samples
-            .iter()
-            .filter(|s| s.name == name)
-            .map(|s| s.own)
-            .max()
-            .unwrap_or_else(|| panic!("build {name} logged nothing"));
         assert!(
-            own >= 2,
-            "build {name} never had more than {own} job(s) running; it was starved for the whole run"
+            samples
+                .iter()
+                .any(|s| s.name == name && s.own >= 2 && s.total > s.own),
+            "build {name} never held a token while a job of the other build \
+             was running: the two were serialised, not sharing"
         );
     }
 }
