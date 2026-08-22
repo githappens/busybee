@@ -44,7 +44,17 @@ use regex::Regex;
 
 /// Six tokens and at most four tasks admitted at once, so every number below
 /// is fixed rather than a function of whatever machine runs the tests.
-const CONFIG: &str = "pool_size = 6\nmax_concurrent = 4\n";
+///
+/// The drain deadline is five times the shipped default because a static
+/// drain has to take its tokens off a build that wants them back: make
+/// returns a token when a job ends and reads one again immediately, so each
+/// token is a race the daemon has to win. Measured against the build in
+/// [`a_static_task_drains_the_pool_and_hands_it_back`], a drain of three
+/// tokens came up short in 6 of 25 attempts at the 2 s default and in 0 of 25
+/// at this one, the slowest taking about 3 s. It costs nothing when the drain
+/// is quick, which is the usual case; it stops a slow one being read as a pool
+/// that does not work.
+const CONFIG: &str = "pool_size = 6\nmax_concurrent = 4\ndrain_deadline_ms = 10000\n";
 const POOL: u32 = 6;
 
 /// One build's ceiling: the pool, plus the one job every jobserver participant
@@ -183,10 +193,13 @@ fn a_static_task_drains_the_pool_and_hands_it_back() {
     let Some(busybee) = fixture() else {
         return;
     };
+    // Long enough that the two-second static task lands well inside the build
+    // even when the drain ahead of it uses its whole ten-second deadline. A
+    // build that ended first would leave the window below empty rather than
+    // throttled, which is a different failure and a confusing one.
+    const TARGETS: u32 = 200;
     let build = busybee.tmp.path().join("drained");
-    // Long enough that the two-second static task lands well inside it even
-    // on a slow runner.
-    counter::make_build(&build, 96, "0.5");
+    counter::make_build(&build, TARGETS, "0.5");
 
     let make = busybee
         .cmd(&["--", "make", "run"])
@@ -260,7 +273,7 @@ fn a_static_task_drains_the_pool_and_hands_it_back() {
 
     let make = make.wait_with_output().expect("wait for the build");
     assert!(make.status.success(), "stderr: {}", stderr(&make));
-    let overall = counter::peak(&build, 96);
+    let overall = counter::peak(&build, TARGETS as usize);
     assert!(
         (THROTTLED_CEILING + 1..=CEILING).contains(&overall),
         "peak concurrency {overall} over the whole build, expected \
