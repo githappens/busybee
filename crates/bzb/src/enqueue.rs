@@ -200,13 +200,17 @@ impl Task {
 /// The line the client prints when its lease is admitted
 /// (`docs/design/bzbd.md` §Client output contract). A jobserver task holds no
 /// tokens of its own — it shares the pool at compile-job granularity — so
-/// there is no held count to report for it.
+/// there is no held count to report for it. A `none` task is exclusive: it has
+/// the whole pool because nothing else is admitted beside it, and a held count
+/// would read as a share of something it is not sharing.
 fn running_line(tool: &str, class: &str, cores: u32, pool_size: u32, peers: usize) -> String {
     if class == Class::Jobserver.as_str() {
         format!(
             "running — {tool}, {class}, sharing {pool_size}-token pool with {}",
             others(peers)
         )
+    } else if class == Class::None.as_str() {
+        format!("running — {tool}, {class}, exclusive ({pool_size} cores)")
     } else {
         format!(
             "running — {tool}, {class}, holding {cores}/{pool_size} cores ({} active)",
@@ -294,8 +298,19 @@ mod tests {
     #[test]
     fn a_task_running_alone_reports_no_peers() {
         assert_eq!(
-            running_line("make", "none", 8, 8, 0),
-            "running — make, none, holding 8/8 cores (0 other tasks active)"
+            running_line("xcodebuild", "static", 8, 8, 0),
+            "running — xcodebuild, static, holding 8/8 cores (0 other tasks active)"
+        );
+    }
+
+    /// A `none` lease blocks every other task, so it has the machine whatever
+    /// its token count says. Reporting a held count would read as a share of a
+    /// pool it is in fact not sharing.
+    #[test]
+    fn an_exclusive_lease_reports_the_whole_machine() {
+        assert_eq!(
+            running_line("make", "none", 1, 18, 0),
+            "running — make, none, exclusive (18 cores)"
         );
     }
 }

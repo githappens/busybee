@@ -137,7 +137,8 @@ async fn a_lease_runs_its_command_and_reports_the_exit_code() {
 /// `--class`/`--cores` reach the daemon on the wire before the injection work
 /// (#8) teaches it to classify. Until then every task is exclusive — but an
 /// override that is accepted and then quietly dropped is a silent fallback, so
-/// the lease says what it did with it.
+/// the lease says what it did with it — and says it *before* `Queued`, which
+/// is where a `--detach` client stops reading.
 #[tokio::test]
 async fn an_override_the_daemon_cannot_honour_yet_is_announced() {
     let Some(pueued) = PueuedFixture::try_start() else {
@@ -154,15 +155,15 @@ async fn an_override_the_daemon_cannot_honour_yet_is_announced() {
         .expect("send a submit request");
 
     match event(&mut conn).await {
-        LeaseEvent::Queued { .. } => {}
-        other => panic!("expected a Queued event first, got {other:?}"),
-    }
-    match event(&mut conn).await {
         LeaseEvent::Notice { text } => assert!(
             text.contains("--class") && text.contains("--cores"),
             "notice was {text:?}"
         ),
-        other => panic!("expected a Notice about the override, got {other:?}"),
+        other => panic!("expected a Notice about the override first, got {other:?}"),
+    }
+    match event(&mut conn).await {
+        LeaseEvent::Queued { .. } => {}
+        other => panic!("expected a Queued event, got {other:?}"),
     }
 }
 

@@ -284,10 +284,11 @@ impl Leases {
             self.persist();
             return;
         }
-        self.send(id, LeaseEvent::Queued { id: id.0, ahead });
         // An override the daemon cannot act on yet is said out loud: accepting
         // one and running the task exclusive anyway would tell the caller their
-        // scheduling choice took effect when it did not.
+        // scheduling choice took effect when it did not. It goes out before
+        // `Queued`, because that event is where a `--detach` client stops
+        // reading — a notice after it would never reach one.
         if unhonoured_override {
             self.send(
                 id,
@@ -298,6 +299,7 @@ impl Leases {
                 },
             );
         }
+        self.send(id, LeaseEvent::Queued { id: id.0, ahead });
 
         let actions = self.scheduler.handle(Event::Submit(spec));
         // The machine's own notification for this lease would repeat the

@@ -116,9 +116,14 @@ Lines the client prints to **stderr** (stdout is reserved for the task's output)
 busybee: queued (2 ahead)
 busybee: running — cmake, jobserver, sharing 18-token pool with 1 other task
 busybee: running — xcodebuild, static, holding 9/18 cores (2 other tasks active)
+busybee: running — make, none, exclusive (18 cores)
 busybee: note: you passed -j8; ninja will ignore the shared pool
 busybee: command exited 0 (elapsed 2m14s)
 ```
+
+A `none` task reports the pool rather than a held count: it is admitted alone, so the cores it holds a token for understate what it was granted.
+
+Notices the daemon raises about the request itself (an override it will not honour) precede `Queued`, since a `--detach` client returns on that event and would never see one raised after it.
 
 Exit-code mapping is unchanged (`bzb-core/src/exit_code.rs`).
 
