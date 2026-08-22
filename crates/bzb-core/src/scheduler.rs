@@ -41,20 +41,8 @@ use std::collections::{BTreeMap, VecDeque};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LeaseId(pub u64);
 
-/// How a task shares the token pool.
-///
-/// Mirrors the classification table in the spec; will be re-exported from
-/// `classify` once that module lands (#3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Class {
-    /// Speaks the jobserver protocol: takes no tokens up front and
-    /// self-balances at compile-job granularity.
-    Jobserver,
-    /// Cannot speak jobserver: holds a fixed number of tokens for its lifetime.
-    Static,
-    /// Unrecognised or explicitly exclusive: wants the whole machine.
-    None,
-}
+/// How a task shares the token pool, as decided by [`crate::classify`].
+pub use crate::classify::Class;
 
 /// A queued lease request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +71,9 @@ pub enum Event {
     Submit(Request),
     /// The client went away while queued, or its running task must be torn down.
     Cancel(LeaseId),
-    /// The daemon finished the drain and launched the task.
+    /// The daemon finished the drain and launched the task. Must be reported
+    /// even when the lease was already dropped mid-drain, so the machine can
+    /// ask for the now-live task to be torn down again.
     Started { id: LeaseId, cores_held: u32 },
     /// The task exited or was killed. The daemon has already returned the
     /// lease's tokens to the fifo, so no [`Action::Drop`] is emitted for it.
@@ -163,18 +153,24 @@ impl Scheduler {
         }
     }
 
-    /// Feed one event, get the actions the daemon must perform. Events naming
-    /// a lease the machine does not know about are ignored (the daemon and the
-    /// machine can race on a lease that just ended).
+    /// Feed one event, get the actions the daemon must perform.
+    ///
+    /// Terminal events naming a lease the machine does not know about are
+    /// ignored: the daemon and the machine can race on a lease that just
+    /// ended, and there is nothing left to account for. [`Event::Started`] is
+    /// not terminal — for an untracked lease it means a task went live after
+    /// its teardown, so it answers with another [`Action::Drop`].
     pub fn handle(&mut self, ev: Event) -> Vec<Action> {
         let mut actions = Vec::new();
         match ev {
             Event::Submit(r) => self.queue.push_back(r),
-            Event::Started { id, cores_held } => {
-                if let Some(lease) = self.admitted.get_mut(&id) {
-                    lease.cores_held = cores_held;
-                }
-            }
+            Event::Started { id, cores_held } => match self.admitted.get_mut(&id) {
+                Some(lease) => lease.cores_held = cores_held,
+                // Torn down while its drain was still in flight, and the task
+                // launched anyway: it is live and holds tokens the machine no
+                // longer tracks. Ask for teardown again rather than leaking it.
+                None => actions.push(Action::Drop(id)),
+            },
             Event::Finished(id) => {
                 self.admitted.remove(&id);
             }
@@ -333,13 +329,6 @@ mod tests {
         actions
     }
 
-    fn admits(actions: &[Action]) -> Vec<&Action> {
-        actions
-            .iter()
-            .filter(|a| matches!(a, Action::Admit { .. }))
-            .collect()
-    }
-
     #[test]
     fn jobserver_leases_are_admitted_immediately_up_to_max_concurrent() {
         let mut s = Scheduler::new(params(8, 4));
@@ -489,15 +478,22 @@ mod tests {
             }]
         );
 
-        // Even once the pool frees, only the exclusive head is admitted.
+        // Even once the pool frees, only the exclusive head is admitted; the
+        // jobserver lease behind it just moves up a place.
         let actions = s.handle(Event::Finished(LeaseId(1)));
         assert_eq!(
-            admits(&actions),
-            vec![&Action::Admit {
-                id: LeaseId(2),
-                class: Class::None,
-                drain_target: 8
-            }]
+            actions,
+            vec![
+                Action::Admit {
+                    id: LeaseId(2),
+                    class: Class::None,
+                    drain_target: 8
+                },
+                Action::Notify {
+                    id: LeaseId(3),
+                    ahead: 0
+                },
+            ]
         );
     }
 
@@ -582,19 +578,48 @@ mod tests {
     }
 
     #[test]
-    fn events_for_unknown_leases_are_ignored() {
+    fn terminal_events_for_unknown_leases_are_ignored() {
         let mut s = Scheduler::new(params(8, 4));
         assert_eq!(s.handle(Event::Finished(LeaseId(9))), vec![]);
         assert_eq!(s.handle(Event::Cancel(LeaseId(9))), vec![]);
         assert_eq!(s.handle(Event::DrainFailed(LeaseId(9))), vec![]);
+        assert_eq!(s.snapshot().free_estimate, 8);
+    }
+
+    #[test]
+    fn late_started_for_an_untracked_lease_is_dropped_again() {
+        let mut s = Scheduler::new(params(8, 1));
+        s.handle(Event::Submit(req(1, Class::Static, Some(4))));
+        s.handle(Event::Submit(req(2, Class::Jobserver, None)));
+
+        // The client goes away mid-drain: the lease is torn down and the slot
+        // handed to the one behind it.
+        let actions = s.handle(Event::Cancel(LeaseId(1)));
+        assert_eq!(
+            actions,
+            vec![
+                Action::Drop(LeaseId(1)),
+                Action::Admit {
+                    id: LeaseId(2),
+                    class: Class::Jobserver,
+                    drain_target: 0
+                },
+            ]
+        );
+
+        // The drain had already finished and the task launched anyway: it is
+        // live and holds four tokens the machine no longer tracks. Ignoring
+        // this would leak both the process and its tokens, so ask for teardown
+        // again rather than treating it as a harmless stale event.
         assert_eq!(
             s.handle(Event::Started {
-                id: LeaseId(9),
-                cores_held: 3
+                id: LeaseId(1),
+                cores_held: 4
             }),
-            vec![]
+            vec![Action::Drop(LeaseId(1))]
         );
-        assert_eq!(s.snapshot().free_estimate, 8);
+        // Still untracked: the daemon returns the tokens as part of the drop.
+        assert!(s.snapshot().admitted.iter().all(|l| l.id != LeaseId(1)));
     }
 
     #[test]

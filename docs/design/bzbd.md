@@ -121,6 +121,7 @@ No silent fallbacks anywhere: if bzbd cannot create its fifo or socket it refuse
 |---|---|
 | client disconnects while queued | lease dropped |
 | client disconnects while running | pueue task killed (SIGINT → SIGKILL escalation as today), tokens returned |
+| task goes live after its lease was torn down | the drain finished and the task launched while the teardown was in flight. bzbd reports `Started` regardless; the admission machine no longer tracks the lease, so it answers with a second drop and the task is killed and its tokens returned. Never swallowed: an ignored late `Started` would leak both the process and its tokens |
 | task exits | observed by polling pueue status (1 s); tokens returned; client gets exit code |
 | pueued dies | running leases marked lost; clients exit non-zero with a clear message; bzbd keeps serving and re-spawns pueued on next submit |
 | bzbd dies | running tasks continue (pueued's children; they hold the old fifo open). On restart bzbd creates a new pid-suffixed fifo, reloads `leases.json`, cross-checks against pueue status, and seeds `pool_size − Σ(static tokens still held by live tasks)` tokens. Orphaned jobserver tasks finish on the old pipe. |
