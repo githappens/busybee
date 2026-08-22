@@ -102,17 +102,30 @@ pub fn available(tool: &str, min: (u32, u32)) -> bool {
     }
 }
 
-/// `(major, minor)` from the first line of `tool --version`, `None` if the
-/// tool cannot be run. Handles both "GNU Make 4.4.1" and ninja's bare "1.13.2".
+/// `(major, minor)` from the first line of `tool --version`, `None` only when
+/// `tool` is not in `PATH`. Handles both "GNU Make 4.4.1" and ninja's bare
+/// "1.13.2". Every other failure — the tool is there but will not run, or it
+/// prints something with no version in it — panics: reporting those as a skip
+/// would let the caller pass while testing nothing.
 fn version(tool: &str) -> Option<(u32, u32)> {
-    let out = std::process::Command::new(tool)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let out = match std::process::Command::new(tool).arg("--version").output() {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!("run `{tool} --version`: {e}"),
+    };
     let text = String::from_utf8_lossy(&out.stdout);
-    let last_word = text.lines().next()?.split_whitespace().last()?;
-    let mut parts = last_word.split('.').map(|p| p.parse::<u32>().ok());
-    Some((parts.next()??, parts.next()??))
+    let last_word = text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().last());
+    let mut parts = last_word
+        .unwrap_or_default()
+        .split('.')
+        .map(|p| p.parse::<u32>());
+    match (parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor))) => Some((major, minor)),
+        _ => panic!("no version in `{tool} --version` output {text:?}"),
+    }
 }
 
 /// Every sample the build(s) in `dir` have written so far, oldest first.
