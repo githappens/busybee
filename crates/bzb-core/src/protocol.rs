@@ -192,6 +192,9 @@ pub struct LeaseView {
     pub tool: String,
     pub class: String,
     pub cores: u32,
+    /// `queued`, `running`, or `orphaned`: running with no client, taken over
+    /// from a daemon that died (`docs/design/bzbd.md` §Failure and recovery),
+    /// so only `busybee cancel` can end it early.
     pub state: String,
     pub elapsed_ms: u64,
     pub ahead: Option<usize>,

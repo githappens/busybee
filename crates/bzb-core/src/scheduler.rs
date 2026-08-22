@@ -228,6 +228,24 @@ impl Scheduler {
         actions
     }
 
+    /// Accounts for a lease that is already running: one a previous daemon
+    /// admitted and left behind (`docs/design/bzbd.md` §Failure and recovery,
+    /// "bzbd dies"). Admission is not consulted — the task is on the machine
+    /// whatever the policy would say now — so what matters is that its slot
+    /// and `cores_held` count against everything admitted from here on, and
+    /// come back with [`Event::Finished`] or [`Event::Cancel`] like any
+    /// other lease's.
+    pub fn adopt(&mut self, r: Request, cores_held: u32) {
+        self.admitted.insert(
+            r.id,
+            Admitted {
+                class: r.class,
+                cores_held,
+                label: r.label,
+            },
+        );
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let held: u32 = self.admitted.values().map(|l| l.cores_held).sum();
         Snapshot {
@@ -902,6 +920,42 @@ mod tests {
             }]
         );
         assert_eq!(s.snapshot().free_estimate, 8);
+    }
+
+    /// A lease a previous daemon left running is on the machine whatever the
+    /// policy would say about admitting it now: it is counted — slot, tokens,
+    /// exclusivity — against everything admitted from here on, and releases
+    /// them like any other lease when it ends.
+    #[test]
+    fn an_adopted_lease_is_admitted_without_policy_and_counts_against_the_rest() {
+        let mut s = Scheduler::new(params(4, 1));
+        s.adopt(req(7, Class::Static, None), 3);
+        // No `Started` to wait for: the tokens are already held.
+        assert_eq!(s.snapshot().free_estimate, 1);
+        // And a second one is taken on even though `max_concurrent` is 1.
+        s.adopt(req(8, Class::None, None), 0);
+
+        // Allocated after the adopted ids, so nothing collides.
+        let actions = s.handle(Event::Submit(req(9, Class::Jobserver, None)));
+        assert_eq!(
+            actions,
+            vec![Action::Notify {
+                id: LeaseId(9),
+                ahead: 0
+            }]
+        );
+
+        s.handle(Event::Finished(LeaseId(8)));
+        assert_eq!(
+            s.handle(Event::Finished(LeaseId(7))),
+            vec![Action::Admit {
+                id: LeaseId(9),
+                class: Class::Jobserver,
+                drain_target: 0,
+                cores: Some(4),
+            }]
+        );
+        assert_eq!(s.snapshot().free_estimate, 4);
     }
 
     #[test]
