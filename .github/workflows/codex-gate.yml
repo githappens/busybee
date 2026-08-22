@@ -57,7 +57,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          ONLY_PR: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
+          # Only a manual dispatch narrows to one PR. Event runs evaluate every open
+          # PR: a clean Codex verdict is a reaction, which raises no event of its own,
+          # and the cron trigger is throttled on quiet repositories.
+          ONLY_PR: ${{ inputs.pr }}
         run: |
           set -euo pipefail
           if [ -n "$ONLY_PR" ] && gh api "repos/$REPO/pulls/$ONLY_PR" --jq .state 2>/dev/null | grep -q open; then
