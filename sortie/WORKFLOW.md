@@ -80,7 +80,7 @@ reactions:
     poll_interval_ms: 120000
     debounce_ms: 60000
     max_continuation_turns: 3
-  # Codex (chatgpt-codex-connector[bot]) reviews every push; its P0/P1 inline
+  # Codex (chatgpt-codex-connector[bot]) reviews every push; its inline
   # comments -> continuation turn. github-actions[bot] only posts the verdict.
   bot_review:
     provider: github
@@ -91,7 +91,7 @@ reactions:
     poll_interval_ms: 60000
     max_continuation_turns: 5
   # Merge once the review decision is APPROVED (codex-gate approves as
-  # github-actions[bot] when Codex reports no P0/P1 on the head commit; the
+  # github-actions[bot] when Codex reports no findings on the head commit; the
   # main ruleset requires that approval) and every check is green.
   auto_merge:
     provider: github
@@ -186,7 +186,7 @@ When the acceptance criteria pass locally:
    ```
 5. Stop. An automated reviewer (Codex) reviews every push and its findings come
    back to you as a continuation turn; the PR merges automatically once the
-   review reports no P0/P1 findings and CI is green. Human review comments also
+   review reports no findings and CI is green. Human review comments also
    come back as continuation turns.
 {{ if .run.is_continuation }}
 
@@ -209,10 +209,9 @@ Address every point, push, and reply on the PR with what changed.
 
 {{ range .bot_review_comments }}- {{ if .file }}`{{ .file }}`{{ if .start_line }}:{{ .start_line }}{{ end }}: {{ end }}{{ .body }}
 {{ end }}
-Treat P0 as must-fix and P1 as fix-or-justify. For each finding either fix it or
-reply on the PR thread with the reason it does not apply; then push. A new push
-triggers a fresh automated review; the PR merges automatically once the review
-reports no P0/P1 findings and CI is green.
+For each finding either fix it or reply on its PR thread with the reason it does
+not apply; then push. A new push triggers a fresh automated review; the PR merges
+automatically once that review reports no findings and CI is green.
 {{ end }}
 {{ end }}
 {{ if and .attempt (not .run.is_continuation) }}

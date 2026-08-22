@@ -50,7 +50,9 @@ Only issues with the `sortie` label **and** the milestone in `query_filter` are
 candidates. Labels are the state machine; sortie is the only writer:
 
 ```
-sortie:ready ──dispatch──▶ sortie:working ──PR opened──▶ sortie:review ──merged──▶ sortie:done (closed)
+sortie:ready ──dispatch──▶ sortie:working ──PR opened──▶ sortie:review ──auto-merged──▶ sortie:done (closed)
+                                                              │  ▲
+                                                Codex findings └──┘ continuation turn
                                   │
                                   └─ agent writes `blocked` ──▶ parked (needs-human)
 ```
@@ -76,10 +78,25 @@ The board (Projects → "busybee · bzbd", Kanban view) mirrors these labels thr
   dispatched. The `before_run` hook writes `.sortie/model`, and `agent.sh` runs
   Claude with that model; without the label the default in `agent.sh` applies.
   Retries and continuation turns follow the label.
-- **Review feedback loop**: request changes on the PR; sortie dispatches a
-  continuation turn with your comments (`reactions.review_comments`).
-- **Merge**: human, via GitHub. `reactions.merge_completion` then sets
-  `sortie:done` and closes the issue.
+- **Automated review and merge** (no human in the loop by default):
+  1. Codex reviews every push (ChatGPT → Codex → Code review settings: auto
+     review on, trigger "on every push"; rules in `AGENTS.md` → *Code Review
+     Rules*). It posts a comment-only review as `chatgpt-codex-connector[bot]`.
+  2. `.github/workflows/codex-gate.yml` reads that review for the head commit and,
+     as `github-actions[bot]`, submits REQUEST_CHANGES (any inline finding) or
+     APPROVE (none). The `main` ruleset requires one approval and dismisses it on
+     push, so the review decision tracks the latest Codex verdict. Needs the repo
+     setting "Allow GitHub Actions to create and approve pull requests".
+  3. `reactions.bot_review` routes Codex's comments to the agent as a continuation
+     turn (max 5 per issue, then `needs-human`).
+  4. `reactions.auto_merge` squash-merges once the decision is APPROVED and CI is
+     green; `reactions.merge_completion` sets `sortie:done` and closes the issue;
+     the unblock sidecar releases dependents.
+  If Codex never reviews (rate limit reached with credits off), the PR simply
+  waits: the gate only acts on an existing Codex review for the head commit.
+- **Human review**: request changes on the PR; sortie dispatches a continuation
+  turn with your comments (`reactions.review_comments`). Your approval counts
+  like the gate's.
 - **Stop everything**: Ctrl-C `run.sh`. Sessions already running finish their
   turn; on the next start sortie reconciles against tracker state.
 - **Change concurrency, polling, model**: edit `WORKFLOW.md`; most `agent.*`
