@@ -109,21 +109,22 @@ fn row(lease: &LeaseView) -> String {
         format!("#{}", lease.id),
         lease.state,
         elapsed(lease.elapsed_ms),
-        lease.tool,
+        printable(&lease.tool),
         lease.class,
         cores(lease),
         printable(&lease.label)
     )
 }
 
-/// A label is the caller's `--name`, i.e. arbitrary text. One lease is one row,
-/// so a newline in it must not split the row and an escape sequence must not
+/// A label is the caller's `--name` and a tool is the basename of the command
+/// they wrapped, i.e. both are arbitrary text. One lease is one row, so a
+/// newline in either must not split the row and an escape sequence must not
 /// rewrite what the terminal has already drawn: control characters are shown as
 /// their escape (`\n`, `\u{1b}`) instead of being sent through. `--json` still
-/// carries the label verbatim — a decoder is not a terminal.
-fn printable(label: &str) -> String {
-    let mut out = String::with_capacity(label.len());
-    for character in label.chars() {
+/// carries them verbatim — a decoder is not a terminal.
+fn printable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for character in text.chars() {
         if character.is_control() {
             out.extend(character.escape_debug());
         } else {
@@ -190,6 +191,23 @@ mod tests {
         assert!(!rendered.contains('\u{1b}'), "rendered {rendered:?}");
         assert!(
             rendered.contains(r"ui build\nfailed\u{1b}[2K"),
+            "rendered {rendered:?}"
+        );
+    }
+
+    /// The tool is the basename of whatever the caller wrapped, so it is the
+    /// caller's text too and can carry the same control characters a label can.
+    #[test]
+    fn a_control_character_in_a_tool_name_cannot_break_the_table() {
+        let mut reply = reply();
+        reply.leases[0].tool = "xcode\nbuild\u{1b}[2K".into();
+
+        let rendered = render(&reply);
+
+        assert_eq!(rendered.lines().count(), 2, "rendered {rendered:?}");
+        assert!(!rendered.contains('\u{1b}'), "rendered {rendered:?}");
+        assert!(
+            rendered.contains(r"xcode\nbuild\u{1b}[2K"),
             "rendered {rendered:?}"
         );
     }

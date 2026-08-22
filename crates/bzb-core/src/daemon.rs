@@ -108,28 +108,32 @@ impl Connection {
     /// protocol version, a handshake that never arrives — is a daemon that *is*
     /// running and not answering, so it propagates.
     ///
-    /// The handshake is bounded by [`STARTUP_TIMEOUT`]: a wedged daemon accepts
-    /// and then says nothing, and the one-shot callers of this have no deadline
-    /// of their own to fall back on.
+    /// The whole attempt — the connect and the handshake — is bounded by
+    /// [`STARTUP_TIMEOUT`]: a wedged daemon accepts and then says nothing, and
+    /// the one-shot callers of this have no deadline of their own to fall back
+    /// on. The deadline covers the connect too so that no step of reaching the
+    /// daemon is left outside it.
     pub async fn connect_if_listening(socket: &Path) -> Result<Option<Self>, BusybeeError> {
-        match UnixStream::connect(socket).await {
-            Ok(stream) => {
-                match tokio::time::timeout(STARTUP_TIMEOUT, Self::handshake(stream)).await {
-                    Ok(result) => result.map(Some),
-                    Err(_) => Err(BusybeeError::DaemonUnreachable {
-                        context: format!(
-                            "bzbd at {} accepted the connection but did not complete the \
-                             handshake within {} seconds",
-                            socket.display(),
-                            STARTUP_TIMEOUT.as_secs()
-                        ),
-                    }),
+        let attempt = async {
+            match UnixStream::connect(socket).await {
+                Ok(stream) => Self::handshake(stream).await.map(Some),
+                Err(e)
+                    if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) =>
+                {
+                    Ok(None)
                 }
+                Err(e) => Err(unreachable_at(socket, e)),
             }
-            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
-                Ok(None)
-            }
-            Err(e) => Err(unreachable_at(socket, e)),
+        };
+        match tokio::time::timeout(STARTUP_TIMEOUT, attempt).await {
+            Ok(result) => result,
+            Err(_) => Err(BusybeeError::DaemonUnreachable {
+                context: format!(
+                    "bzbd at {} did not answer the connection and handshake within {} seconds",
+                    socket.display(),
+                    STARTUP_TIMEOUT.as_secs()
+                ),
+            }),
         }
     }
 
