@@ -57,7 +57,7 @@ agent:
   command: sortie/agent.sh   # picks the model per issue; see the before_run hook
   max_turns: 20
   max_sessions: 3
-  max_concurrent_agents: 1   # raise to 3 once one issue has reached a PR (hot-reloads)
+  max_concurrent_agents: 3   # hot-reloads; drop to 1 when bringing up a fresh setup
   turn_timeout_ms: 7200000
   read_timeout_ms: 10000
   stall_timeout_ms: 900000
@@ -116,20 +116,24 @@ Blocked-by issues (all must already be merged on `main`): {{ range $i, $b := .is
    adjacent refactors, no speculative features. If something outside scope
    blocks you, write `blocked` to `.sortie/status` with one line explaining why,
    and stop.
-3. **TDD.** Write the failing test named in the issue first, then the code. Never
+3. **Simplest thing that works.** If the `ponytail` skill is available, invoke it
+   before writing code and `ponytail-review` before opening the PR: standard
+   library before dependencies, one function before an abstraction, no
+   speculative flexibility. The issue's acceptance criteria are the whole scope.
+4. **TDD.** Write the failing test named in the issue first, then the code. Never
    weaken, skip, or delete an existing test to get green; if a test disagrees
    with your change, assume the code is wrong until proven otherwise.
-4. **No silent fallbacks.** Errors propagate with context; degraded paths must be
+5. **No silent fallbacks.** Errors propagate with context; degraded paths must be
    loud. Do not add `unwrap_or_default`-style masking to make something pass.
-5. **Build and test through the dev shell and busybee:**
+6. **Build and test through the dev shell and busybee:**
    `busybee -- cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
    `cargo fmt --all`. Cargo output goes to `build/`; do not change `.cargo/config.toml`.
    Never install or replace the machine's global `busybee`/`bzbd`/`pueued`; test via
    cargo-built binaries only.
-6. **Isolation.** Integration tests must spawn their own `pueued`/`bzbd` in a
+7. **Isolation.** Integration tests must spawn their own `pueued`/`bzbd` in a
    temporary state dir (see `crates/bzb/tests/common/pueued.rs`), never the user's
    instance.
-7. **Public repo hygiene.** Everything you write — code, comments, tests,
+8. **Public repo hygiene.** Everything you write — code, comments, tests,
    fixtures, commit messages, PR text — is public. Use generic examples only: no
    machine names, user names, local paths, or references to other projects.
    No AI co-author trailers in commits.
