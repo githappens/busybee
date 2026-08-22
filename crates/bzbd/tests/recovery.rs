@@ -246,6 +246,43 @@ async fn a_restarted_daemon_adopts_the_static_lease_it_left_running() {
     );
 }
 
+/// Table row "bzbd dies", in the moment between pueued starting a task and
+/// the daemon writing its id down: the record says the submission went out
+/// but names no task. The restarted daemon finds the task by label and
+/// creation time, as the poll finds an unanswered submission, and adopts it
+/// rather than admitting the next exclusive task beside it.
+#[tokio::test]
+async fn a_restarted_daemon_matches_the_submission_it_was_killed_in() {
+    let Some(pueued) = PueuedFixture::try_start() else {
+        return;
+    };
+    let mut daemon = pool_of_four(&pueued.config_path);
+    let (_conn, id, task) = run(&daemon, request(&["sh", "-c", "sleep 5"])).await;
+
+    daemon.kill();
+    // What `leases.json` says when the daemon dies between `pueue.add` and
+    // the persist that follows it: the submission time is on record — the
+    // lease was written before the task went out — and the task id is not.
+    stage_record(&daemon, |record| {
+        let submitted = record["started_at_unix_ms"].clone();
+        record["submitted_at_unix_ms"] = submitted;
+        record["pueue_task_id"] = Value::Null;
+    });
+    daemon.restart();
+
+    let status = status(&daemon).await;
+    assert_eq!(status.leases.len(), 1, "leases were {:?}", status.leases);
+    let orphan = &status.leases[0];
+    assert_eq!(orphan.id, id);
+    assert_eq!(orphan.pueue_task_id, Some(task));
+    assert_eq!(orphan.state, "orphaned");
+    assert_eq!(
+        leases_json(&daemon)[0]["pueue_task_id"],
+        Value::from(task),
+        "the matched task must be on record for the next restart"
+    );
+}
+
 /// Five targets that each note how many of them are running at once: the
 /// peak is what tells a make on the pool from one running one job at a time.
 const MAKEFILE: &str = "\

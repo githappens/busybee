@@ -14,15 +14,19 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io::ErrorKind,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use bzb_core::{classify::Class, jobserver::Jobserver};
+use chrono::{DateTime, Local};
 use pueue_lib::task::{Task, TaskStatus};
 use serde::{Deserialize, Serialize};
 
-use crate::submit::Pueue;
+use crate::{
+    leases::{orphan, Unreconciled},
+    submit::Pueue,
+};
 
 /// What one lease looks like in `leases.json`: enough to take it back after a
 /// restart and to keep reporting it.
@@ -38,6 +42,14 @@ pub struct Record {
     pub cores_held: u32,
     pub pueue_task_id: Option<usize>,
     pub started_at_unix_ms: u64,
+    /// When the submission went to pueued, written down before it goes: the
+    /// task id comes back in the answer, and a daemon that died before
+    /// writing that down left a record with no task id and a task pueued may
+    /// well have started. The time is what finds it, the way the poll finds
+    /// an unanswered submission. Absent from records written before this
+    /// field, and from a lease not yet admitted.
+    #[serde(default)]
+    pub submitted_at_unix_ms: Option<u64>,
     /// The fifo the task was pointed at. It stays on disk while the task
     /// runs — a sub-make opens the path anew — and goes once it is done.
     /// Absent from records written before this field.
@@ -169,7 +181,33 @@ struct Reconciled {
 /// nobody to report to, a task pueued no longer knows about is not on the
 /// machine as far as anyone can tell, and a lease that was never admitted
 /// lost its client with the daemon.
-fn reconcile(records: Vec<Record>, tasks: &BTreeMap<usize, Task>) -> Reconciled {
+///
+/// A record with no task id but a submission time is the one in between: the
+/// daemon died after sending the task to pueued and before writing down the
+/// id that came back. Its task, if pueued started one, is found the way the
+/// poll finds an unanswered submission — by label and creation time, among
+/// the tasks no other record claims — and the record is then adopted like any
+/// other. Dropped as never admitted, it would run on beside the next
+/// exclusive task.
+fn reconcile(mut records: Vec<Record>, tasks: &BTreeMap<usize, Task>) -> Reconciled {
+    let mut claimed: BTreeSet<usize> = records.iter().filter_map(|r| r.pueue_task_id).collect();
+    for record in &mut records {
+        let Some(sent) = record
+            .submitted_at_unix_ms
+            .filter(|_| record.pueue_task_id.is_none())
+        else {
+            continue;
+        };
+        let pending = Unreconciled {
+            label: record.label.clone(),
+            since: DateTime::<Local>::from(UNIX_EPOCH + Duration::from_millis(sent)),
+        };
+        if let Some(task_id) = orphan(tasks, &pending, &claimed) {
+            claimed.insert(task_id);
+            record.pueue_task_id = Some(task_id);
+        }
+    }
+
     let mut reconciled = Reconciled {
         adopted: Vec::new(),
         killing: Vec::new(),
@@ -177,6 +215,9 @@ fn reconcile(records: Vec<Record>, tasks: &BTreeMap<usize, Task>) -> Reconciled 
     };
     for record in records {
         let reason = match record.pueue_task_id {
+            None if record.submitted_at_unix_ms.is_some() => {
+                "its submission went unanswered, and pueued has no task for it".to_string()
+            }
             None => "it was never admitted, and its client went with the daemon".to_string(),
             Some(task_id) => match tasks.get(&task_id).map(|t| &t.status) {
                 Some(TaskStatus::Running { .. }) if record.killing => {
@@ -255,7 +296,6 @@ fn pid_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Local;
     use pueue_lib::task::TaskResult;
 
     fn record(id: u64, pueue_task_id: Option<usize>) -> Record {
@@ -267,6 +307,7 @@ mod tests {
             cores_held: 0,
             pueue_task_id,
             started_at_unix_ms: 0,
+            submitted_at_unix_ms: None,
             fifo: None,
             killing: false,
         }
@@ -366,6 +407,55 @@ mod tests {
         );
     }
 
+    /// Table row "bzbd dies": a lease whose submission was on its way to
+    /// pueued when the daemon died has no task id on record, but pueued may
+    /// well have started the task. It is found the way the poll finds an
+    /// unanswered submission — by label and creation time, among the tasks
+    /// no other record claims — and adopted. Dropped as never admitted, it
+    /// would run on beside the next exclusive task.
+    #[test]
+    fn a_submission_in_flight_when_the_daemon_died_is_matched_to_its_task() {
+        let sent = Local::now();
+        let build = |id: usize| {
+            let mut task = task(id, running());
+            task.label = Some("cargo build".into());
+            task.created_at = sent;
+            task
+        };
+        let state = tasks(vec![build(4), build(5)]);
+        let submitted = |id: u64| {
+            let mut record = record(id, None);
+            record.label = "cargo build".into();
+            record.submitted_at_unix_ms = Some(sent.timestamp_millis() as u64);
+            record
+        };
+        let mut claimed = record(11, Some(5));
+        claimed.label = "cargo build".into();
+        // 10 was in flight and gets the task 11 does not claim; 12 was in
+        // flight too, but the file cannot say it was — a daemon has one
+        // submission out at a time — and nothing is left for it anyway.
+        let records = vec![submitted(10), claimed, submitted(12), record(13, None)];
+
+        let reconciled = reconcile(records, &state);
+
+        let adopted: Vec<(u64, Option<usize>)> = reconciled
+            .adopted
+            .iter()
+            .map(|r| (r.id, r.pueue_task_id))
+            .collect();
+        assert_eq!(adopted, vec![(10, Some(4)), (11, Some(5))]);
+        let dropped: Vec<(u64, &str)> = reconciled
+            .dropped
+            .iter()
+            .map(|(r, reason)| (r.id, reason.as_str()))
+            .collect();
+        assert_eq!(dropped.len(), 2, "dropped {dropped:?}");
+        assert_eq!(dropped[0].0, 12);
+        assert!(dropped[0].1.contains("submission"), "{:?}", dropped[0]);
+        assert_eq!(dropped[1].0, 13);
+        assert!(dropped[1].1.contains("never admitted"), "{:?}", dropped[1]);
+    }
+
     #[test]
     fn only_jobserver_files_carry_a_pid() {
         assert_eq!(fifo_pid(Path::new("/state/jobserver-4242")), Some(4242));
@@ -393,6 +483,7 @@ mod tests {
         let records: Vec<Record> = serde_json::from_str(old).expect("decode");
         assert_eq!(records[0].argv, Vec::<String>::new());
         assert_eq!(records[0].fifo, None);
+        assert_eq!(records[0].submitted_at_unix_ms, None);
         assert!(!records[0].killing);
     }
 }

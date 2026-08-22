@@ -155,6 +155,9 @@ struct Lease {
     pueue_task_id: Option<usize>,
     cores_held: u32,
     started_at: SystemTime,
+    /// When its task went to pueued, on record before it goes
+    /// (`Record::submitted_at_unix_ms`). `None` until admission.
+    submitted_at: Option<SystemTime>,
     /// The fifo its task was pointed at: this daemon's, or a previous
     /// daemon's for an adopted lease. `None` only for a record written
     /// before the field existed.
@@ -187,6 +190,7 @@ impl Lease {
             cores_held: self.cores_held,
             pueue_task_id: self.pueue_task_id,
             started_at_unix_ms: unix_ms(self.started_at),
+            submitted_at_unix_ms: self.submitted_at.map(unix_ms),
             fifo: self.fifo.clone(),
             killing,
         }
@@ -245,13 +249,15 @@ impl Kill {
 /// A submission whose answer never arrived. The task id comes back in that
 /// answer, so without it bzbd cannot tell a submission that never landed from
 /// one pueued has already started — and it starts them on arrival. The next
-/// poll settles it, and admissions wait until it has.
-struct Unreconciled {
+/// poll settles it, and admissions wait until it has. A restarted daemon
+/// builds one from a record that says when its submission went out but not
+/// what came back (`crate::recovery`).
+pub(crate) struct Unreconciled {
     /// The label the task would carry.
-    label: String,
+    pub(crate) label: String,
     /// When the submission went out: a task created before it is somebody
     /// else's.
-    since: DateTime<Local>,
+    pub(crate) since: DateTime<Local>,
 }
 
 impl Leases {
@@ -295,8 +301,9 @@ impl Leases {
             };
             actor.next_id = actor.next_id.max(record.id + 1);
             actor.old_fifos.extend(record.fifo.clone());
-            // The previous daemon sent SIGTERM and the task is still there;
-            // the grace starts over from here and SIGKILL follows it.
+            // The previous daemon booked the teardown, sent SIGTERM unless it
+            // died first, and the task is still there; the grace starts over
+            // from here and SIGKILL follows it.
             actor.killing.insert(
                 task_id,
                 Kill {
@@ -340,6 +347,9 @@ impl Leases {
                     pueue_task_id: record.pueue_task_id,
                     cores_held: record.cores_held,
                     started_at: UNIX_EPOCH + Duration::from_millis(record.started_at_unix_ms),
+                    submitted_at: record
+                        .submitted_at_unix_ms
+                        .map(|ms| UNIX_EPOCH + Duration::from_millis(ms)),
                     fifo: record.fifo,
                 },
             );
@@ -432,6 +442,7 @@ impl Leases {
             pueue_task_id: None,
             cores_held: 0,
             started_at: SystemTime::now(),
+            submitted_at: None,
             fifo: Some(self.jobserver.path().to_path_buf()),
         };
         let spec = LeaseSpec {
@@ -552,7 +563,15 @@ impl Leases {
         };
         let class = lease.class;
 
-        let sent_at = Local::now();
+        // On record before the submission goes out, not after the answer
+        // comes back: pueued starts the task on arrival, and a daemon killed
+        // before it could write the task id down would otherwise leave a
+        // record that looks never admitted over a task that is running. The
+        // time is what a restart matches the task by.
+        let sent_at = SystemTime::now();
+        let lease = self.leases.get_mut(&id).expect("checked above");
+        lease.submitted_at = Some(sent_at);
+        self.persist();
         let task_id = match self.pueue.add(spec).await {
             Ok(task_id) => task_id,
             Err(err) => {
@@ -562,7 +581,7 @@ impl Leases {
                 // anything else is admitted.
                 self.unreconciled.push(Unreconciled {
                     label,
-                    since: sent_at,
+                    since: sent_at.into(),
                 });
                 let actions = self.scheduler.handle(Event::DrainFailed(id));
                 // The machine's teardown has no task id to act on; the lease
@@ -618,12 +637,12 @@ impl Leases {
         // Its admission may not have happened yet; it must not happen now.
         self.deferred
             .retain(|a| !matches!(a, Action::Admit { id: held, .. } if *held == id));
-        if let Some(task_id) = lease.pueue_task_id {
-            self.kill_task(task_id, Some(lease.record(id, true))).await;
+        match lease.pueue_task_id {
+            // The record changes from a lease to a teardown, never to
+            // nothing: `kill_task` books it before the signal goes out.
+            Some(task_id) => self.kill_task(task_id, Some(lease.record(id, true))).await,
+            None => self.persist(),
         }
-        // After the teardown is on the books, not before: the record changes
-        // from a lease to a teardown, never to nothing.
-        self.persist();
         if let Some(conn) = &lease.conn {
             let _ = conn.send(LeaseEvent::Finished {
                 id: id.0,
@@ -635,11 +654,19 @@ impl Leases {
     /// Signals a task and waits for pueued to confirm it is gone; SIGKILL
     /// follows on the poll after the grace period, for a task that ignores the
     /// first signal. The lease's tokens go back to the pool with that
-    /// confirmation. The caller persists: the teardown is now on the books.
+    /// confirmation.
     async fn kill_task(&mut self, task_id: usize, record: Option<Record>) {
+        self.book_teardown(task_id, record);
         if let Err(err) = self.pueue.kill(task_id, Signal::SigTerm).await {
             tracing::error!(task = task_id, "cannot stop the task: {err:#}");
         }
+    }
+
+    /// Puts a teardown on the books, and on disk, before the task is
+    /// signalled rather than after: a daemon killed between the two then
+    /// finds a teardown to resume, not a lease to adopt over a task whose
+    /// cancellation it never heard of.
+    fn book_teardown(&mut self, task_id: usize, record: Option<Record>) {
         self.killing.insert(
             task_id,
             Kill {
@@ -648,6 +675,7 @@ impl Leases {
                 record,
             },
         );
+        self.persist();
     }
 
     /// Returns tokens to the pool — after the pool's debt, if it has one
@@ -962,7 +990,7 @@ fn write_json(path: &Path, records: &[Record]) -> Result<()> {
 /// bzbd asked for, pueued created it no earlier than the submission, it is
 /// still alive, and no lease claims it. Anything else is somebody's task and
 /// is left alone.
-fn orphan(
+pub(crate) fn orphan(
     tasks: &BTreeMap<usize, Task>,
     pending: &Unreconciled,
     tracked: &BTreeSet<usize>,
@@ -1178,6 +1206,7 @@ mod tests {
             cores_held,
             pueue_task_id: Some(task),
             started_at_unix_ms: 0,
+            submitted_at_unix_ms: None,
             fifo: None,
             killing: false,
         }
@@ -1272,7 +1301,9 @@ mod tests {
 
     /// A teardown is on the books until pueued confirms the task gone, so a
     /// daemon restarted inside the grace period finds it and finishes it
-    /// instead of admitting beside a task that ignored SIGTERM.
+    /// instead of admitting beside a task that ignored SIGTERM. Booking it
+    /// is what `kill_task` does before it signals, so a daemon killed between
+    /// the two finds a teardown, not a lease.
     #[test]
     fn a_teardown_in_flight_is_recorded_until_pueued_confirms_it_gone() {
         let _umask = crate::tests::hold_umask(0o022);
@@ -1280,17 +1311,10 @@ mod tests {
         let mut actor = actor(directory.path(), |_| (Vec::new(), Vec::new(), 0));
         let mut record = held(5, 9, 0);
         record.killing = true;
-        actor.killing.insert(
-            9,
-            Kill {
-                deadline: Instant::now() + KILL_GRACE,
-                escalated: false,
-                record: Some(record),
-            },
-        );
 
-        actor.persist();
+        actor.book_teardown(9, Some(record));
 
+        assert!(actor.holding(), "the teardown holds nothing back");
         let written = std::fs::read(directory.path().join("leases.json")).expect("read");
         let records: Vec<Record> = serde_json::from_slice(&written).expect("decode");
         assert_eq!(records.len(), 1, "records were {records:?}");
