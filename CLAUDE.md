@@ -31,9 +31,8 @@ busybee -- cargo test --workspace
 `build/debug/` and `build/release/` rather than `target/`. Do not change that
 setting and do not commit `build/` — it is gitignored.
 
-CI runs the format check, that clippy line and the test suite on Linux and
-macOS, so all three gate a merge. Format the files you touch; do not reformat
-the workspace as a side effect of something else.
+CI gates fmt, clippy and the tests on Linux and macOS. Format the files you
+touch; do not reformat the workspace as a side effect of something else.
 
 The dev shell gains `gnumake` and `ninja` when the jobserver work lands — add
 them to `flake.nix` in that change, not ahead of it.
@@ -114,9 +113,11 @@ nix develop -c cargo test -p bzb --test smoke
   is testable without a daemon. New scheduling and classification logic follows
   the same shape.
 - **stdout belongs to the wrapped task.** busybee's own messages go to stderr,
-  prefixed `busybee: `. Two commands own stdout as their result: `--detach`
-  prints `busybee: enqueued task <id>` there (`crates/bzb/tests/smoke.rs`
-  asserts that channel), and `monitor` renders its ratatui TUI to it.
+  prefixed `busybee: ` — except a fatal error, which `main` returns as an
+  `anyhow::Result` for Rust to print unprefixed as `Error: …`. Two commands own
+  stdout as their result: `--detach` prints `busybee: enqueued task <id>` there
+  (`crates/bzb/tests/smoke.rs` asserts that channel), and `monitor` renders its
+  ratatui TUI to it.
 - **`exit_code.rs` is the single source of truth** for translating a task
   result into a process exit code. Do not map results anywhere else.
 
@@ -129,12 +130,11 @@ since, falling back to `0.0.<commit-count>` with no tag and to
 `CARGO_PKG_VERSION` with no `.git`. Parsing lives in `version_parse.rs`, shared
 between the build script and the test harness.
 
-`scripts/buildanddeploy.sh` is the release pipeline: it builds a release binary
-under `nix develop`, checks `build/release/busybee` and `build/release/bzb`
-exist, then installs them into the nix profile from the flake's binary-only
-derivation (`--impure`, with `BUSYBEE_REPO` pointing the flake at the working
-tree, since `build/` is gitignored and so absent from the flake source). It is
-deliberately non-hermetic; do not change it as part of unrelated work.
+`scripts/buildanddeploy.sh` is the release pipeline: it builds release binaries
+under `nix develop`, checks `build/release/{busybee,bzb}` exist, then installs
+them into the nix profile from the flake's binary-only derivation (`--impure`,
+with `BUSYBEE_REPO` pointing the flake at the working tree, since `build/` is
+gitignored). Deliberately non-hermetic; do not change it in unrelated work.
 
 ## What not to do
 
