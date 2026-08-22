@@ -94,8 +94,25 @@ fn row(lease: &LeaseView) -> String {
         lease.tool,
         lease.class,
         cores(lease),
-        lease.label
+        printable(&lease.label)
     )
+}
+
+/// A label is the caller's `--name`, i.e. arbitrary text. One lease is one row,
+/// so a newline in it must not split the row and an escape sequence must not
+/// rewrite what the terminal has already drawn: control characters are shown as
+/// their escape (`\n`, `\u{1b}`) instead of being sent through. `--json` still
+/// carries the label verbatim — a decoder is not a terminal.
+fn printable(label: &str) -> String {
+    let mut out = String::with_capacity(label.len());
+    for character in label.chars() {
+        if character.is_control() {
+            out.extend(character.escape_debug());
+        } else {
+            out.push(character);
+        }
+    }
+    out
 }
 
 /// What the lease is doing with the pool: waiting for it, sharing it, or
@@ -139,6 +156,24 @@ mod tests {
                 pueue_task_id: Some(3),
             }],
         }
+    }
+
+    /// A label is whatever the caller passed to `--name`, so it can carry a
+    /// newline or an escape sequence. One lease is still one row, and the
+    /// terminal above the table is still the caller's.
+    #[test]
+    fn a_control_character_in_a_label_cannot_break_the_table() {
+        let mut reply = reply();
+        reply.leases[0].label = "ui build\nfailed\u{1b}[2K".into();
+
+        let rendered = render(&reply);
+
+        assert_eq!(rendered.lines().count(), 2, "rendered {rendered:?}");
+        assert!(!rendered.contains('\u{1b}'), "rendered {rendered:?}");
+        assert!(
+            rendered.contains(r"ui build\nfailed\u{1b}[2K"),
+            "rendered {rendered:?}"
+        );
     }
 
     /// The pool and the fifo are sampled separately, so the three numbers can

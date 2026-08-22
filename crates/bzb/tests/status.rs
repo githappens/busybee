@@ -362,16 +362,22 @@ async fn the_json_output_carries_no_ansi_escapes_on_a_terminal() {
     // Read while the child runs, on a thread so the fake daemon's task still
     // gets to answer. Waiting for the child first would race macOS, which
     // flushes the pty's output queue once the last slave descriptor closes;
-    // `slave` stays open here for the same reason.
-    let reader = std::thread::spawn(move || {
-        let mut line = String::new();
-        master.read_line(&mut line).expect("read the pty");
-        line
+    // `slave` stays open here for the same reason. Holding it open also means
+    // the read never sees EOF, so the line is collected with a deadline rather
+    // than by joining: a `status --json` that printed nothing must fail this
+    // test, not hang it.
+    let (send_line, line) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut read = String::new();
+        master.read_line(&mut read).expect("read the pty");
+        let _ = send_line.send(read);
     });
 
     let status = child.wait().await.expect("wait for busybee status --json");
     assert!(status.success(), "busybee status --json exited {status}");
-    let line = reader.join().expect("the pty reader thread");
+    let line = line
+        .recv_timeout(Duration::from_secs(10))
+        .expect("busybee status --json wrote a line to the pty");
 
     assert!(
         !line.contains('\u{1b}'),
