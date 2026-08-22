@@ -82,11 +82,16 @@ The board (Projects → "busybee · bzbd", Kanban view) mirrors these labels thr
   1. Codex reviews every push (ChatGPT → Codex → Code review settings: auto
      review on, trigger "on every push"; rules in `AGENTS.md` → *Code Review
      Rules*). It posts a comment-only review as `chatgpt-codex-connector[bot]`.
-  2. `.github/workflows/codex-gate.yml` reads that review for the head commit and,
-     as `github-actions[bot]`, submits REQUEST_CHANGES (any inline finding) or
-     APPROVE (none). The `main` ruleset requires one approval and dismisses it on
-     push, so the review decision tracks the latest Codex verdict. Needs the repo
-     setting "Allow GitHub Actions to create and approve pull requests".
+  2. `.github/workflows/codex-gate.yml` (every 5 min and on PR events) selects PRs
+     with new Codex activity on their head commit, has Claude Haiku read that
+     material and decide APPROVE / REQUEST_CHANGES / UNSURE, and posts the verdict
+     as `github-actions[bot]` (UNSURE posts nothing; the PR waits). Rebuttals never
+     lift a block: only a clean Codex re-review of a new head does. The `main`
+     ruleset requires one approval and dismisses it on push, so the review decision
+     tracks the latest verdict. Needs the repo setting "Allow GitHub Actions to
+     create and approve pull requests" and the `CLAUDE_CODE_OAUTH_TOKEN` secret
+     (from `claude setup-token`; tied to the Max subscription, so it expires with
+     it and shares its rate window).
   3. `reactions.bot_review` routes Codex's comments to the agent as a continuation
      turn (max 5 per issue, then `needs-human`).
   4. `reactions.auto_merge` squash-merges once the decision is APPROVED and CI is
