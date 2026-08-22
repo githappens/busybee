@@ -204,6 +204,23 @@ fn drop_unlinks_fifo() {
 }
 
 #[test]
+fn create_rejects_dir_makeflags_cannot_carry() {
+    // MAKEFLAGS is split on whitespace, so make would open only "fifo:<prefix>".
+    let dir = fixture("with space", ".keep", "");
+    let err = Jobserver::create(&dir, 4)
+        .err()
+        .expect("create must fail for a whitespace path");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    let leftovers: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n.to_string_lossy().starts_with("jobserver-"))
+        .collect();
+    assert!(leftovers.is_empty(), "fifo left behind: {leftovers:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ninja_respects_pool_of_four() {
     if !available("ninja", (1, 13)) {
         return;

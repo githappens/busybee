@@ -22,7 +22,9 @@
 //! on macOS a fifo is a socket pair and `FIONREAD` on a read-write descriptor
 //! reports the write side, which is always empty. The path carries the
 //! creating pid so a restarted daemon gets a fresh pipe while orphaned builds
-//! keep reading the old one.
+//! keep reading the old one. `MAKEFLAGS` has no quoting, so [`Jobserver::create`]
+//! refuses directories containing whitespace rather than hand out a path
+//! clients would truncate.
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -62,7 +64,18 @@ impl Jobserver {
             pool_size <= MAX_POOL,
             "pool_size {pool_size} exceeds the {MAX_POOL}-byte pipe capacity"
         );
-        let path = dir.join(format!("jobserver-{}", std::process::id()));
+        // Clients split MAKEFLAGS on whitespace (make, ninja, the `jobserver`
+        // crate), so a path containing any is silently truncated; reject it.
+        let Some(dir) = dir.to_str().filter(|s| !s.contains(char::is_whitespace)) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "jobserver directory {} contains whitespace or non-UTF-8 bytes; MAKEFLAGS cannot carry it",
+                    dir.display()
+                ),
+            ));
+        };
+        let path = Path::new(dir).join(format!("jobserver-{}", std::process::id()));
         let c_path = CString::new(path.as_os_str().as_bytes())?;
         // SAFETY: c_path is a valid NUL-terminated string for the call's duration.
         if unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) } != 0 {

@@ -12,7 +12,7 @@ pub mod env;
 pub mod errors;
 pub mod exit_code;
 pub mod group;
-pub mod log;
 pub mod jobserver;
+pub mod log;
 pub mod status;
 pub mod wait;
