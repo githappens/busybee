@@ -43,11 +43,18 @@ hooks:
     else
       git checkout -q -B "$b" origin/main
     fi
+    # Per-issue model override: a `model:<name>` label (e.g. model:fable)
+    # becomes .sortie/model, read by sortie/agent.sh. No label = default model.
+    mkdir -p .sortie
+    labels="$(gh issue view "$SORTIE_ISSUE_IDENTIFIER" --repo githappens/busybee --json labels --jq '[.labels[].name] | join(" ")')"
+    model=""
+    for l in $labels; do case "$l" in model:*) model="${l#model:}";; esac; done
+    if [ -n "$model" ]; then printf '%s\n' "$model" > .sortie/model; else rm -f .sortie/model; fi
   timeout_ms: 120000
 
 agent:
   kind: claude-code
-  command: claude
+  command: sortie/agent.sh   # picks the model per issue; see the before_run hook
   max_turns: 20
   max_sessions: 3
   max_concurrent_agents: 3
@@ -57,7 +64,6 @@ agent:
   max_retry_backoff_ms: 300000
 
 claude-code:
-  model: opus
   permission_mode: dontAsk
   allowed_tools: "Bash Edit MultiEdit Write Read Glob Grep Agent TodoWrite WebFetch(domain:docs.rs) WebFetch(domain:github.com)"
   disallowed_tools: "mcp__sortie-tools__tracker_api WebSearch"
