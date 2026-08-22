@@ -100,10 +100,14 @@ fn segments(reply: &StatusReply, width: u64) -> (u64, u64, u64) {
         return (0, 0, 0);
     }
     let cells = pool.min(width);
-    let scale = |n: u32| (n as u64 * cells).div_ceil(pool).min(cells);
-    let held = scale(reply.held);
-    let in_use = scale(approx_in_use(reply)).min(cells - held);
-    (held, in_use, cells - held - in_use)
+    // Segments are cut at scaled cumulative boundaries, rounded down, so a
+    // segment can never round itself into the next one's cells: any free
+    // tokens at all still leave a free cell, which is what the operator is
+    // reading the bar for.
+    let boundary = |tokens: u64| (tokens * cells / pool).min(cells);
+    let held = boundary(reply.held as u64);
+    let in_use_end = boundary(reply.held as u64 + approx_in_use(reply) as u64);
+    (held, in_use_end - held, cells - in_use_end)
 }
 
 fn legend(reply: &StatusReply, stale: Option<Duration>) -> String {
@@ -278,6 +282,22 @@ mod tests {
             );
             draw(&PoolView::Absent, width);
         }
+    }
+
+    /// Scaling the pool into a narrower bar must not round the free tokens
+    /// away: a bar that says the machine is full when six tokens are there for
+    /// the taking is the one reading the operator acts on.
+    #[test]
+    fn scaling_never_rounds_a_free_segment_to_nothing() {
+        let reply = StatusReply {
+            pool_size: 18,
+            free: 2,
+            held: 8,
+            leases: vec![],
+        };
+        let (held, in_use, free) = segments(&reply, 10);
+        assert_eq!(held + in_use + free, 10, "bar was {held}/{in_use}/{free}");
+        assert!(free > 0, "bar was {held}/{in_use}/{free}");
     }
 
     /// bzbd reports the fifo and the leases from separate samples, so the two

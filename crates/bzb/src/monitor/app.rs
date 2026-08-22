@@ -56,10 +56,28 @@ async fn run_loop<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> R
     let mut pool = Pool::default();
     pool.record(poll().await, Instant::now());
 
+    // Polling runs off the interactive loop, which only receives finished
+    // polls: a daemon that is slow to accept a connection or slow to answer
+    // would otherwise hold the loop for the length of its timeouts, freezing
+    // the redraws and the `q` key exactly when the pool needs looking at. One
+    // poll is in flight at a time, because the poller awaits its own answer
+    // before the next tick, and it stops when the loop drops the receiver.
+    let (polls_tx, mut polls) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        let period = Duration::from_millis(1000);
+        // Delayed by one period: the poll above already asked, just now.
+        let mut status_tick = time::interval_at(time::Instant::now() + period, period);
+        status_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+        loop {
+            status_tick.tick().await;
+            if polls_tx.send(poll().await).await.is_err() {
+                break;
+            }
+        }
+    });
+
     let mut cpu_tick = time::interval(Duration::from_millis(500));
     cpu_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let mut status_tick = time::interval(Duration::from_millis(1000));
-    status_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut render_tick = time::interval(Duration::from_millis(250));
     render_tick.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     let mut events = EventStream::new();
@@ -73,8 +91,8 @@ async fn run_loop<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> R
                     .collect();
                 prev_samples = curr;
             }
-            _ = status_tick.tick() => {
-                pool.record(poll().await, Instant::now());
+            Some(polled) = polls.recv() => {
+                pool.record(polled, Instant::now());
             }
             _ = render_tick.tick() => {
                 draw(terminal, &usages, &pool.view(Instant::now()))?;
@@ -96,8 +114,11 @@ async fn run_loop<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> R
 /// pure.
 enum Poll {
     Reply(StatusReply),
-    /// Nothing is listening on the socket.
+    /// Nothing is listening on the socket, and the daemon left no leases behind.
     Absent,
+    /// Nothing is listening, but the daemon's lease record is non-empty or
+    /// unreadable: whatever it was running may still be on the machine.
+    Crashed(String),
     /// A daemon is there and did not answer the request.
     Failed(String),
 }
@@ -105,8 +126,25 @@ enum Poll {
 async fn poll() -> Poll {
     match ask().await {
         Ok(Some(reply)) => Poll::Reply(reply),
-        Ok(None) => Poll::Absent,
+        Ok(None) => absent(crate::status::recorded_leases()),
         Err(e) => Poll::Failed(format!("{e:#}")),
+    }
+}
+
+/// Classifies a socket nobody is listening on, given the leases bzbd recorded.
+///
+/// A daemon that *died* leaves its tasks running as pueued's children and a
+/// record of them behind (`docs/design/bzbd.md` §Failure and recovery), the same
+/// case `busybee status` refuses to call idle. The monitor is a viewer and
+/// cannot exit non-zero over it, so it says the pool is unknown and why.
+fn absent(recorded: anyhow::Result<usize>) -> Poll {
+    match recorded {
+        Ok(0) => Poll::Absent,
+        Ok(n) => Poll::Crashed(format!(
+            "bzbd is not running, but {n} lease(s) it held are still recorded; \
+             the tasks pueued started for them may still be on the machine"
+        )),
+        Err(e) => Poll::Crashed(format!("bzbd is not running, and {e:#}")),
     }
 }
 
@@ -158,6 +196,14 @@ impl Pool {
             Poll::Absent => {
                 self.last_good = None;
                 self.failure = None;
+            }
+            // A daemon that died takes its reply with it the same way, but not
+            // the load: the pool is unknown until someone deals with what it
+            // left running, and drawing the last reply as merely stale would
+            // suggest the numbers still describe the machine.
+            Poll::Crashed(reason) => {
+                self.last_good = None;
+                self.failure = Some(reason);
             }
             // A failed poll against a live daemon loses one sample, not the
             // view: the last one is kept and marked as old.
@@ -300,6 +346,47 @@ mod tests {
         assert!(matches!(
             pool.view(start + Duration::from_secs(1)),
             PoolView::Absent
+        ));
+    }
+
+    /// A daemon that died leaves its tasks running under pueued and a record of
+    /// them in `leases.json` (`docs/design/bzbd.md` §Failure and recovery), so a
+    /// socket nobody answers is only an idle pool when that record is empty.
+    #[test]
+    fn leases_left_behind_by_a_dead_daemon_are_not_an_idle_pool() {
+        assert!(matches!(absent(Ok(0)), Poll::Absent));
+
+        let Poll::Crashed(reason) = absent(Ok(2)) else {
+            panic!("a record of two leases is not an idle pool");
+        };
+        assert!(reason.contains('2'), "reason was {reason:?}");
+    }
+
+    /// The record is the only evidence of what a dead daemon left running, so
+    /// failing to read it is an unknown pool, not an idle one.
+    #[test]
+    fn an_unreadable_lease_record_is_reported_rather_than_ignored() {
+        let Poll::Crashed(reason) = absent(Err(anyhow::anyhow!("leases.json is not JSON"))) else {
+            panic!("an unreadable record is not an idle pool");
+        };
+        assert!(reason.contains("not JSON"), "reason was {reason:?}");
+    }
+
+    /// The pool of a daemon that crashed is unknown, not the pool it last
+    /// reported: the leases in that reply may have ended with it.
+    #[test]
+    fn a_crashed_daemon_replaces_the_last_view_with_the_reason() {
+        let start = Instant::now();
+        let mut pool = Pool::default();
+        pool.record(Poll::Reply(reply()), start);
+        pool.record(
+            Poll::Crashed("bzbd is not running, but 2 leases are recorded".into()),
+            start + Duration::from_secs(1),
+        );
+
+        assert!(matches!(
+            pool.view(start + Duration::from_secs(1)),
+            PoolView::Unreachable(reason) if reason.contains("2 leases")
         ));
     }
 

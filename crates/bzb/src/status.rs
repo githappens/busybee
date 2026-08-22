@@ -76,6 +76,22 @@ pub async fn run(json: bool) -> Result<()> {
 /// machine this command cannot report on, so it says so and exits non-zero
 /// rather than calling the pool idle and inviting more.
 fn report_absent_daemon() -> Result<()> {
+    let recorded = recorded_leases()?;
+    if recorded > 0 {
+        bail!(
+            "bzbd is not running, but {} still records {recorded} lease(s) it held: the tasks \
+             pueued started for them may still be on the machine, so the pool is not idle",
+            leases_path()?.display(),
+        );
+    }
+    eprintln!("busybee: daemon not running; pool idle");
+    Ok(())
+}
+
+/// How many leases the daemon recorded in `leases.json`, for a caller that
+/// found nothing listening. A record that cannot be read is an error, not a
+/// zero: it is the only evidence of what a dead daemon left running.
+pub(crate) fn recorded_leases() -> Result<usize> {
     let path = leases_path()?;
     let recorded: Vec<serde_json::Value> = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
@@ -88,16 +104,7 @@ fn report_absent_daemon() -> Result<()> {
             path.display()
         ),
     };
-    if !recorded.is_empty() {
-        bail!(
-            "bzbd is not running, but {} still records {} lease(s) it held: the tasks \
-             pueued started for them may still be on the machine, so the pool is not idle",
-            path.display(),
-            recorded.len()
-        );
-    }
-    eprintln!("busybee: daemon not running; pool idle");
-    Ok(())
+    Ok(recorded.len())
 }
 
 /// The reply verbatim plus `approx_in_use`, as one JSON object.
