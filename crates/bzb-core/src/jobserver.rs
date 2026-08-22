@@ -95,8 +95,12 @@ impl Jobserver {
         let (fd_rw, fd_r) = match handles {
             Ok(h) => h,
             Err(err) => {
-                let _ = fs::remove_file(&path);
-                return Err(err);
+                return Err(match unlink(&path) {
+                    Ok(()) => err,
+                    Err(u) => {
+                        io::Error::new(err.kind(), format!("{err}; cleanup also failed: {u}"))
+                    }
+                })
             }
         };
         let js = Self {
@@ -213,13 +217,13 @@ impl Jobserver {
     /// with `EEXIST`. The descriptors close when `self` is dropped either way.
     pub fn close(mut self) -> io::Result<()> {
         self.closed = true;
-        self.unlink()
+        unlink(&self.path)
     }
+}
 
-    fn unlink(&self) -> io::Result<()> {
-        fs::remove_file(&self.path)
-            .map_err(|e| io::Error::new(e.kind(), format!("unlink {}: {e}", self.path.display())))
-    }
+fn unlink(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)
+        .map_err(|e| io::Error::new(e.kind(), format!("unlink {}: {e}", path.display())))
 }
 
 impl Drop for Jobserver {
@@ -227,7 +231,7 @@ impl Drop for Jobserver {
         if self.closed {
             return;
         }
-        if let Err(e) = self.unlink() {
+        if let Err(e) = unlink(&self.path) {
             eprintln!("warning: jobserver fifo left behind: {e}");
         }
     }
