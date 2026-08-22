@@ -108,13 +108,30 @@ fn segments(reply: &StatusReply, width: u64) -> (u64, u64, u64) {
     }
     let cells = pool.min(width);
     // Segments are cut at scaled cumulative boundaries, rounded down, so a
-    // segment can never round itself into the next one's cells: any free
-    // tokens at all still leave a free cell, which is what the operator is
-    // reading the bar for.
+    // segment can never round itself into the next one's cells.
     let boundary = |tokens: u64| (tokens * cells / pool).min(cells);
-    let held = boundary(reply.held as u64);
-    let in_use_end = boundary(reply.held as u64 + approx_in_use(reply) as u64);
-    (held, in_use_end - held, cells - in_use_end)
+    let held = reply.held as u64;
+    let in_use = approx_in_use(reply) as u64;
+    let held_end = boundary(held);
+    let in_use_end = boundary(held + in_use);
+    let mut bar = [held_end, in_use_end - held_end, cells - in_use_end];
+
+    // Rounding down still scales a small segment away, and each of the three
+    // is the one an operator might be reading the bar for: held capacity a
+    // static lease took, work in flight, tokens there for the taking. Give
+    // every segment that holds tokens a cell, borrowed from the widest one,
+    // as long as the bar is wide enough to spare it.
+    for (i, tokens) in [held, in_use, reply.free as u64].into_iter().enumerate() {
+        if tokens == 0 || bar[i] > 0 {
+            continue;
+        }
+        let widest = (0..3).max_by_key(|&j| bar[j]).expect("three segments");
+        if bar[widest] > 1 {
+            bar[widest] -= 1;
+            bar[i] = 1;
+        }
+    }
+    (bar[0], bar[1], bar[2])
 }
 
 fn legend(reply: &StatusReply, stale: Option<Duration>) -> String {
@@ -334,6 +351,23 @@ mod tests {
         };
         let (held, in_use, free) = segments(&reply, 10);
         assert_eq!(held + in_use + free, 10, "bar was {held}/{in_use}/{free}");
+        assert!(free > 0, "bar was {held}/{in_use}/{free}");
+    }
+
+    /// The same holds for a single held token: a static lease keeping capacity
+    /// out of the pool is the reason the machine feels slow, and a bar that
+    /// scales it away leaves nothing on screen that says so.
+    #[test]
+    fn scaling_never_rounds_a_held_segment_to_nothing() {
+        let reply = StatusReply {
+            pool_size: 18,
+            free: 1,
+            held: 1,
+            leases: vec![],
+        };
+        let (held, in_use, free) = segments(&reply, 10);
+        assert_eq!(held + in_use + free, 10, "bar was {held}/{in_use}/{free}");
+        assert!(held > 0, "bar was {held}/{in_use}/{free}");
         assert!(free > 0, "bar was {held}/{in_use}/{free}");
     }
 
