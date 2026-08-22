@@ -120,12 +120,26 @@ impl Connection {
         let mut line = serde_json::to_string(value)
             .map_err(|e| BusybeeError::Protocol(format!("cannot encode a message: {e}")))?;
         line.push('\n');
-        self.outgoing.write_all(line.as_bytes()).await?;
+        // Not `?`: the shared `Network` variant reads "pueue-lib I/O error",
+        // and this socket has nothing to do with pueued.
+        self.outgoing
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| BusybeeError::DaemonUnreachable {
+                context: format!("cannot send to bzbd: {e}"),
+            })?;
         Ok(())
     }
 
     async fn recv_opt(&mut self) -> Result<Option<Response>, BusybeeError> {
-        let Some(line) = self.incoming.next_line().await? else {
+        let Some(line) =
+            self.incoming
+                .next_line()
+                .await
+                .map_err(|e| BusybeeError::DaemonUnreachable {
+                    context: format!("cannot read from bzbd: {e}"),
+                })?
+        else {
             return Ok(None);
         };
         serde_json::from_str(&line)
@@ -194,7 +208,7 @@ pub async fn connect_or_spawn_bzbd() -> Result<Connection, BusybeeError> {
             Err(other) => other,
         };
         if !spawned {
-            spawn_bzbd(deadline).await?;
+            spawn_bzbd(&bzbd_program(), deadline).await?;
             spawned = true;
             continue;
         }
@@ -213,22 +227,29 @@ pub async fn connect_or_spawn_bzbd() -> Result<Connection, BusybeeError> {
     }
 }
 
-/// Starts `bzbd` in daemonize mode. Prefers the binary next to the running
-/// executable so a locally built client starts its matching daemon, and falls
-/// back to PATH. The daemonizing parent exits once its child is serving or has
-/// failed, so waiting for it both paces the retry and surfaces startup errors;
-/// a child that never reports is bounded by `deadline`.
-async fn spawn_bzbd(deadline: Instant) -> Result<(), BusybeeError> {
-    let neighbour = env::current_exe()
+/// The daemon binary to start: the one next to the running executable, so a
+/// locally built client starts its matching daemon, else whatever is on PATH.
+fn bzbd_program() -> PathBuf {
+    env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join("bzbd")))
-        .filter(|path| path.is_file());
-    let program = neighbour.unwrap_or_else(|| PathBuf::from("bzbd"));
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("bzbd"))
+}
 
-    let child = Command::new(&program)
+/// Starts `bzbd` in daemonize mode. The daemonizing parent exits once its
+/// child is serving or has failed, so waiting for it both paces the retry and
+/// surfaces startup errors; a child that never reports is bounded by
+/// `deadline`.
+async fn spawn_bzbd(program: &Path, deadline: Instant) -> Result<(), BusybeeError> {
+    let child = Command::new(program)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        // Timing out below drops the handle, which on its own neither kills
+        // nor reaps the process; without this a daemon that hangs before
+        // reporting outlives every client that tried to start it.
+        .kill_on_drop(true)
         .spawn()
         .map_err(|e| BusybeeError::DaemonUnreachable {
             context: format!("cannot spawn {}: {e}", program.display()),
@@ -430,6 +451,29 @@ mod tests {
         );
     }
 
+    /// A transport failure on a bzbd socket must name bzbd. The shared
+    /// `Network` variant reads "pueue-lib I/O error", which points the user at
+    /// a daemon that had nothing to do with it.
+    #[tokio::test]
+    async fn a_broken_bzbd_connection_names_bzbd() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        drop(theirs);
+        let (reader, outgoing) = ours.into_split();
+        let mut conn = Connection {
+            incoming: BufReader::new(reader).lines(),
+            outgoing,
+        };
+
+        // The first write can still land in the socket buffer; the second
+        // cannot, the peer's end of the pair is gone.
+        let _ = conn.send(Request::Ping).await;
+        let error = conn.send(Request::Ping).await;
+        let Err(BusybeeError::DaemonUnreachable { context }) = error else {
+            panic!("expected a write to a closed bzbd socket to name bzbd, got {error:?}");
+        };
+        assert!(context.contains("bzbd"), "{context}");
+    }
+
     /// A daemon that accepts connections but never answers must not hang the
     /// client past its startup deadline.
     #[tokio::test]
@@ -448,6 +492,36 @@ mod tests {
             panic!("expected the stalled handshake to fail at the deadline");
         };
         assert!(Instant::now() < deadline + Duration::from_secs(1));
+    }
+
+    /// A hung daemon must not survive the client that gave up on it. Timing
+    /// out only drops the `Child` handle, and a dropped handle neither kills
+    /// nor reaps the process on its own, so the forking parent would linger
+    /// while later clients time out against it in turn.
+    #[tokio::test]
+    async fn a_daemon_that_never_reports_is_killed_at_the_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let program = dir.path().join("bzbd");
+        // Touched only if the process outlives the deadline below.
+        let survived = dir.path().join("survived");
+        std::fs::write(
+            &program,
+            format!("#!/bin/sh\nsleep 1\ntouch '{}'\n", survived.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let Err(BusybeeError::DaemonUnreachable { context }) = spawn_bzbd(&program, deadline).await
+        else {
+            panic!("expected a daemon that never reports to fail at the deadline");
+        };
+        assert!(context.contains("did not report"), "{context}");
+
+        sleep(Duration::from_millis(1500)).await;
+        assert!(!survived.exists(), "the timed-out daemon was left running");
     }
 
     /// Sets environment variables around `body`, restoring them afterwards.

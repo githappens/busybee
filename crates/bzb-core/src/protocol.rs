@@ -10,6 +10,8 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::classify::Class;
+
 /// Bumped whenever a change to the types below is not backwards compatible.
 pub const PROTOCOL_VERSION: u32 = 1;
 
@@ -33,7 +35,7 @@ pub struct LeaseRequest {
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
     pub label: Option<String>,
-    pub class_override: Option<String>,
+    pub class_override: Option<Class>,
     pub cores_wanted: Option<u32>,
 }
 
@@ -106,6 +108,32 @@ mod tests {
             serde_json::from_str::<Request>(&line).unwrap(),
             Request::Cancel { lease: 7 }
         ));
+    }
+
+    /// The class vocabulary is closed (`docs/design/bzbd.md` §Lease model
+    /// types the field as `Option<Class>`), so a typo is a wire error the
+    /// client hears about now rather than a string the scheduler has to
+    /// re-validate at admission.
+    #[test]
+    fn a_class_override_carries_only_a_known_class() {
+        let request = LeaseRequest {
+            argv: vec!["make".into()],
+            cwd: PathBuf::from("/somewhere"),
+            env: BTreeMap::new(),
+            label: None,
+            class_override: Some(Class::Static),
+            cores_wanted: Some(4),
+        };
+        let line = serde_json::to_string(&request).unwrap();
+        assert!(
+            line.contains(r#""class_override":"static""#),
+            "line was {line:?}"
+        );
+
+        assert!(
+            serde_json::from_str::<Class>(r#""statik""#).is_err(),
+            "an unknown class must not decode"
+        );
     }
 
     #[test]

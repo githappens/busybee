@@ -35,6 +35,8 @@
 
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
+
 /// Value written into `MAKEFLAGS` / `CARGO_MAKEFLAGS` for pool members.
 const JOBSERVER_AUTH: &str = "--jobserver-auth=fifo:{fifo}";
 /// `Plan::tool` for an opaque shell string (`sh -c '…'`).
@@ -68,8 +70,11 @@ const MAKE_REQUIRED_VALUE_LONG_OPTIONS: [&str; 10] = [
     "--what-if",
 ];
 
-/// How a task is admitted against the token pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a task is admitted against the token pool. Also the wire form of
+/// `LeaseRequest::class_override`, which is why it serialises as the same
+/// lowercase names `--class` and [`Class::as_str`] use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Class {
     /// Speaks the GNU make jobserver protocol; shares the fifo dynamically.
     Jobserver,
