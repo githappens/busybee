@@ -9,7 +9,7 @@ use std::{
     io::{self, Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
-        unix::fs::PermissionsExt,
+        unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     },
     path::Path,
     sync::{
@@ -65,11 +65,17 @@ pub fn run() -> Result<()> {
 
 /// Creates the state directory owner-only. The socket inside it is the
 /// daemon's whole control surface, so on a shared machine the usual 022 umask
-/// would hand every other user a way in.
+/// would hand every other user a way in. The mode is part of the creation
+/// rather than a chmod after it: a directory born 0755 is reachable for as
+/// long as it takes to restrict it, which is long enough to plant a file in.
 fn create_state_dir(dir: &Path) -> Result<()> {
-    std::fs::create_dir_all(dir)
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
         .with_context(|| format!("cannot create the state directory {}", dir.display()))?;
-    // Also for a directory that already existed: it may predate this.
+    // `recursive` leaves an existing directory alone, mode included, and one
+    // may predate this.
     std::fs::set_permissions(dir, Permissions::from_mode(0o700))
         .with_context(|| format!("cannot restrict the state directory {}", dir.display()))
 }
@@ -242,6 +248,9 @@ fn lock_pid_file(path: &Path) -> Result<Option<File>> {
         .read(true)
         .truncate(false)
         .write(true)
+        // A pid file that turns out to be a symlink is not ours: we truncate
+        // this one, and following the link would empty whatever it points at.
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .with_context(|| format!("cannot open the pid file {}", path.display()))?;
 
@@ -403,6 +412,9 @@ fn open_log(log: &Path) -> Result<File> {
     OpenOptions::new()
         .create(true)
         .append(true)
+        // Same as the pid file: our standard streams end up here, so a symlink
+        // planted in the state directory would aim them somewhere else.
+        .custom_flags(libc::O_NOFOLLOW)
         .open(log)
         .with_context(|| format!("cannot open the log file {}", log.display()))
 }
@@ -443,6 +455,46 @@ mod tests {
 
         assert!(tripped.load(Ordering::SeqCst), "the watchdog never fired");
         drop(armed);
+    }
+
+    /// The mode has to come from the creation itself, not from a chmod after
+    /// it: between the two, another user can reach inside a directory the
+    /// umask left open. Every level counts, because a parent that stays
+    /// traversable is a way to the files below it.
+    #[test]
+    fn every_state_directory_is_created_owner_only() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let nested = tmp.path().join("outer/state");
+
+        create_state_dir(&nested).expect("create the state directory");
+
+        for dir in [nested.parent().expect("outer"), nested.as_path()] {
+            let mode = std::fs::metadata(dir).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{} is {mode:o}", dir.display());
+        }
+    }
+
+    /// A pid file we did not create is not ours to truncate: following a
+    /// symlink planted in the state directory would empty whatever it points
+    /// at. Refuse instead, loudly.
+    #[test]
+    fn a_symlinked_pid_file_is_refused() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let target = tmp.path().join("precious");
+        std::fs::write(&target, "keep me").expect("write the target");
+        let pid_file = tmp.path().join("bzbd.pid");
+        std::os::unix::fs::symlink(&target, &pid_file).expect("plant the symlink");
+
+        let err = lock_pid_file(&pid_file).expect_err("a symlinked pid file was accepted");
+
+        assert!(
+            err.to_string().contains("bzbd.pid"),
+            "message was {err:#}, which does not name the path"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&target).expect("read the target"),
+            "keep me"
+        );
     }
 
     /// And a child that did start serving must survive: the watchdog bounds
