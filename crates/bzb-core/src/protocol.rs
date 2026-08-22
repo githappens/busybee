@@ -29,8 +29,9 @@ pub enum Line {
     /// The peer closed the connection between messages.
     Closed,
     /// The bytes are not a message and the connection cannot be read past
-    /// them, so the reason is all the peer gets: either no newline within
-    /// [`MAX_LINE_BYTES`], or a close part-way through a message.
+    /// them, so the reason is all the peer gets: no newline within
+    /// [`MAX_LINE_BYTES`], a close part-way through a message, or bytes that
+    /// are not UTF-8.
     Malformed(String),
 }
 
@@ -57,9 +58,16 @@ pub async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Li
             line.len()
         )));
     }
-    let text = String::from_utf8(line)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid utf-8: {e}")))?;
-    Ok(Line::Text(text))
+    // Not an `io::Error`: the read succeeded and the frame ended where it
+    // should. What arrived simply is not a message, which is a protocol error
+    // the peer is owed an answer about — the same answer as any other broken
+    // frame, since the decoder cannot be handed these bytes either.
+    match String::from_utf8(line) {
+        Ok(text) => Ok(Line::Text(text)),
+        Err(e) => Ok(Line::Malformed(format!(
+            "a line that is not valid utf-8 is not a message: {e}"
+        ))),
+    }
 }
 
 /// The client's first line.

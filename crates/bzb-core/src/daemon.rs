@@ -2,7 +2,7 @@
 //! reach it, and how to auto-start it.
 
 use std::{
-    env, io,
+    env,
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
@@ -152,25 +152,22 @@ impl Connection {
     }
 
     async fn recv_opt(&mut self) -> Result<Option<Response>, BusybeeError> {
-        let read = read_line(&mut self.incoming).await.map_err(|e| {
-            // Bytes that are not UTF-8 came from a daemon that answered: that
-            // is a broken protocol, not an absent daemon. Reporting it as
-            // unreachable would send `connect_or_spawn_bzbd` off to spawn a
-            // replacement, which exits as "already running", and the caller
-            // would hear about a startup timeout instead of the real reason.
-            if e.kind() == io::ErrorKind::InvalidData {
-                BusybeeError::Protocol(format!("bzbd sent a line that is not valid utf-8: {e}"))
-            } else {
-                BusybeeError::DaemonUnreachable {
+        let read =
+            read_line(&mut self.incoming)
+                .await
+                .map_err(|e| BusybeeError::DaemonUnreachable {
                     context: format!("cannot read from bzbd: {e}"),
-                }
-            }
-        })?;
+                })?;
         let line = match read {
             Line::Text(line) => line,
             Line::Closed => return Ok(None),
             // The same framing the daemon reads under: a peer that breaks it is
             // not speaking this protocol, and we cannot find the next message.
+            // That covers bytes that are not UTF-8, which came from a daemon
+            // that did answer: calling those unreachable would send
+            // `connect_or_spawn_bzbd` off to spawn a replacement, which exits
+            // as "already running", and the caller would hear about a startup
+            // timeout instead of the real reason.
             Line::Malformed(reason) => {
                 return Err(BusybeeError::Protocol(format!(
                     "bzbd broke the protocol framing: {reason}"

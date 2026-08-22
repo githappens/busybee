@@ -37,9 +37,12 @@ use tracing::Level;
 pub fn run() -> Result<()> {
     let foreground = parse_args(std::env::args().skip(1))?;
 
-    restrict_umask();
+    restrict_umask(DIR_UMASK);
     let dir = state_dir()?;
     create_state_dir(&dir)?;
+    // The directory exists; everything created from here on is a file or the
+    // socket, and none of them wants an execute bit.
+    restrict_umask(FILE_UMASK);
     let log = log_path()?;
 
     // Fork before the runtime exists: a forked child inherits no threads.
@@ -64,14 +67,25 @@ pub fn run() -> Result<()> {
     result
 }
 
+/// The mask the state directory is created under: owner-only, keeping the
+/// execute bit a directory needs to be traversable at all.
+const DIR_UMASK: libc::mode_t = 0o077;
+
+/// The mask everything inside it is created under — socket, pid file, log.
+/// One bit tighter than [`DIR_UMASK`], because none of them is executable and
+/// `docs/design/bzbd.md` §Components puts `bzbd.sock` at 0600: `bind` derives
+/// the socket's mode from 0777, so only a mask that clears owner-execute too
+/// lands on it.
+const FILE_UMASK: libc::mode_t = 0o177;
+
 /// Nothing bzbd creates is anyone else's business, and a mode set after the
 /// creation is always a window: a unix socket in particular is connectable
 /// from the moment it is bound. The umask makes owner-only part of every
 /// creation instead, before the first of them happens.
-fn restrict_umask() {
+fn restrict_umask(mask: libc::mode_t) {
     // SAFETY: `umask` is a process-wide setting with no preconditions. It is
     // not thread-safe against a concurrent file creation, hence this early.
-    unsafe { libc::umask(0o077) };
+    unsafe { libc::umask(mask) };
 }
 
 /// Creates the state directory owner-only. The socket inside it is the
@@ -466,37 +480,37 @@ mod tests {
     }
 
     /// The mode has to come from the creation itself, not from a chmod after
-    /// it: between the two, another user can reach inside a directory the
-    /// umask left open. Every level counts, because a parent that stays
-    /// traversable is a way to the files below it.
+    /// it: another user can reach inside a directory the umask left open, and
+    /// a unix socket is connectable from the moment it is bound. Every
+    /// directory level counts, because a parent that stays traversable is a way
+    /// to the files below it.
+    ///
+    /// One test, not two: `umask` is process-wide, so walking `run`'s sequence
+    /// in one place is the only way to check both masks without the two racing
+    /// each other across the test harness's threads.
     #[test]
-    fn every_state_directory_is_created_owner_only() {
+    fn the_state_directory_and_the_socket_are_born_owner_only() {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let nested = tmp.path().join("outer/state");
 
+        restrict_umask(DIR_UMASK);
         create_state_dir(&nested).expect("create the state directory");
 
         for dir in [nested.parent().expect("outer"), nested.as_path()] {
             let mode = std::fs::metadata(dir).expect("stat").permissions().mode();
             assert_eq!(mode & 0o777, 0o700, "{} is {mode:o}", dir.display());
         }
-    }
 
-    /// A unix socket is connectable from the moment it is bound, so a mode
-    /// applied after the bind comes too late: under the usual 022 umask the
-    /// socket spends that window at 0755, connectable by anyone. The umask has
-    /// to carry the restriction into the creation instead.
-    #[test]
-    fn a_bound_socket_is_owner_only_from_birth() {
-        restrict_umask();
-        let tmp = tempfile::tempdir().expect("create tempdir");
-        let path = tmp.path().join("bzbd.sock");
+        restrict_umask(FILE_UMASK);
+        let socket = nested.join("bzbd.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind the socket");
 
-        let listener = std::os::unix::net::UnixListener::bind(&path).expect("bind the socket");
-
-        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        let mode = std::fs::metadata(&socket)
+            .expect("stat")
+            .permissions()
+            .mode();
         drop(listener);
-        assert_eq!(mode & 0o077, 0, "the socket was born {mode:o}");
+        assert_eq!(mode & 0o777, 0o600, "the socket was born {mode:o}");
     }
 
     /// A pid file we did not create is not ours to truncate: following a

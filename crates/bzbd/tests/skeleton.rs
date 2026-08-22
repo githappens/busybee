@@ -123,15 +123,15 @@ async fn the_state_directory_and_the_socket_are_owner_only() {
         "the state directory {} is not owner-only",
         daemon.state_dir().display()
     );
-    // Not an exact mode: `bind` derives the socket's from 0777, so the daemon's
-    // umask leaves it 0700. What has to hold is that nobody else is in it, and
-    // that it held from the moment the socket was bound: a chmod afterwards
-    // would leave a window in which any user could connect.
-    let socket = mode(&daemon.socket_path());
+    // The exact mode `docs/design/bzbd.md` names, and it has to hold from the
+    // moment the socket was bound: a chmod afterwards would leave a window in
+    // which any user could connect. An execute bit on a socket means nothing,
+    // so the mask that produces this one drops it too.
     assert_eq!(
-        socket & 0o077,
-        0,
-        "the socket is {socket:o}, not owner-only"
+        mode(&daemon.socket_path()),
+        0o600,
+        "the socket {} is not 0600",
+        daemon.socket_path().display()
     );
 }
 
@@ -310,6 +310,17 @@ async fn the_error_for_an_unknown_request_variant_stays_within_the_line_limit() 
         message.contains("decode"),
         "expected a decode error, got {message:?}"
     );
+}
+
+/// A line that is not UTF-8 breaks the same contract as one that never ends:
+/// `docs/design/bzbd.md` §Components has one message per line and every line
+/// UTF-8. The daemon owes the client the reason, not a connection that drops
+/// without a word — from that, a client cannot tell a protocol error from a
+/// daemon that died.
+#[tokio::test]
+async fn a_request_that_is_not_utf8_gets_an_error_rather_than_a_dropped_connection() {
+    let message = bounded_decode_error(b"\xff\xfe not utf-8\n").await;
+    assert!(message.contains("utf-8"), "message was {message:?}");
 }
 
 /// Sends `request` to a fresh daemon after the handshake and returns the error
