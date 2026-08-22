@@ -23,6 +23,14 @@
 //! be fully free, and everything behind it waits too. Priorities, preemption
 //! and reordering are out of scope.
 //!
+//! Every [`Action::Admit`] also carries `cores`, the lease's fair share of the
+//! pool at that admission — the daemon's `{cores}` substitution value. It
+//! equals `drain_target` for static and none; for jobserver it is `fair`
+//! rather than 0. The machine reports it per admission because it is
+//! count-sensitive: one batch (a [`Scheduler::set_params`] reload, or a
+//! [`Event::Finished`] freeing several slots) can admit leases whose shares
+//! differ, so the daemon cannot recover it from the queue afterwards.
+//!
 //! The machine is driven by [`Event`]s and answers with [`Action`]s; the
 //! daemon performs the IO (draining fifo tokens, submitting to pueued,
 //! notifying clients) and reports back with `Started`/`Finished`.
@@ -94,6 +102,14 @@ pub enum Action {
         id: LeaseId,
         class: Class,
         drain_target: u32,
+        /// The lease's fair share of the pool at this admission: the value the
+        /// daemon substitutes for the `{cores}` placeholder (and `{cores-1}`,
+        /// `BUSYBEE_CORES`, `RUST_TEST_THREADS`). Equal to `drain_target` for
+        /// [`Class::Static`]/[`Class::None`]; for [`Class::Jobserver`] it is
+        /// `ceil(pool_size / (admitted_count + 1))`, because a jobserver task
+        /// still spawns threads that do not speak the protocol and need
+        /// bounding, even though it holds no tokens of its own.
+        cores: u32,
     },
     /// The lease's queue position changed; tell the client `ahead` tasks
     /// are in front of it.
@@ -234,11 +250,16 @@ impl Scheduler {
             let Some(drain_target) = self.drain_target(head) else {
                 break;
             };
+            let cores = match head.class {
+                Class::Jobserver => self.fair_share(None),
+                Class::Static | Class::None => drain_target,
+            };
             let r = self.queue.pop_front().expect("front() just returned Some");
             actions.push(Action::Admit {
                 id: r.id,
                 class: r.class,
                 drain_target,
+                cores,
             });
             self.admitted.insert(
                 r.id,
@@ -334,14 +355,19 @@ mod tests {
         let mut s = Scheduler::new(params(8, 4));
         for id in 1..=4 {
             let actions = submit_and_start(&mut s, req(id, Class::Jobserver, None), 0);
-            assert_eq!(
-                actions,
-                vec![Action::Admit {
-                    id: LeaseId(id),
-                    class: Class::Jobserver,
-                    drain_target: 0
-                }],
-                "lease {id} should be admitted at once"
+            // The share each one gets is
+            // `jobserver_admission_carries_a_fair_share_although_it_drains_nothing`.
+            assert!(
+                matches!(
+                    actions[..],
+                    [Action::Admit {
+                        id: admitted,
+                        class: Class::Jobserver,
+                        drain_target: 0,
+                        ..
+                    }] if admitted == LeaseId(id)
+                ),
+                "lease {id} should be admitted at once, got {actions:?}"
             );
         }
         // Fifth waits: max_concurrent is 4.
@@ -356,6 +382,54 @@ mod tests {
     }
 
     #[test]
+    fn jobserver_admission_carries_a_fair_share_although_it_drains_nothing() {
+        let mut s = Scheduler::new(params(8, 4));
+        // fair = ceil(8 / 1), ceil(8 / 2), ceil(8 / 3): the share shrinks as
+        // more leases are admitted, even though none of them holds a token.
+        for (id, cores) in [(1, 8), (2, 4), (3, 3)] {
+            let actions = submit_and_start(&mut s, req(id, Class::Jobserver, None), 0);
+            assert_eq!(
+                actions,
+                vec![Action::Admit {
+                    id: LeaseId(id),
+                    class: Class::Jobserver,
+                    drain_target: 0,
+                    cores,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_of_admissions_gives_each_lease_its_own_share() {
+        let mut s = Scheduler::new(params(8, 1));
+        submit_and_start(&mut s, req(1, Class::Jobserver, None), 0);
+        s.handle(Event::Submit(req(2, Class::Jobserver, None)));
+        s.handle(Event::Submit(req(3, Class::Jobserver, None)));
+
+        // One reload admits both queued leases; their shares differ because
+        // each is computed against the admitted count at its own admission.
+        let actions = s.set_params(params(8, 3));
+        assert_eq!(
+            actions,
+            vec![
+                Action::Admit {
+                    id: LeaseId(2),
+                    class: Class::Jobserver,
+                    drain_target: 0,
+                    cores: 4,
+                },
+                Action::Admit {
+                    id: LeaseId(3),
+                    class: Class::Jobserver,
+                    drain_target: 0,
+                    cores: 3,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn static_alone_drains_the_whole_pool() {
         let mut s = Scheduler::new(params(8, 4));
         let actions = s.handle(Event::Submit(req(1, Class::Static, None)));
@@ -364,7 +438,8 @@ mod tests {
             vec![Action::Admit {
                 id: LeaseId(1),
                 class: Class::Static,
-                drain_target: 8
+                drain_target: 8,
+                cores: 8,
             }]
         );
     }
@@ -381,7 +456,8 @@ mod tests {
             vec![Action::Admit {
                 id: LeaseId(3),
                 class: Class::Static,
-                drain_target: 3
+                drain_target: 3,
+                cores: 3,
             }]
         );
     }
@@ -395,7 +471,8 @@ mod tests {
             vec![Action::Admit {
                 id: LeaseId(1),
                 class: Class::Static,
-                drain_target: 2
+                drain_target: 2,
+                cores: 2,
             }]
         );
     }
@@ -411,7 +488,8 @@ mod tests {
             vec![Action::Admit {
                 id: LeaseId(2),
                 class: Class::Static,
-                drain_target: 4
+                drain_target: 4,
+                cores: 4,
             }]
         );
     }
@@ -425,7 +503,8 @@ mod tests {
             vec![Action::Admit {
                 id: LeaseId(1),
                 class: Class::Static,
-                drain_target: 1
+                drain_target: 1,
+                cores: 1,
             }]
         );
     }
@@ -458,7 +537,8 @@ mod tests {
             vec![Action::Admit {
                 id: LeaseId(3),
                 class: Class::None,
-                drain_target: 8
+                drain_target: 8,
+                cores: 8,
             }]
         );
     }
@@ -487,7 +567,8 @@ mod tests {
                 Action::Admit {
                     id: LeaseId(2),
                     class: Class::None,
-                    drain_target: 8
+                    drain_target: 8,
+                    cores: 8,
                 },
                 Action::Notify {
                     id: LeaseId(3),
@@ -535,7 +616,8 @@ mod tests {
                 Action::Admit {
                     id: LeaseId(2),
                     class: Class::Jobserver,
-                    drain_target: 0
+                    drain_target: 0,
+                    cores: 8,
                 },
             ]
         );
@@ -556,7 +638,8 @@ mod tests {
                 Action::Admit {
                     id: LeaseId(2),
                     class: Class::Jobserver,
-                    drain_target: 0
+                    drain_target: 0,
+                    cores: 8,
                 },
             ]
         );
@@ -602,7 +685,8 @@ mod tests {
                 Action::Admit {
                     id: LeaseId(2),
                     class: Class::Jobserver,
-                    drain_target: 0
+                    drain_target: 0,
+                    cores: 8,
                 },
             ]
         );
@@ -677,7 +761,8 @@ mod tests {
             vec![Action::Admit {
                 id: LeaseId(2),
                 class: Class::Static,
-                drain_target: 4
+                drain_target: 4,
+                cores: 4,
             }]
         );
     }
@@ -698,7 +783,8 @@ mod tests {
                 Action::Admit {
                     id: LeaseId(2),
                     class: Class::Jobserver,
-                    drain_target: 0
+                    drain_target: 0,
+                    cores: 4,
                 },
                 Action::Notify {
                     id: LeaseId(3),
@@ -732,7 +818,8 @@ mod tests {
             vec![Action::Admit {
                 id: LeaseId(2),
                 class: Class::None,
-                drain_target: 8
+                drain_target: 8,
+                cores: 8,
             }]
         );
         assert_eq!(s.snapshot().free_estimate, 8);
