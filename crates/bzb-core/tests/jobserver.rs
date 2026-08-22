@@ -275,6 +275,25 @@ fn create_rejects_dir_makeflags_cannot_carry() {
 }
 
 #[test]
+fn create_rejects_a_pool_the_pipe_cannot_hold() {
+    // Every token must fit in the pipe at once; 4096 is the smallest capacity
+    // on the supported platforms, so one more is an error, not a panic.
+    let dir = fixture("too-many-tokens", ".keep", "");
+    let err = Jobserver::create(&dir, 4097)
+        .err()
+        .expect("create must fail for a pool larger than the pipe");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+    assert!(err.to_string().contains("4097"), "{err}");
+    let leftovers: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|n| n.to_string_lossy().starts_with("jobserver-"))
+        .collect();
+    assert!(leftovers.is_empty(), "fifo left behind: {leftovers:?}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn ninja_respects_pool_of_four() {
     if !available("ninja", (1, 13)) {
         return;

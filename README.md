@@ -38,9 +38,6 @@ interleave token by token; when one finishes, the other grows back within a
 compile unit. No daemon decision is involved. The caveat is static tasks: their
 tools read the core count once at startup, so a static task is **locked at the
 number it was admitted with** until it exits, even if the machine empties out.
-(Injection lands with [#8](https://github.com/githappens/busybee/issues/8);
-until then every task is admitted `none`, `--class` and `--cores` only earn a
-notice, and busybee says as much on stderr.)
 
 ## Usage
 
@@ -85,30 +82,39 @@ returns, and the task outlives the client, so `Ctrl-C` cannot reach it —
 | `make`, `gmake` | jobserver | `MAKEFLAGS=--jobserver-auth=fifo:…` |
 | `ninja` | jobserver | same |
 | `cmake --build` | jobserver | same, via the generator; `CMAKE_BUILD_PARALLEL_LEVEL` is removed |
-| `cargo` | jobserver | `MAKEFLAGS`, `CARGO_MAKEFLAGS`, `RUST_TEST_THREADS`; the `rustc` processes cargo spawns take tokens through it |
+| `cargo` | jobserver | `MAKEFLAGS`, `CARGO_MAKEFLAGS`; the `rustc` processes cargo spawns take tokens through it. `RUST_TEST_THREADS` is set to the admission-time share as a cap, not a token holding: test threads take nothing from the pool, so they run beside jobs that do |
 | `xcodebuild` | static | argv `-jobs max(1, N−1)`, since `-jobs N` runs N+1 compiles; a one-token share still allows two. Your own `-jobs` is left alone, and the lease goes on holding its share, so the tool oversubscribes it |
 | `go` | static | `GOMAXPROCS=N` |
 | `ctest` | static | `CTEST_PARALLEL_LEVEL=N` |
 | `pytest` (+ xdist) | static | `PYTEST_ADDOPTS` gains `-n N`, which only pytest-xdist reads |
 | `docker build`, everything else | none | nothing injected — the task runs alone |
 
-**Matched, not checked.** busybee classifies on the executable name alone. The
-jobserver rows assume make ≥ 4.4, ninja ≥ 1.13 and a Make or Ninja generator
-under `cmake --build`; nothing verifies it, so an older tool is still admitted
-as jobserver, ignores the fifo and runs at its own default. Your own count wins
-too: `make -j8`, `ninja -j8`, `cargo build -j8` and `cmake --build … --parallel
-8` keep your number over busybee's `MAKEFLAGS`, and `env MAKEFLAGS=-j8 make`
-lands after busybee's environment, so the injection is dropped outright. Either
-way you get a notice and a jobserver task that holds no tokens — it runs beside
-the pool rather than inside it.
+**Matched, not checked.** busybee classifies on the executable name plus, for
+the rows whose name carries one, the mode token as the tool's *first* argument.
+`cmake --install`, `cmake -E env ./x --build` and a non-build `docker` are
+therefore `none`, not jobserver. What is never checked is versions and
+generators: the jobserver rows assume make ≥ 4.4, ninja ≥ 1.13 and a Make or
+Ninja generator under `cmake --build`, so an older tool is still admitted as
+jobserver, ignores the fifo and runs at its own default.
+
+Your own count wins too. `make -j8`, `cargo build -j8` and `cmake --build …
+--parallel 8` keep your number over busybee's `MAKEFLAGS`; an `env` assignment
+lands after busybee's environment, so `env MAKEFLAGS=-j8 make` drops the
+injection and `env CMAKE_BUILD_PARALLEL_LEVEL=64 cmake --build …` keeps your
+level, the planned removal going with it. Either way: a notice, and a jobserver
+task holding no tokens — beside the pool, not inside it. The static rows have
+the gap the `xcodebuild` row spells out — `go build -p N`, `ctest -j N` and
+`pytest -n N` beat the `GOMAXPROCS`, `CTEST_PARALLEL_LEVEL` and `PYTEST_ADDOPTS`
+values busybee injects, while the lease holds the smaller share it was admitted
+at, so the tool oversubscribes it.
 
 **none** is the honest default for a command busybee cannot reason about: a
 benchmark, a render, an opaque `sh -c '…'`. It takes the whole pool and
 everything else waits — safe but wasteful, so name a better class when you can.
 
-[#8](https://github.com/githappens/busybee/issues/8) adds `BUSYBEE_CLASS` and
-`BUSYBEE_CORES` to every task's environment — the remedy for a tool hidden
-inside a script. Until it lands the script sees neither, so keep the fallback:
+Every task's environment carries `BUSYBEE_CLASS` and `BUSYBEE_CORES` — the
+remedy for a tool hidden inside a script. Keep a fallback anyway, so the script
+still runs when it is invoked outside busybee:
 
 ```bash
 busybee --class static --cores 4 -- ./scripts/bench.sh

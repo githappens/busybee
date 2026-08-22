@@ -126,6 +126,12 @@ pub enum Inject {
     Cmake,
     /// `MAKEFLAGS`, `CARGO_MAKEFLAGS`, and `RUST_TEST_THREADS`.
     Cargo,
+    /// [`Inject::Cargo`] with the fifo authentication left out: the test-thread
+    /// cap only. What a `cargo` row keeps when an override forces it off the
+    /// pool — those threads take no tokens either way, so without the cap a
+    /// static lease holding `--cores N` would still start the machine's
+    /// default number of them.
+    CargoCores,
     /// Append `-jobs {cores-1}` to argv.
     Xcodebuild,
     /// `GOMAXPROCS`.
@@ -301,6 +307,10 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
             Class::Static | Class::None,
             Inject::Xcodebuild | Inject::Go | Inject::Ctest | Inject::Pytest,
         ) => table_inject,
+        // `docs/design/bzbd.md` §Classification: forcing static/none keeps a
+        // core-count injection and drops a fifo one. Cargo's recipe is the one
+        // that carries both, so it degrades rather than disappearing.
+        (Class::Static | Class::None, Inject::Cargo) => Inject::CargoCores,
         _ => Inject::None,
     };
 
@@ -366,6 +376,14 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
             "--cores is ignored for jobserver commands; the shared pool rebalances on its own"
                 .to_string(),
         ),
+        // An exclusive lease drains the whole pool by definition
+        // (`Scheduler::drain_target`), so a count cannot be honoured. Left
+        // unset rather than carried, so `busybee status` cannot report a
+        // number nothing acts on.
+        (Class::None, Some(_)) => plan.notices.push(
+            "--cores is ignored for an exclusive command; it holds the whole pool until it ends"
+                .to_string(),
+        ),
         (_, cores) => plan.cores_wanted = cores,
     }
 
@@ -429,6 +447,7 @@ fn apply_injection(plan: &mut Plan, inject: Inject, user_flag: bool) {
                 plan.argv.push("{cores-1}".to_string());
             }
         }
+        Inject::CargoCores => set(plan, "RUST_TEST_THREADS", "{cores}"),
         Inject::Go => set(plan, "GOMAXPROCS", "{cores}"),
         Inject::Ctest => set(plan, "CTEST_PARALLEL_LEVEL", "{cores}"),
         Inject::Pytest => plan
@@ -786,6 +805,68 @@ mod tests {
         );
         assert!(plan.notices.iter().any(|n| n.contains("BUSYBEE_CLASS")));
         assert!(plan.notices.iter().any(|n| n.contains("BUSYBEE_CORES")));
+    }
+
+    /// `docs/design/bzbd.md` §Classification: forcing static or none off the
+    /// pool "keeps a core-count injection and drops a fifo one". Cargo's
+    /// recipe carries both, and its test threads take no tokens whichever
+    /// class the lease ends up in — so dropping the cap with the
+    /// authentication would let a lease holding `--cores N` still start the
+    /// machine's default number of them.
+    #[test]
+    fn forcing_cargo_off_the_pool_keeps_its_test_thread_cap() {
+        for class in [Class::Static, Class::None] {
+            let plan = classify(
+                &["cargo".to_string(), "test".to_string()],
+                &Overrides {
+                    class: Some(class),
+                    cores: Some(2),
+                },
+                &default_table(),
+            );
+
+            assert_eq!(plan.class, class);
+            let name = |k: &str| plan.env_set.iter().any(|(key, _)| key == k);
+            assert!(
+                name("RUST_TEST_THREADS"),
+                "{class:?} lost the cap: {:?}",
+                plan.env_set
+            );
+            assert!(
+                !name("MAKEFLAGS") && !name("CARGO_MAKEFLAGS"),
+                "{class:?} kept the fifo authentication: {:?}",
+                plan.env_set
+            );
+        }
+    }
+
+    /// A count an exclusive lease cannot honour is said out loud rather than
+    /// dropped: `drain_target` gives `Class::None` the whole pool whatever the
+    /// caller asked for, and a request that quietly did something other than
+    /// what was typed is the failure this project calls a silent fallback.
+    #[test]
+    fn a_cores_count_an_exclusive_lease_cannot_honour_is_announced() {
+        let plan = classify(
+            &["unknown-tool".to_string()],
+            &Overrides {
+                class: None,
+                cores: Some(2),
+            },
+            &default_table(),
+        );
+
+        assert_eq!(plan.class, Class::None);
+        assert_eq!(
+            plan.cores_wanted, None,
+            "a count nothing acts on is not carried"
+        );
+        assert!(
+            plan.notices
+                .iter()
+                .any(|n| n.contains("--cores is ignored")),
+            "the caller was not told: {:?}",
+            plan.notices
+        );
     }
 
     #[test]

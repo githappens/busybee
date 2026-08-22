@@ -123,7 +123,7 @@ busybee: command exited 0 (elapsed 2m14s)
 
 A `none` task reports the pool rather than a held count: it is admitted alone, so the cores it holds a token for understate what it was granted.
 
-Notices the daemon raises about the request itself (an override it will not honour) precede `Queued`, since a `--detach` client returns on that event and would never see one raised after it.
+Notices the classifier raises about the request itself (a `-j` that defeats the pool, a `--cores` the class ignores) precede `Queued`, since a `--detach` client returns on that event and would never see one raised after it. A notice raised at admission — a static drain that found no token within its deadline — follows `Queued` and precedes `Admitted`.
 
 Exit-code mapping is unchanged (`bzb-core/src/exit_code.rs`).
 
@@ -141,7 +141,7 @@ No silent fallbacks anywhere: if bzbd cannot create its fifo or socket it refuse
 | event | behaviour |
 |---|---|
 | client disconnects while queued | lease dropped |
-| client disconnects while running | pueue task killed (SIGINT → SIGKILL escalation as today), tokens returned. The admission machine forgets the lease at once, but the next admission waits until pueued reports the task gone: a task that ignores the first signal is still on the machine, and starting its replacement meanwhile would run two exclusive tasks at once. The teardown is written to `leases.json` before the signal is sent, so a daemon killed between the two resumes it rather than adopting the task as a lease whose cancellation it never heard of |
+| client disconnects while running | pueue task killed (SIGINT → SIGKILL escalation as today), tokens returned once pueued reports the task gone — not when the signal is sent: a static task that ignores the first signal is still running at its full width, and a jobserver build would take returned tokens at once and oversubscribe the pool. The admission machine forgets the lease at once, but the next admission waits for the same report: starting a replacement meanwhile would run two exclusive tasks at once. The teardown is written to `leases.json` before the signal is sent, so a daemon killed between the two resumes it rather than adopting the task as a lease whose cancellation it never heard of |
 | task goes live after its lease was torn down | the drain finished and the task launched while the teardown was in flight. bzbd reports `Started` regardless; the admission machine no longer tracks the lease, so it answers with a second drop and the task is killed and its tokens returned. Never swallowed: an ignored late `Started` would leak both the process and its tokens |
 | a submission to pueued goes unanswered | the task id is in the answer, so bzbd cannot tell a submission that never landed from one pueued has already started — and `start_immediately` starts it on arrival. The next poll looks for it by label and creation time; anything found is killed like any other orphan, and nothing is admitted until that is settled |
 | a drain comes up short, or collects nothing at all | not a failure: the task starts with what was collected, the implicit token providing the minimum of one, and `Started` reports the real count. Only a drain that cannot run at all (fifo unreadable, submission rejected) ends the lease. Treating exhaustion as a failure would stop a second static task from ever running once the first drained the pool |
@@ -200,13 +200,18 @@ Reload is SIGHUP or `busybee config reload`, which is the same reload over the
 socket so the client can report a refusal instead of leaving it in the log. New
 `Params` go to `Scheduler::set_params`; a changed `pool_size` is applied by
 releasing or acquiring the delta on the fifo, never taking it below the tokens
-currently held — a shrink that cannot complete is logged and finishes as the
-holding leases end. `busybee config show` prints the effective configuration,
-defaults merged, as TOML.
+currently held — a shrink that cannot complete is logged, the rest booked as
+owed, and finishes as the holding leases end: a static grant is withheld as it
+is released, and what a jobserver build returns straight to the fifo is taken
+from there on the next poll, and before any admission — the poll that sees a
+build end drives the admission its end made room for, which would otherwise
+start on the returned tokens. A token taken either way pays the shrink once.
+`busybee config show` prints the effective configuration, defaults merged, as
+TOML.
 
 ## Observability
 
-`busybee status [--json]`: free tokens, held tokens, each lease (id, label, tool, class, cores, state, elapsed, ahead-count). `tool` is the basename `classify` recognised, which is what decides the class; `label` is the caller's `--name` when there is one, so the two are separate fields. Until the classification and injection work lands, admission still gives every lease the `none` class, so `tool` is reported for the operator while `class` reads `none` whatever the tool is — and a `none` lease holds the machine rather than a token count, which is what its `cores` column says. The monitor TUI reads the same data: pool gauge plus one row per lease. Jobserver tasks show an *estimated* "using ~N" (`pool − FIONREAD − Σ held`, attributed by counting compiler processes in each task's process group), labelled approximate and never used for scheduling.
+`busybee status [--json]`: free tokens, held tokens, each lease (id, label, tool, class, cores, state, elapsed, ahead-count). `tool` is the basename `classify` recognised, which is what decides the class; `label` is the caller's `--name` when there is one, so the two are separate fields. A `none` lease holds the machine rather than a token count, which is what its `cores` column says. The monitor TUI reads the same data: pool gauge plus one row per lease. Jobserver tasks show an *estimated* "using ~N" (`pool − FIONREAD − Σ held`, attributed by counting compiler processes in each task's process group), labelled approximate and never used for scheduling.
 
 `--json` prints `StatusReply` verbatim as one line, plus `approx_in_use` (`pool_size − free − held`, clamped at 0) so the estimate above does not have to be re-derived. The status command does not auto-start bzbd: asking what the pool is doing should not create the pool, and reporting a daemon that failed to start as an idle machine would be the silent fallback this document rules out everywhere else. With no daemon listening there is usually no pool and nothing being gated, so the client says so on stderr and exits 0, leaving stdout empty rather than inventing an all-zero reply. The exception is a bzbd that died with leases live: its tasks keep running (§Failure and recovery) and `leases.json` still records them, so the client reports that instead and exits non-zero — the pool is not idle and it cannot say what it holds.
 

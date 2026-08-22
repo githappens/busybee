@@ -127,6 +127,27 @@ async fn status(daemon: &Fixture) -> StatusReply {
     }
 }
 
+/// Waits for every token to be back in the pool. A teardown holds its task's
+/// tokens until pueued reports the task gone, which is a poll after the lease
+/// itself left the books, so a test that ended a running task has to wait for
+/// both before the pool reads whole.
+async fn wait_for_pool_restored(daemon: &Fixture, patience: Duration) -> StatusReply {
+    let deadline = tokio::time::Instant::now() + patience;
+    loop {
+        let status = status(daemon).await;
+        if status.held == 0 && status.free == status.pool_size {
+            return status;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pool was still {} free and {} held after {patience:?}",
+            status.free,
+            status.held
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Polls `status` until it holds no leases, or fails after `patience`.
 async fn wait_for_no_leases(daemon: &Fixture, patience: Duration) -> StatusReply {
     let deadline = tokio::time::Instant::now() + patience;
@@ -722,7 +743,11 @@ async fn a_client_killed_with_sigkill_takes_its_task_with_it() {
     client.wait().expect("reap the client");
 
     wait_for_task_to_end(&pueued.config_path, task, Duration::from_secs(2)).await;
-    let status = wait_for_no_leases(&daemon, Duration::from_secs(2)).await;
+    wait_for_no_leases(&daemon, Duration::from_secs(2)).await;
+    // The lease leaves the books when the client dies, but its tokens do not:
+    // the teardown holds them until pueued confirms the task gone, a poll
+    // later. `busybee status` reports the pool itself, so it shows that gap.
+    let status = wait_for_pool_restored(&daemon, Duration::from_secs(5)).await;
     assert_eq!((status.held, status.free), (0, 4));
 }
 

@@ -24,7 +24,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use bzb_core::{
-    classify::{classify, default_table, Class, Overrides},
+    classify::{classify, default_table, Class, Overrides, Plan, Table},
+    config::{Config, StaticDefault},
     enqueue::{shell_escape_join, TaskSpec},
     errors::BusybeeError,
     exit_code::task_result_to_exit_code,
@@ -38,6 +39,7 @@ use pueue_lib::{message::Signal, task::Task, task::TaskStatus};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
+    inject::inject,
     recovery::{Record, Recovered},
     submit::Pueue,
 };
@@ -46,6 +48,11 @@ use crate::{
 /// §Failure and recovery fixes the cadence at one second — the same one the
 /// client polled at before the broker.
 const POLL: Duration = Duration::from_secs(1);
+
+/// How often the fifo's token count is checked against the leases' books.
+/// Rare on purpose: it is a backstop for tokens a tool lost or invented, not
+/// part of admission.
+const ACCOUNTING: Duration = Duration::from_secs(10);
 
 /// The exit code a lease reports when its own client hung up: nobody is left
 /// to read it, but the code has to say the task did not finish on its own.
@@ -70,11 +77,12 @@ pub enum Command {
         lease: LeaseId,
         known: oneshot::Sender<bool>,
     },
-    Status(oneshot::Sender<StatusReply>),
+    Status(oneshot::Sender<Result<StatusReply>>),
     /// A reloaded config file. Acknowledged, so a caller that has to report
-    /// the reload only does so once the scheduler is actually running on it.
-    SetParams {
-        params: Params,
+    /// the reload only does so once the actor is actually running on it.
+    /// Boxed: a whole `Config` in the variant would grow every message.
+    SetConfig {
+        config: Box<Config>,
         done: oneshot::Sender<()>,
     },
     /// The daemon is stopping. Its tasks are not: `leases.json` is written
@@ -112,16 +120,21 @@ impl Handle {
     pub async fn status(&self) -> Result<StatusReply> {
         let (tx, rx) = oneshot::channel();
         self.send(Command::Status(tx)).await?;
-        rx.await.context("the lease actor dropped a status request")
+        rx.await
+            .context("the lease actor dropped a status request")?
     }
 
-    /// Hands the scheduler a reloaded configuration's admission parameters,
-    /// returning once it has taken them.
-    pub async fn set_params(&self, params: Params) -> Result<()> {
+    /// Hands the actor a reloaded configuration, returning once it is in
+    /// force: the scheduler on its parameters, the fifo resized to its pool.
+    pub async fn set_config(&self, config: Config) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.send(Command::SetParams { params, done: tx }).await?;
+        self.send(Command::SetConfig {
+            config: Box::new(config),
+            done: tx,
+        })
+        .await?;
         rx.await
-            .context("the lease actor dropped a set-params request")
+            .context("the lease actor dropped a set-config request")
     }
 
     /// Has the actor write its books down and hand the fifo to the tasks
@@ -147,7 +160,9 @@ struct Lease {
     /// the lease is over. `None` for a lease adopted from a previous daemon,
     /// whose client went with that daemon.
     conn: Option<Events>,
-    class: Class,
+    /// What to run and how, from `classify`; its placeholders are filled in
+    /// at admission.
+    plan: Plan,
     pueue_task_id: Option<usize>,
     cores_held: u32,
     started_at: SystemTime,
@@ -169,11 +184,10 @@ impl Lease {
             .unwrap_or_else(|| shell_escape_join(&self.request.argv))
     }
 
-    /// The tool column of `busybee status`: the basename `classify` finds under
-    /// the wrappers. Reporting only — admission still gives every lease
-    /// `Class::None` until the injection work lands.
+    /// The tool column of `busybee status`: the basename `classify` found
+    /// under the wrappers, already on the plan admission was sized from.
     fn tool(&self) -> String {
-        classify(&self.request.argv, &Overrides::default(), &default_table()).tool
+        self.plan.tool.clone()
     }
 
     /// The lease as `leases.json` records it.
@@ -182,7 +196,7 @@ impl Lease {
             id: id.0,
             label: self.label(),
             argv: self.request.argv.clone(),
-            class: self.class,
+            class: self.plan.class,
             cores_held: self.cores_held,
             pueue_task_id: self.pueue_task_id,
             started_at_unix_ms: unix_ms(self.started_at),
@@ -204,6 +218,13 @@ pub struct Leases {
     /// machine whose tasks shut down slowly needs longer, and the tests need
     /// a grace they cannot race.
     kill_grace: Duration,
+    /// How long a static drain waits for its tokens before starting with
+    /// what it has.
+    drain_deadline: Duration,
+    /// The classification table with the config file's rows layered on.
+    table: Table,
+    /// The `cores_wanted` a static lease without a `--cores` starts from.
+    static_default: StaticDefault,
     leases: BTreeMap<LeaseId, Lease>,
     next_id: u64,
     pueue: Pueue,
@@ -261,9 +282,10 @@ impl Leases {
     /// (`crate::recovery`): adopted leases hold their slots and tokens from
     /// the first admission on, teardowns in flight hold admissions back until
     /// pueued confirms their task gone, and ids carry on from after theirs.
+    /// `recovered` carries the pool: it is seeded short of what the leases it
+    /// adopted still hold, so the fifo is never created here.
     pub fn new(
-        params: Params,
-        kill_grace: Duration,
+        config: &Config,
         recovered: Recovered,
         leases_path: PathBuf,
     ) -> (Self, Handle, mpsc::Receiver<Command>) {
@@ -274,11 +296,15 @@ impl Leases {
             debt,
         } = recovered;
         let (tx, rx) = mpsc::channel(64);
+        let params = config.params();
         let mut actor = Self {
             scheduler: Scheduler::new(params),
             params,
             jobserver,
-            kill_grace,
+            kill_grace: Duration::from_millis(config.kill_grace_ms),
+            drain_deadline: Duration::from_millis(config.drain_deadline_ms),
+            table: table(config),
+            static_default: config.defaults.r#static,
             leases: BTreeMap::new(),
             next_id: 1,
             pueue: Pueue::default(),
@@ -304,7 +330,7 @@ impl Leases {
             actor.killing.insert(
                 task_id,
                 Kill {
-                    deadline: Instant::now() + kill_grace,
+                    deadline: Instant::now() + Duration::from_millis(config.kill_grace_ms),
                     escalated: false,
                     record: Some(record),
                 },
@@ -312,6 +338,7 @@ impl Leases {
         }
         for record in adopted {
             let id = LeaseId(record.id);
+            let argv = record.argv.clone();
             actor.next_id = actor.next_id.max(record.id + 1);
             actor.scheduler.adopt(
                 LeaseSpec {
@@ -340,7 +367,16 @@ impl Leases {
                         detached: true,
                     },
                     conn: None,
-                    class: record.class,
+                    // The task is already running under the class it was
+                    // admitted as, so the record wins over what its argv
+                    // classifies to now — an override or a config row edited
+                    // since would otherwise re-label a task in flight. The
+                    // rest of the plan is only reporting for an orphan: its
+                    // env and argv were applied before this daemon existed.
+                    plan: Plan {
+                        class: record.class,
+                        ..classify(&argv, &Overrides::default(), &actor.table)
+                    },
                     pueue_task_id: record.pueue_task_id,
                     cores_held: record.cores_held,
                     started_at: UNIX_EPOCH + Duration::from_millis(record.started_at_unix_ms),
@@ -360,6 +396,7 @@ impl Leases {
     pub async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
         self.resume_teardowns().await;
         let mut ticker = tokio::time::interval(POLL);
+        let mut accounting = tokio::time::interval(ACCOUNTING);
         loop {
             tokio::select! {
                 command = commands.recv() => match command {
@@ -368,7 +405,11 @@ impl Leases {
                     // can reach us again.
                     None => break,
                 },
-                _ = ticker.tick() => self.poll().await,
+                _ = ticker.tick() => {
+                    self.poll().await;
+                    self.collect_debt();
+                }
+                _ = accounting.tick() => self.account(),
             }
         }
     }
@@ -407,12 +448,11 @@ impl Leases {
                 // were cancelling; the lease is over either way.
                 let _ = known.send(live);
             }
-            Command::SetParams { params, done } => {
-                self.params = params;
+            Command::SetConfig { config, done } => {
                 // Driven, not discarded: a raised pool or max_concurrent can
                 // make the queue head admissible right now, and nothing else
                 // is going to happen until a running task ends.
-                let actions = self.scheduler.set_params(params);
+                let actions = self.reconfigure(&config);
                 self.drive(actions).await;
                 // Gone only if the reloading caller stopped waiting.
                 let _ = done.send(());
@@ -434,6 +474,164 @@ impl Leases {
         }
     }
 
+    /// Tokens out on a task's behalf: its lease's, or — once the lease is
+    /// gone — the teardown's, or a submission's whose answer never came, until
+    /// pueued confirms what became of the task. The three sets are disjoint:
+    /// `drop_lease` and `hold_unanswered` both take the lease out of the map
+    /// before its record goes on either list.
+    fn held(&self) -> u32 {
+        self.leases.values().map(|l| l.cores_held).sum::<u32>()
+            + self
+                .killing
+                .values()
+                .filter_map(|k| k.record.as_ref())
+                .map(|r| r.cores_held)
+                .sum::<u32>()
+            + self.unreconciled.iter().map(|r| r.cores_held).sum::<u32>()
+    }
+
+    /// Whether any token is legitimately out of the fifo without a lease's
+    /// books saying so: a jobserver task takes and returns tokens directly,
+    /// and a teardown or an unanswered submission holds its own.
+    fn tokens_in_flight(&self) -> bool {
+        self.holding()
+            || self
+                .leases
+                .values()
+                .any(|l| l.plan.class == Class::Jobserver && l.pueue_task_id.is_some())
+    }
+
+    /// The fifo's token count against the leases' books. Tokens above the
+    /// pool — a tool wrote bytes it never read, or the pool shrank while a
+    /// lease held them — are drained; a shortfall is only reported, since
+    /// whoever holds those tokens is the one to return them.
+    fn account(&mut self) {
+        let free = match self.jobserver.free() {
+            Ok(free) => free,
+            Err(err) => {
+                tracing::error!("cannot count the pool's free tokens: {err}");
+                return;
+            }
+        };
+        let held = self.held();
+        let pool = self.params.pool_size;
+        if free + held > pool {
+            self.take_excess(free, held);
+        } else if free + held < pool && !self.tokens_in_flight() {
+            tracing::warn!(
+                free,
+                held,
+                pool,
+                deficit = pool - free - held,
+                "the pool is short of tokens; a task did not return them"
+            );
+        }
+    }
+
+    /// Removes the tokens free above the pool, and pays the pool's debt with
+    /// them: a token taken out of existence here is one `release` no longer
+    /// has to withhold, or the next static grant would be short by tokens
+    /// that were already gone.
+    fn take_excess(&mut self, free: u32, held: u32) {
+        let pool = self.params.pool_size;
+        match self.jobserver.drain_excess(pool.saturating_sub(held)) {
+            // Nothing free to take: the tokens above the pool are out with
+            // leases, which the shrink that put them there has said already.
+            Ok(0) => {}
+            Ok(drained) => {
+                self.debt -= drained.min(self.debt);
+                tracing::warn!(
+                    free,
+                    held,
+                    pool,
+                    drained,
+                    debt = self.debt,
+                    "the pool held excess tokens: a tool wrote more than it read, or the pool shrank"
+                );
+            }
+            Err(err) => tracing::error!("cannot drain the excess tokens: {err}"),
+        }
+    }
+
+    /// Collects what the pool is owed from the tokens free above it. A static
+    /// grant pays on its release; a jobserver build returns its tokens
+    /// straight to the fifo, where `release` never sees them, so they are
+    /// taken from there — on every poll while anything is owed, since a build
+    /// would otherwise run on them until the accounting check came round, and
+    /// before every admission, since the poll that sees a build end drives
+    /// the admission its end made room for before the tick is over.
+    fn collect_debt(&mut self) {
+        if self.debt == 0 {
+            return;
+        }
+        let free = match self.jobserver.free() {
+            Ok(free) => free,
+            Err(err) => {
+                tracing::error!("cannot count the pool's free tokens: {err}");
+                return;
+            }
+        };
+        let held = self.held();
+        if free + held > self.params.pool_size {
+            self.take_excess(free, held);
+        }
+    }
+
+    /// Puts a reloaded configuration in force: the pool-size delta on the
+    /// fifo, then the scheduler's parameters, the drain deadline and the
+    /// override table. Returns what the scheduler has to say about the new
+    /// capacity.
+    fn reconfigure(&mut self, config: &Config) -> Vec<Action> {
+        let params = config.params();
+        self.resize_pool(params.pool_size);
+        self.params = params;
+        self.drain_deadline = Duration::from_millis(config.drain_deadline_ms);
+        self.table = table(config);
+        self.static_default = config.defaults.r#static;
+        self.scheduler.set_params(params)
+    }
+
+    /// Applies a changed `pool_size` to the fifo (`docs/design/bzbd.md`
+    /// §Configuration): a grown pool releases the delta; a shrunk one drains
+    /// what is free, never taking tokens back from a lease that holds them —
+    /// the rest of a shrink is logged here and finished by the accounting
+    /// check as the holding leases end.
+    fn resize_pool(&mut self, pool_size: u32) {
+        let old = self.params.pool_size;
+        if pool_size > old {
+            self.release(pool_size - old);
+        } else if pool_size < old {
+            let held = self.held();
+            let wanted = old - pool_size;
+            match self.jobserver.drain_excess(pool_size.saturating_sub(held)) {
+                Ok(drained) if drained == wanted => {}
+                Ok(drained) => {
+                    // What could not be drained is owed: those tokens are out
+                    // with leases, and the pool has no room for them when they
+                    // come back. Booking the shortfall as debt is what makes
+                    // `release` withhold it — logging alone would hand the
+                    // whole grant back and let the next admission run on a
+                    // pool wider than the file now says, well before the
+                    // accounting check comes round.
+                    self.debt += wanted - drained;
+                    tracing::warn!(
+                        old,
+                        new = pool_size,
+                        drained,
+                        held,
+                        debt = self.debt,
+                        "the pool shrank by more than was free; the rest is owed as the leases holding it end"
+                    );
+                }
+                Err(err) => {
+                    // Nothing came out, so the whole shrink is owed.
+                    self.debt += wanted;
+                    tracing::error!(debt = self.debt, "cannot shrink the pool: {err}");
+                }
+            }
+        }
+    }
+
     async fn submit(
         &mut self,
         request: LeaseRequest,
@@ -445,15 +643,21 @@ impl Leases {
         // Everything else in the map was submitted before this one, and the
         // queue is FIFO: they are exactly what it is waiting behind.
         let ahead = self.leases.len();
-        // Classification arrives with the injection work; until then every
-        // task is exclusive, which is what busybee did before the broker.
-        let class = Class::None;
-        let unhonoured_override =
-            request.class_override.is_some() || request.cores_wanted.is_some();
+        let overrides = Overrides {
+            class: request.class_override,
+            cores: request.cores_wanted,
+        };
+        let mut plan = classify(&request.argv, &overrides, &self.table);
+        // `[defaults] static` from the config file: what a static lease asks
+        // for when its caller did not say. The classifier never sets
+        // `cores_wanted` for a jobserver lease, and neither does this.
+        if plan.class == Class::Static && plan.cores_wanted.is_none() {
+            plan.cores_wanted = self.static_default.cores_wanted();
+        }
         let lease = Lease {
             request,
             conn: Some(events),
-            class,
+            plan,
             pueue_task_id: None,
             cores_held: 0,
             started_at: SystemTime::now(),
@@ -462,8 +666,8 @@ impl Leases {
         };
         let spec = LeaseSpec {
             id,
-            class,
-            cores_wanted: lease.request.cores_wanted,
+            class: lease.plan.class,
+            cores_wanted: lease.plan.cores_wanted,
             label: lease.label(),
         };
         self.leases.insert(id, lease);
@@ -475,20 +679,12 @@ impl Leases {
             self.persist();
             return;
         }
-        // An override the daemon cannot act on yet is said out loud: accepting
-        // one and running the task exclusive anyway would tell the caller their
-        // scheduling choice took effect when it did not. It goes out before
+        // What the classifier had to say about the command — a `-j` that
+        // defeats the pool, a `--cores` that is ignored — goes out before
         // `Queued`, because that event is where a `--detach` client stops
-        // reading — a notice after it would never reach one.
-        if unhonoured_override {
-            self.send(
-                id,
-                LeaseEvent::Notice {
-                    text: "--class/--cores are not in effect yet (the injection work is #8); \
-                           this task runs exclusive"
-                        .into(),
-                },
-            );
+        // reading; a notice after it would never reach one.
+        for text in &self.leases[&id].plan.notices {
+            self.send(id, LeaseEvent::Notice { text: text.clone() });
         }
         self.send(id, LeaseEvent::Queued { id: id.0, ahead });
 
@@ -539,7 +735,12 @@ impl Leases {
                     tracing::debug!("holding an admission back until the machine is accounted for");
                     self.deferred.push_back(action);
                 }
-                Action::Admit { id, cores, .. } => pending.extend(self.admit(id, cores).await),
+                Action::Admit {
+                    id,
+                    drain_target,
+                    cores,
+                    ..
+                } => pending.extend(self.admit(id, drain_target, cores).await),
                 Action::Notify { id, ahead } => {
                     // The machine counts queue positions; a client wants to
                     // know how many tasks are in front of it, running ones
@@ -559,33 +760,88 @@ impl Leases {
     }
 
     /// Submits an admitted lease to pueued and tells its client it is running.
-    async fn admit(&mut self, id: LeaseId, cores: Option<u32>) -> Vec<Action> {
-        let Some(lease) = self.leases.get(&id) else {
+    async fn admit(&mut self, id: LeaseId, drain_target: u32, cores: Option<u32>) -> Vec<Action> {
+        if !self.leases.contains_key(&id) {
             // The actor is the only thing that removes leases, and it does not
             // do so between an admission and this call.
             tracing::error!(lease = id.0, "admitted a lease that no longer exists");
             return self.scheduler.handle(Event::DrainFailed(id));
+        }
+
+        // What the pool is owed is taken before anything starts on it. The
+        // build whose end drove this admission has just returned its tokens
+        // to the fifo, old pool and all, and a task submitted now would read
+        // them before the tick's collection came round.
+        self.collect_debt();
+
+        // The drain blocks, for up to the deadline; nothing else the actor
+        // could do meanwhile may run ahead of an admission anyway.
+        let drained = tokio::task::block_in_place(|| {
+            self.jobserver.acquire(drain_target, self.drain_deadline)
+        });
+        let got = match drained {
+            Ok(got) => got,
+            Err(err) => {
+                tracing::error!(lease = id.0, "cannot drain the pool: {err}");
+                return self.refuse(id, format!("bzbd could not drain the token pool: {err}"));
+            }
         };
+        if drain_target > 0 && got == 0 {
+            // Token exhaustion, not a failure: the task runs on the implicit
+            // token, and is told so rather than left to wonder why it is slow.
+            self.send(
+                id,
+                LeaseEvent::Notice {
+                    text: format!(
+                        "no token was free within {} ms; starting on the implicit token only",
+                        self.drain_deadline.as_millis()
+                    ),
+                },
+            );
+        }
+        let lease = self.leases.get(&id).expect("checked above");
+        // A jobserver lease is told the fair share the machine sized it at;
+        // anything else is told the tokens it actually holds, with the
+        // implicit one as the minimum.
+        let share = cores.unwrap_or(got.max(1));
+        let injected = inject(
+            &lease.plan,
+            lease.request.argv.len(),
+            lease.request.env.clone(),
+            &self.jobserver.path().display().to_string(),
+            share,
+        );
         let spec = TaskSpec {
-            command: shell_escape_join(&lease.request.argv),
+            command: shell_escape_join(&injected.argv),
             cwd: lease.request.cwd.clone(),
-            env: lease.request.env.clone(),
+            env: injected.env,
             label: Some(lease.label()),
             // The group is at `parallel_tasks = 0`, so pueue's dispatcher will
             // never start it: admission is bzbd's decision and it has been made.
             start_immediately: true,
         };
-        let class = lease.class;
+        let class = lease.plan.class;
 
         // On record before the submission goes out, not after the answer
         // comes back: pueued starts the task on arrival, and a daemon killed
         // before it could write the task id down would otherwise leave a
         // record that looks never admitted over a task that is running. The
         // time is what a restart matches the task by.
+        // The tokens are the lease's from here on, and the record says so
+        // before the submission goes out for the same reason the time does:
+        // a successor that found the task running with no grant against it
+        // would seed those tokens a second time.
         let sent_at = SystemTime::now();
         let lease = self.leases.get_mut(&id).expect("checked above");
         lease.submitted_at = Some(sent_at);
-        self.persist();
+        lease.cores_held = got;
+        if let Err(err) = self.try_persist() {
+            tracing::error!(lease = id.0, "cannot record the grant: {err:#}");
+            return self.refuse(
+                id,
+                format!("bzbd could not record the lease before starting it: {err:#}"),
+            );
+        }
         let task_id = match self.pueue.add(spec).await {
             Ok(task_id) => task_id,
             Err(err) => {
@@ -611,8 +867,9 @@ impl Leases {
 
         let lease = self.leases.get_mut(&id).expect("checked above");
         lease.pueue_task_id = Some(task_id);
-        // Still none: the fifo drain arrives with the injection work, and an
-        // exclusive lease owns the machine without holding a token either way.
+        // What the drain actually got, already on record from before the
+        // submission. An exclusive lease holds none: it owns the machine
+        // without taking a token from the pool.
         let cores_held = lease.cores_held;
         self.persist();
 
@@ -631,6 +888,23 @@ impl Leases {
             },
         );
         self.scheduler.handle(Event::Started { id, cores_held })
+    }
+
+    /// Ends an admitted lease that could not be launched at all: the machine
+    /// hears `DrainFailed`, and the client hears why its command is not going
+    /// to run. Never silent. Nothing went to pueued, so unlike a failed
+    /// submission there is no task to go looking for afterwards.
+    fn refuse(&mut self, id: LeaseId, reason: String) -> Vec<Action> {
+        let actions = self.scheduler.handle(Event::DrainFailed(id));
+        // The machine's teardown has no task id to act on; the lease ends
+        // here instead.
+        let actions = actions
+            .into_iter()
+            .filter(|a| !matches!(a, Action::Drop(dropped) if *dropped == id))
+            .collect();
+        self.send(id, LeaseEvent::Notice { text: reason });
+        self.finish(id, 1);
+        actions
     }
 
     /// Ends a lease whose submission went unanswered. pueued may have started
@@ -954,7 +1228,14 @@ impl Leases {
         }
     }
 
-    fn status(&self) -> StatusReply {
+    fn status(&self) -> Result<StatusReply> {
+        // The real count, not the machine's estimate: jobserver tasks take and
+        // return tokens the machine never sees, and a teardown's are still out
+        // until pueued confirms its task gone.
+        let free = self
+            .jobserver
+            .free()
+            .context("cannot count the pool's free tokens")?;
         let snapshot = self.scheduler.snapshot();
         let leases = snapshot
             .admitted
@@ -991,18 +1272,29 @@ impl Leases {
                 }
             })
             .collect();
-        StatusReply {
+        Ok(StatusReply {
             pool_size: self.params.pool_size,
-            free: snapshot.free_estimate,
-            held: snapshot.admitted.iter().map(|l| l.cores_held).sum(),
+            free,
+            held: self.held(),
             leases,
-        }
+        })
     }
 
     /// Rewrites `leases.json`, which is what a restarted bzbd reads to find the
     /// tasks it left running: the leases, the teardowns it has not seen
     /// through, and the submissions it has not heard back on.
     fn persist(&self) {
+        if let Err(err) = self.try_persist() {
+            // Not fatal to the leases themselves, but a restart would forget
+            // them, so it is never swallowed.
+            tracing::error!("cannot record the leases: {err:#}");
+        }
+    }
+
+    /// [`Self::persist`] for the one caller that cannot carry on without it:
+    /// a grant the file will not take is one a successor would seed a second
+    /// time, so the task does not start on it.
+    fn try_persist(&self) -> Result<()> {
         let records: Vec<Record> = self
             .leases
             .iter()
@@ -1010,11 +1302,7 @@ impl Leases {
             .chain(self.killing.values().filter_map(|k| k.record.clone()))
             .chain(self.unreconciled.iter().cloned())
             .collect();
-        if let Err(err) = write_json(&self.leases_path, &records) {
-            // Not fatal to the leases themselves, but a restart would forget
-            // them, so it is never swallowed.
-            tracing::error!("cannot record the leases: {err:#}");
-        }
+        write_json(&self.leases_path, &records)
     }
 }
 
@@ -1117,6 +1405,14 @@ fn elapsed_ms(since: SystemTime) -> u64 {
             0
         }
     }
+}
+
+/// The built-in classification table with the config file's rows layered on.
+/// Rebuilt on every reload: an override that was removed has to disappear.
+fn table(config: &Config) -> Table {
+    let mut table = default_table();
+    config.apply_overrides(&mut table);
+    table
 }
 
 #[cfg(test)]
@@ -1278,9 +1574,20 @@ mod tests {
         max_concurrent: 4,
     };
 
-    /// The default grace; these tests drive the escalation by hand rather than
-    /// waiting on it.
-    const TEST_KILL_GRACE: Duration = Duration::from_millis(1000);
+    /// The defaults with `PARAMS` on top: the actor takes the whole config
+    /// now, for the drain deadline, the grace and the override table as well
+    /// as the scheduler's parameters.
+    fn test_config() -> Config {
+        let mut config = Config::defaults().expect("the defaults are a valid config");
+        config.pool_size = PARAMS.pool_size;
+        config.max_concurrent = PARAMS.max_concurrent;
+        config
+    }
+
+    /// The grace `test_config` carries; these tests drive the escalation by
+    /// hand rather than waiting on it.
+    const TEST_KILL_GRACE: Duration =
+        Duration::from_millis(bzb_core::config::DEFAULT_KILL_GRACE_MS);
 
     /// An actor on a fresh pool in `directory`, with nothing recovered
     /// unless `recovered` says otherwise. The caller holds the umask: the
@@ -1292,8 +1599,7 @@ mod tests {
         let jobserver = Jobserver::create(directory, PARAMS.pool_size).expect("a fifo");
         let (adopted, killing, debt) = recovered(&jobserver);
         let (actor, _handle, _commands) = Leases::new(
-            PARAMS,
-            TEST_KILL_GRACE,
+            &test_config(),
             Recovered {
                 jobserver,
                 adopted,
@@ -1364,7 +1670,7 @@ mod tests {
             )
             .await;
 
-        let status = actor.status();
+        let status = actor.status().expect("the fifo is readable");
         assert_eq!(status.leases.len(), 1, "leases were {:?}", status.leases);
         assert_eq!(status.leases[0].state, "queued");
         assert_eq!(status.leases[0].pueue_task_id, None);
@@ -1462,7 +1768,14 @@ mod tests {
                     detached: false,
                 },
                 conn: None,
-                class: Class::Static,
+                plan: Plan {
+                    class: Class::Static,
+                    ..classify(
+                        &["make".to_string()],
+                        &Overrides::default(),
+                        &default_table(),
+                    )
+                },
                 pueue_task_id: None,
                 cores_held: 2,
                 started_at: SystemTime::now(),
@@ -1538,6 +1851,75 @@ mod tests {
         actor.finish(LeaseId(5), 0);
 
         assert_eq!(free(&actor), 4, "the pool grew past its size");
+        assert_eq!(actor.debt, 0);
+    }
+
+    /// A shrink owed by a jobserver build is in the fifo the moment the
+    /// build ends, and so is the admission its end drives, in the same poll.
+    /// What is owed is collected before that admission goes out, not after
+    /// the tick: a build started on the excess would run at the old pool's
+    /// width.
+    // Multi-threaded: the drain in `admit` is a `block_in_place`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shrink_is_collected_before_the_admission_it_made_room_for() {
+        let _umask = crate::tests::hold_umask(0o022);
+        let directory = tempfile::tempdir().expect("create a tempdir");
+        let mut actor = actor(directory.path(), |_| (Vec::new(), Vec::new(), 0));
+        // A teardown in flight holds the admission back, so that it can be
+        // driven by hand once the pool is in the state a build's end leaves
+        // it in.
+        actor.killing.insert(
+            9,
+            Kill {
+                deadline: Instant::now() + TEST_KILL_GRACE,
+                escalated: false,
+                record: None,
+            },
+        );
+        let (events, _stream) = mpsc::unbounded_channel();
+        let (id, asked) = oneshot::channel();
+        actor
+            .submit(
+                LeaseRequest {
+                    argv: vec!["make".into()],
+                    cwd: PathBuf::from("/tmp"),
+                    env: Default::default(),
+                    label: None,
+                    class_override: None,
+                    cores_wanted: None,
+                    detached: false,
+                },
+                events,
+                id,
+            )
+            .await;
+        asked.await.expect("the submission names its lease");
+        assert!(
+            matches!(actor.deferred.front(), Some(Action::Admit { .. })),
+            "the admission was not held back: {:?}",
+            actor.deferred
+        );
+
+        // The pool shrank from four to two under a build holding all four;
+        // the build has ended and its tokens are back, two more than the
+        // pool has room for.
+        actor.params.pool_size = 2;
+        actor.debt = 2;
+        assert_eq!(free(&actor), 4);
+        // Stops the admission short of pueued: a record that cannot be
+        // written refuses the lease, leaving the fifo as it was when the
+        // submission would have gone out.
+        std::fs::create_dir(directory.path().join("leases.json.tmp")).expect("plant the directory");
+
+        actor.killing.clear();
+        let waiting = std::mem::take(&mut actor.deferred);
+        actor.drive(waiting.into()).await;
+
+        assert_eq!(
+            free(&actor),
+            2,
+            "the admission went out on a pool the shrink had not been collected from"
+        );
         assert_eq!(actor.debt, 0);
     }
 

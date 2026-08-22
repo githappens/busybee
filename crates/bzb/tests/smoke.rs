@@ -45,16 +45,21 @@ impl Busybee {
              so the client has a daemon to start",
             bzbd.display()
         );
-        Some(Self {
-            _pueue: pueue,
-            tmp: TempDir::new().expect("create tempdir"),
-        })
+        let tmp = TempDir::new().expect("create tempdir");
+        // A config file of the test's own: the pool size is pinned rather
+        // than left to the core count of whatever runs the tests, and the
+        // developer's config stays out of it.
+        std::fs::write(tmp.path().join("config.toml"), "pool_size = 4\n")
+            .expect("write the config");
+        Some(Self { _pueue: pueue, tmp })
     }
 
-    /// A `busybee` invocation pointed at this test's daemons.
+    /// A `busybee` invocation pointed at this test's daemons. The bzbd it
+    /// auto-starts inherits this environment, config file included.
     fn cmd(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_busybee"));
         cmd.env("BUSYBEE_STATE_DIR", self.state_dir())
+            .env("BUSYBEE_CONFIG", self.tmp.path().join("config.toml"))
             .env("PUEUE_CONFIG_PATH", &self._pueue.config_path)
             .args(args);
         cmd
@@ -231,11 +236,10 @@ fn busybee_s_own_lines_go_to_stderr_in_lease_order() {
     }
 }
 
-/// `--class`/`--cores` reach the task through the daemon's injection, which
-/// lands with the classification work (#8).
+/// `--class`/`--cores` reach the task through the daemon's injection: the
+/// task is told the static share it actually holds.
 #[test]
 #[serial_test::serial]
-#[ignore = "needs the daemon-side injection from #8"]
 fn a_static_task_is_told_how_many_cores_it_holds() {
     let Some(busybee) = Busybee::start() else {
         return;

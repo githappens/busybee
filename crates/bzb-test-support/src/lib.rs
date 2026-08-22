@@ -84,6 +84,11 @@ impl PueuedFixture {
         );
     }
 
+    /// The daemon's pid, for a test that signals it.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Kills the daemon now, for a test about what happens when pueued dies.
     /// Idempotent: `Drop` kills it again and does not mind.
     pub fn kill(&mut self) {
