@@ -73,8 +73,9 @@ jobs:
             codex_at=$(jq -r '[.[] | select(.user.login==env.REVIEWER and .commit_id==env.HEAD) | .submitted_at] | max // empty' <<<"$reviews")
             comment_at=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
               --jq '[.[] | select(.user.login==env.REVIEWER and .created_at > env.HEAD_DATE) | .created_at] | max // empty')
+            # 👀 only means "reviewing"; it is not a verdict, so it does not count as activity.
             reaction_at=$(gh api "repos/$REPO/issues/$PR/reactions" --paginate \
-              --jq '[.[] | select(.user.login==env.REVIEWER and .created_at > env.HEAD_DATE) | .created_at] | max // empty')
+              --jq '[.[] | select(.user.login==env.REVIEWER and .content != "eyes" and .created_at > env.HEAD_DATE) | .created_at] | max // empty')
             latest=$(printf '%s\n%s\n%s\n' "$codex_at" "$comment_at" "$reaction_at" | sort | tail -1)
             gate_at=$(jq -r '[.[] | select(.user.login==env.GATE and .commit_id==env.HEAD) | .submitted_at] | max // empty' <<<"$reviews")
             if [ -n "$latest" ] && { [ -z "$gate_at" ] || [[ "$latest" > "$gate_at" ]]; }; then
