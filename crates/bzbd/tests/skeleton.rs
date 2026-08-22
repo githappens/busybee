@@ -5,6 +5,7 @@
 
 use std::{
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command},
     time::{Duration, Instant},
@@ -22,32 +23,41 @@ const BZBD: &str = env!("CARGO_BIN_EXE_bzbd");
 /// A foreground `bzbd` with its own state directory, killed on drop.
 struct Fixture {
     child: Child,
-    tmp: TempDir,
+    state: PathBuf,
+    /// Kept for its drop: it takes the state directory with it.
+    _tmp: TempDir,
 }
 
 impl Fixture {
     fn start() -> Self {
         let tmp = TempDir::new().expect("create tempdir");
+        // A directory bzbd has to create itself, so its mode is the daemon's
+        // doing rather than tempfile's.
+        let state = tmp.path().join("state");
         let child = Command::new(BZBD)
             .arg("--foreground")
-            .env("BUSYBEE_STATE_DIR", tmp.path())
+            .env("BUSYBEE_STATE_DIR", &state)
             .spawn()
             .expect("spawn bzbd");
-        let fixture = Self { child, tmp };
+        let fixture = Self {
+            child,
+            state,
+            _tmp: tmp,
+        };
         wait_for(&fixture.socket_path(), true);
         fixture
     }
 
     fn state_dir(&self) -> &Path {
-        self.tmp.path()
+        &self.state
     }
 
     fn socket_path(&self) -> PathBuf {
-        self.tmp.path().join("bzbd.sock")
+        self.state.join("bzbd.sock")
     }
 
     fn pid_path(&self) -> PathBuf {
-        self.tmp.path().join("bzbd.pid")
+        self.state.join("bzbd.pid")
     }
 }
 
@@ -98,6 +108,34 @@ async fn ping_reports_the_crate_version_and_the_daemon_pid() {
         }
         other => panic!("expected a Pong, got {other:?}"),
     }
+}
+
+/// The socket is the daemon's whole control surface, and it lives wherever the
+/// state directory does. Under the usual 022 umask both would otherwise be
+/// readable and connectable by every other user on the machine.
+#[tokio::test]
+async fn the_state_directory_and_the_socket_are_owner_only() {
+    let daemon = Fixture::start();
+
+    assert_eq!(
+        mode(daemon.state_dir()),
+        0o700,
+        "the state directory {} is not owner-only",
+        daemon.state_dir().display()
+    );
+    assert_eq!(
+        mode(&daemon.socket_path()),
+        0o600,
+        "the socket is not owner-only"
+    );
+}
+
+fn mode(path: &Path) -> u32 {
+    fs::metadata(path)
+        .unwrap_or_else(|err| panic!("stat {}: {err}", path.display()))
+        .permissions()
+        .mode()
+        & 0o777
 }
 
 #[tokio::test]

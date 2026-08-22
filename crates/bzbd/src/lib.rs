@@ -5,9 +5,12 @@
 //! admission and pueue submission arrive with the scheduler.
 
 use std::{
-    fs::{File, OpenOptions},
+    fs::{File, OpenOptions, Permissions},
     io::{self, Read, Write},
-    os::fd::{AsRawFd, FromRawFd},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::PermissionsExt,
+    },
     path::Path,
     sync::{
         mpsc::{self, RecvTimeoutError, Sender},
@@ -35,8 +38,7 @@ pub fn run() -> Result<()> {
     let foreground = parse_args(std::env::args().skip(1))?;
 
     let dir = state_dir()?;
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("cannot create the state directory {}", dir.display()))?;
+    create_state_dir(&dir)?;
     let log = log_path()?;
 
     // Fork before the runtime exists: a forked child inherits no threads.
@@ -59,6 +61,17 @@ pub fn run() -> Result<()> {
         ready.report(&format!("{err:#}"));
     }
     result
+}
+
+/// Creates the state directory owner-only. The socket inside it is the
+/// daemon's whole control surface, so on a shared machine the usual 022 umask
+/// would hand every other user a way in.
+fn create_state_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("cannot create the state directory {}", dir.display()))?;
+    // Also for a directory that already existed: it may predate this.
+    std::fs::set_permissions(dir, Permissions::from_mode(0o700))
+        .with_context(|| format!("cannot restrict the state directory {}", dir.display()))
 }
 
 /// Everything that happens after the fork, so a failure has one place to be
@@ -105,6 +118,11 @@ async fn serve(socket: &Path, pid_file: &Path, ready: &mut Ready) -> Result<()> 
     }
     let listener = UnixListener::bind(socket)
         .with_context(|| format!("cannot bind the socket {}", socket.display()))?;
+    // Belt and braces: the owner-only state directory already keeps other
+    // users from reaching this path, which is also what covers the moment
+    // between the bind and this chmod.
+    std::fs::set_permissions(socket, Permissions::from_mode(0o600))
+        .with_context(|| format!("cannot restrict the socket {}", socket.display()))?;
     tracing::info!(socket = %socket.display(), pid = std::process::id(), "bzbd listening");
 
     // The socket accepts connections and SIGTERM will be caught: only now may
