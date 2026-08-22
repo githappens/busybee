@@ -83,9 +83,9 @@ early.
 
 | tool | class | how it gets its share |
 |---|---|---|
-| `make`, `gmake` (≥ 4.4) | jobserver | `MAKEFLAGS=--jobserver-auth=fifo:…` |
-| `ninja` (≥ 1.13) | jobserver | same |
-| `cmake --build` (Make/Ninja generators) | jobserver | same, via the generator; `CMAKE_BUILD_PARALLEL_LEVEL` is removed |
+| `make`, `gmake` | jobserver | `MAKEFLAGS=--jobserver-auth=fifo:…` |
+| `ninja` | jobserver | same |
+| `cmake --build` | jobserver | same, via the generator; `CMAKE_BUILD_PARALLEL_LEVEL` is removed |
 | `cargo` | jobserver | `MAKEFLAGS`, `CARGO_MAKEFLAGS`, `RUST_TEST_THREADS`; the `rustc` processes cargo spawns take tokens through it |
 | `xcodebuild` | static | argv `-jobs`, one below its tokens (`-jobs N` runs N+1 compiles) |
 | `go` | static | `GOMAXPROCS=N` |
@@ -93,9 +93,12 @@ early.
 | `pytest` | static | `PYTEST_ADDOPTS` gains `-n N` |
 | `docker build`, everything else | none | nothing injected — the task runs alone |
 
-**Your own count wins.** `make -j8`, `ninja -j8`, `cargo build -j8` and
-`cmake --build … --parallel 8` keep your number: no injection, no tokens, a
-notice saying so — that task runs beside the pool rather than inside it.
+**Matched, not checked.** busybee classifies on the executable name alone. The
+jobserver rows assume make ≥ 4.4, ninja ≥ 1.13 and a Make or Ninja generator
+under `cmake --build`; nothing verifies it, so an older tool is still admitted
+as jobserver, ignores the fifo and runs at its own default. Your own count wins
+too: `make -j8`, `cargo build -j8`, `cmake --build … --parallel 8` keep your
+number — no injection, no tokens, a notice saying so, running beside the pool.
 
 **none** is the honest default for a command busybee cannot reason about: a
 benchmark, a render, an opaque `sh -c '…'`. It takes the whole pool and
@@ -214,9 +217,6 @@ saying roughly this:
     To see what the machine is doing, use `busybee status --json` — one JSON
     line with the pool and every lease. Do not query pueue directly; busybee
     owns that queue.
-
-What counts as heavy on your machine is yours to set — busybee just provides
-the gate.
 
 ## Architecture
 
