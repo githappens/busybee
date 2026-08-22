@@ -123,6 +123,20 @@ tool = "make"
 no_notices = true
 
 [[case]]
+name = "an abbreviated make long option still takes the next argument"
+argv = ["make", "--inc", "-j8"]
+class = "jobserver"
+tool = "make"
+no_notices = true
+
+[[case]]
+name = "an abbreviated make --jobs is flagged"
+argv = ["make", "--jo=8"]
+class = "jobserver"
+tool = "make"
+notices_contain = ["--jo=8"]
+
+[[case]]
 name = "make treats everything after -- as targets"
 argv = ["make", "--", "-j8"]
 class = "jobserver"

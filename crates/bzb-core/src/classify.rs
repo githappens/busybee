@@ -435,10 +435,17 @@ fn find_make_jobs_flag(args: &[String]) -> Option<&str> {
             return None; // `--`: only operands follow
         }
         if option.starts_with('-') {
-            if flag_matches("--jobs", arg) {
+            // An empty value is not a job count; `--jobs=` never runs anyway.
+            if make_long_option_matches("--jobs", arg) && !arg.ends_with('=') {
                 return Some(arg);
             }
-            if MAKE_REQUIRED_VALUE_LONG_OPTIONS.contains(&arg.as_str()) {
+            // Without `=` the mandatory value is the next argument, whatever it
+            // looks like (`make --inc -j8` includes a directory named `-j8`).
+            if !arg.contains('=')
+                && MAKE_REQUIRED_VALUE_LONG_OPTIONS
+                    .iter()
+                    .any(|long| make_long_option_matches(long, arg))
+            {
                 rest.next();
             }
             continue;
@@ -460,6 +467,17 @@ fn find_make_jobs_flag(args: &[String]) -> Option<&str> {
         }
     }
     None
+}
+
+/// Whether `arg` names the long option `name`. GNU make takes any unambiguous
+/// prefix (`--inc` is `--include-dir`, `--jo` is `--jobs`), optionally with a
+/// glued `=value`. Prefixes that are ambiguous in real make (`--j` is both
+/// `--jobs` and `--just-print`) are matched here too, but make rejects those
+/// command lines outright, so nothing runs on the wrong reading.
+fn make_long_option_matches(name: &str, arg: &str) -> bool {
+    let option = arg.split_once('=').map_or(arg, |(option, _)| option);
+    // `--` alone is the option terminator, not an abbreviation of everything.
+    option.len() > 2 && name.starts_with(option)
 }
 
 fn flag_notice(tool: &str, flag: &str, inject: Inject, class: Class) -> String {
