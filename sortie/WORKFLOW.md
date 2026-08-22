@@ -112,6 +112,15 @@ reactions:
     escalation: label
     escalation_label: needs-human
     poll_interval_ms: 60000
+  # A failing check on the PR head -> continuation turn with the log excerpt.
+  # CI runs on Linux and macOS while agents develop on one of them, so
+  # platform-specific failures are expected and must be fixed by the agent.
+  ci_failure:
+    provider: github
+    max_retries: 3
+    max_log_lines: 80
+    escalation: label
+    escalation_label: needs-human
   merge_completion:
     provider: github
     target_state: sortie:done
@@ -210,7 +219,7 @@ When the acceptance criteria pass locally:
    back to you as a continuation turn; the PR merges automatically once the
    review reports no findings and CI is green. Human review comments also
    come back as continuation turns.
-{{ if or .run.is_continuation .review_comments .bot_review_comments .merge_conflict }}
+{{ if or .run.is_continuation .review_comments .bot_review_comments .merge_conflict .ci_failure }}
 
 ## Continuation
 
@@ -270,8 +279,27 @@ committing, amending, rebasing or pushing. A new push triggers a fresh automated
 review; the PR merges automatically once that review reports no findings and CI
 is green.
 {{ end }}
+{{ if .ci_failure }}
+
+### CI failure to fix
+
+{{ .ci_failure.failing_count }} check(s) on the PR head `{{ .ci_failure.ref }}` failed:
+{{ range .ci_failure.check_runs }}- {{ .name }}: {{ .conclusion }} ({{ .details_url }})
 {{ end }}
-{{ if and .attempt (not .run.is_continuation) (not .review_comments) (not .bot_review_comments) (not .merge_conflict) }}
+Log excerpt from the first failing check:
+
+```
+{{ .ci_failure.log_excerpt }}
+```
+
+CI runs the suite on both Linux and macOS; you develop on one of them, so the
+usual cause is platform-specific behaviour (socket semantics, error kinds,
+signals, filesystem details). Reproduce from the log, fix the code or the test so
+it holds on both platforms (never gate a test on one OS to make it pass), rerun
+the full test suite, and push.
+{{ end }}
+{{ end }}
+{{ if and .attempt (not .run.is_continuation) (not .review_comments) (not .bot_review_comments) (not .merge_conflict) (not .ci_failure) }}
 
 ## Retry (attempt {{ .attempt }})
 
