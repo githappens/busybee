@@ -797,6 +797,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_reload_the_scheduler_never_took_leaves_the_running_config_alone() {
+        // A mask a tempdir survives, held so the owner-only test cannot set
+        // its own while this one is creating files.
+        let _umask = hold_umask(0o022);
         let tmp = tempfile::tempdir().expect("create tempdir");
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "pool_size = 4\n").expect("write the config");
@@ -833,6 +836,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn a_reload_in_flight_holds_the_next_one_off() {
+        // A mask a tempdir survives, held so the owner-only test cannot set
+        // its own while this one is creating files.
+        let _umask = hold_umask(0o022);
         let tmp = tempfile::tempdir().expect("create tempdir");
         let path = tmp.path().join("config.toml");
         std::fs::write(&path, "pool_size = 4\n").expect("write the config");
