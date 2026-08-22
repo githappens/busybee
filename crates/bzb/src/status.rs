@@ -5,11 +5,19 @@
 //! daemon reports and computes nothing of its own beyond `approx_in_use`,
 //! which is arithmetic on the numbers in the reply.
 
+use std::time::Duration;
+
 use anyhow::{bail, Result};
 use bzb_core::{
     daemon::{socket_path, Connection},
     protocol::{LeaseView, Request, Response, StatusReply},
 };
+
+/// How long the daemon has to answer, once it has handshaken. The handshake's
+/// own deadline ends at the pong, and this command has none of its own — a
+/// daemon that wedges after it would hold `status` open for as long as it stays
+/// wedged.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Asks the running daemon for a status and prints it.
 ///
@@ -31,8 +39,18 @@ pub async fn run(json: bool) -> Result<()> {
         return Ok(());
     };
 
-    conn.send(Request::Status).await?;
-    let reply = match conn.recv().await? {
+    let exchange = async {
+        conn.send(Request::Status).await?;
+        conn.recv().await
+    };
+    let response = match tokio::time::timeout(REPLY_TIMEOUT, exchange).await {
+        Ok(result) => result?,
+        Err(_) => bail!(
+            "bzbd took the status request but did not answer within {} seconds",
+            REPLY_TIMEOUT.as_secs()
+        ),
+    };
+    let reply = match response {
         Response::Status(reply) => reply,
         Response::Error { message } => bail!("bzbd refused the status request: {message}"),
         other => bail!("expected a status reply from bzbd, got {other:?}"),

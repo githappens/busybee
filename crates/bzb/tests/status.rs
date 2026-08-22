@@ -315,6 +315,48 @@ async fn a_daemon_that_hangs_up_mid_handshake_is_reported_as_a_failure() {
     assert!(stderr.contains("bzbd"), "stderr was {stderr:?}");
 }
 
+/// The handshake's own deadline ends at the pong. A daemon that answers it and
+/// then wedges leaves this one-shot command with nothing of its own to give up
+/// on, so the request-and-reply is bounded too.
+#[tokio::test]
+async fn a_daemon_that_never_answers_the_status_request_gives_up() {
+    let state = TempDir::new().expect("create tempdir");
+    let listener = UnixListener::bind(state.path().join("bzbd.sock")).expect("bind");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(reader).lines();
+        lines.next_line().await.expect("read").expect("a hello");
+        respond(
+            &mut writer,
+            Response::Pong {
+                version: "test".into(),
+                pid: std::process::id(),
+            },
+        )
+        .await;
+        // Handshaken, and from here on silent. Holding the connection open is
+        // the point: nothing answers the `Status` and nothing closes on it.
+        std::future::pending::<()>().await;
+    });
+
+    let started = Instant::now();
+    let output = run_status(state.path(), &[]).await;
+
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "busybee status waited {:?} on a wedged daemon",
+        started.elapsed()
+    );
+    assert!(
+        !output.status.success(),
+        "busybee status exited {}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("did not answer"), "stderr was {stderr:?}");
+}
+
 /// No daemon means no pool and nothing being gated, which is a true report and
 /// not a failure. stdout stays empty so a `--json` consumer never mistakes the
 /// message for a reply.
