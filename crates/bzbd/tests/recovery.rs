@@ -203,6 +203,25 @@ async fn pueue(config: &Path) -> pueue_lib::Client {
         .expect("connect to pueued")
 }
 
+/// Waits for pueued to report the task actually running. bzbd submits with
+/// `start_immediately`, but pueued still reports the task `Queued` for a
+/// moment first, and a test that signals it inside that window ends it
+/// outright instead of exercising a task that is on the machine.
+async fn wait_for_task_to_run(config: &Path, task_id: usize, patience: Duration) {
+    let deadline = tokio::time::Instant::now() + patience;
+    loop {
+        let status = task_status(config, task_id).await;
+        if matches!(status, Some(TaskStatus::Running { .. })) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pueue task {task_id} was still {status:?} after {patience:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Polls pueued directly: the task has to be gone from the machine, not just
 /// from bzbd's books.
 async fn wait_for_task_to_end(config: &Path, task_id: usize, patience: Duration) {
@@ -468,17 +487,19 @@ async fn a_restarted_daemon_finishes_the_teardown_it_was_killed_in() {
     // would make the test pass or fail on how busy the machine is.
     let (conn, _, survivor) = run(&daemon, request(&["sh", "-c", "trap '' TERM; sleep 300"])).await;
 
+    // Established, not assumed: the signal has to reach a task pueued is
+    // actually running, or it ends the task rather than being ignored by it.
+    wait_for_task_to_run(&pueued.config_path, survivor, Duration::from_secs(5)).await;
+
     // The client hangs up; the daemon sends SIGTERM and waits for pueued to
-    // confirm the task gone, which it will not for another second.
+    // confirm the task gone, which it will not while the task ignores it.
     drop(conn);
     wait_for_teardown_record(&daemon, Duration::from_secs(2));
     daemon.kill();
+    let survived = task_status(&pueued.config_path, survivor).await;
     assert!(
-        matches!(
-            task_status(&pueued.config_path, survivor).await,
-            Some(TaskStatus::Running { .. })
-        ),
-        "the task did not survive SIGTERM"
+        matches!(survived, Some(TaskStatus::Running { .. })),
+        "the task did not survive SIGTERM; pueued reports {survived:?}"
     );
     // A daemon with the drain (#8) would have recorded the tokens the task
     // holds; see the module comment.
