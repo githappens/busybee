@@ -803,6 +803,81 @@ async fn a_reloaded_pool_size_resizes_the_fifo_around_what_is_held() {
     }
 }
 
+/// `docs/design/bzbd.md` §Configuration: a shrink the free tokens cannot
+/// cover finishes as the holding leases end. A jobserver build returns its
+/// tokens straight to the fifo, where no `release` withholds them, so the
+/// daemon collects what it is owed from there — on the poll, since a build
+/// would run on those tokens until the accounting check came round — and
+/// only once: a debt already collected must not be taken again from the
+/// next static lease's release.
+#[tokio::test]
+async fn a_shrink_under_a_make_is_collected_from_what_it_returns() {
+    if !make_available() {
+        return;
+    }
+    let Some(pueued) = PueuedFixture::try_start() else {
+        return;
+    };
+    let daemon = pool(&pueued.config_path, 4);
+    let dir = build_dir();
+
+    let mut make = submit(&daemon, request(&["make"], dir.path())).await;
+    assert_eq!(queued(&mut make).await, 0);
+    assert_eq!(admitted(&mut make).await.0, "jobserver");
+    // Not before the build holds the whole pool: a shrink that finds its
+    // tokens free completes on the spot and owes nothing.
+    let deadline = Instant::now() + PATIENCE;
+    while status(&daemon).await.free > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "make never took every token of the pool"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    daemon.write_config("pool_size = 2\n");
+    reload(&daemon).await;
+    let log = std::fs::read_to_string(daemon.log_path()).expect("read the log");
+    assert!(
+        log.lines()
+            .any(|l| l.contains("WARN") && l.contains("shrank")),
+        "the shrink found its tokens free, so nothing is owed; log:\n{log}"
+    );
+    assert_eq!(finished(&mut make).await, 0);
+
+    // The build handed its tokens back to a pool with room for two of them.
+    // The deadline is shorter than the accounting interval on purpose: the
+    // check would drain the excess eventually, and a test that allowed it
+    // to would pass while the next build ran on four tokens meanwhile.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status = status(&daemon).await;
+        if status.free == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the shrink was not collected from what make returned: {status:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Collected is paid: the next static grant comes back whole.
+    let mut request = request(&["true"], dir.path());
+    request.class_override = Some(Class::Static);
+    request.cores_wanted = Some(2);
+    let mut conn = submit(&daemon, request).await;
+    assert_eq!(queued(&mut conn).await, 0);
+    assert_eq!(admitted(&mut conn).await, ("static".to_string(), 2, 2, 0));
+    assert_eq!(finished(&mut conn).await, 0);
+    let status = status(&daemon).await;
+    assert_eq!(
+        (status.free, status.held),
+        (2, 0),
+        "a debt collected from the fifo was withheld again from a release: {status:?}"
+    );
+}
+
 async fn reload(daemon: &Fixture) {
     let mut conn = connect(daemon).await;
     conn.send(Request::ConfigReload)

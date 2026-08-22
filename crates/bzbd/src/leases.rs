@@ -405,7 +405,10 @@ impl Leases {
                     // can reach us again.
                     None => break,
                 },
-                _ = ticker.tick() => self.poll().await,
+                _ = ticker.tick() => {
+                    self.poll().await;
+                    self.collect_debt();
+                }
                 _ = accounting.tick() => self.account(),
             }
         }
@@ -502,7 +505,7 @@ impl Leases {
     /// pool — a tool wrote bytes it never read, or the pool shrank while a
     /// lease held them — are drained; a shortfall is only reported, since
     /// whoever holds those tokens is the one to return them.
-    fn account(&self) {
+    fn account(&mut self) {
         let free = match self.jobserver.free() {
             Ok(free) => free,
             Err(err) => {
@@ -513,16 +516,7 @@ impl Leases {
         let held = self.held();
         let pool = self.params.pool_size;
         if free + held > pool {
-            match self.jobserver.drain_excess(pool.saturating_sub(held)) {
-                Ok(drained) => tracing::warn!(
-                    free,
-                    held,
-                    pool,
-                    drained,
-                    "the pool held excess tokens: a tool wrote more than it read, or the pool shrank"
-                ),
-                Err(err) => tracing::error!("cannot drain the excess tokens: {err}"),
-            }
+            self.take_excess(free, held);
         } else if free + held < pool && !self.tokens_in_flight() {
             tracing::warn!(
                 free,
@@ -531,6 +525,53 @@ impl Leases {
                 deficit = pool - free - held,
                 "the pool is short of tokens; a task did not return them"
             );
+        }
+    }
+
+    /// Removes the tokens free above the pool, and pays the pool's debt with
+    /// them: a token taken out of existence here is one `release` no longer
+    /// has to withhold, or the next static grant would be short by tokens
+    /// that were already gone.
+    fn take_excess(&mut self, free: u32, held: u32) {
+        let pool = self.params.pool_size;
+        match self.jobserver.drain_excess(pool.saturating_sub(held)) {
+            // Nothing free to take: the tokens above the pool are out with
+            // leases, which the shrink that put them there has said already.
+            Ok(0) => {}
+            Ok(drained) => {
+                self.debt -= drained.min(self.debt);
+                tracing::warn!(
+                    free,
+                    held,
+                    pool,
+                    drained,
+                    debt = self.debt,
+                    "the pool held excess tokens: a tool wrote more than it read, or the pool shrank"
+                );
+            }
+            Err(err) => tracing::error!("cannot drain the excess tokens: {err}"),
+        }
+    }
+
+    /// Collects what the pool is owed from the tokens free above it. A static
+    /// grant pays on its release; a jobserver build returns its tokens
+    /// straight to the fifo, where `release` never sees them, so they are
+    /// taken from there — on every poll while anything is owed, since a build
+    /// would otherwise run on them until the accounting check came round.
+    fn collect_debt(&mut self) {
+        if self.debt == 0 {
+            return;
+        }
+        let free = match self.jobserver.free() {
+            Ok(free) => free,
+            Err(err) => {
+                tracing::error!("cannot count the pool's free tokens: {err}");
+                return;
+            }
+        };
+        let held = self.held();
+        if free + held > self.params.pool_size {
+            self.take_excess(free, held);
         }
     }
 
