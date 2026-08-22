@@ -32,6 +32,16 @@ Flag tests that were weakened, skipped, or removed to make a change pass, and ne
 behaviour without a test named in the issue. Integration tests must spawn their
 own `pueued`/`bzbd` in a temporary state directory, never the user's instance.
 
+### Stay within the issue's scope
+A finding must concern the change under review: the issue's acceptance criteria,
+the spec sections it touches, and the rules above. Do not flag hardening,
+robustness, or style improvements to code the pull request did not need to
+touch, and do not open a new line of findings on code that exists only to
+satisfy an earlier finding unless that code is actually wrong. Mention
+out-of-scope improvements in the review summary as follow-up suggestions, not as
+findings; the author files them as issues. A pull request that keeps growing to
+absorb adjacent improvements never converges.
+
 ### Public repository hygiene
 Flag machine-, user-, or workspace-specific details in code, comments, fixtures,
 docs, or commit messages: home-directory paths, host names, other project names.
