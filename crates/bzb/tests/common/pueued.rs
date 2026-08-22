@@ -18,8 +18,15 @@ pub struct PueuedFixture {
 
 impl PueuedFixture {
     pub fn try_start() -> Option<Self> {
-        if which::which("pueued").is_err() {
-            eprintln!("pueued not on PATH; skipping integration test");
+        Self::start_program("pueued", Duration::from_secs(3))
+    }
+
+    /// Spawns `program --config <generated config>` and waits `timeout` for the
+    /// socket. `None` means only "`program` is not on `PATH`"; a program that
+    /// starts and never binds panics.
+    fn start_program(program: &str, timeout: Duration) -> Option<Self> {
+        if which::which(program).is_err() {
+            eprintln!("{program} not on PATH; skipping integration test");
             return None;
         }
         let tmp = TempDir::new().expect("create tempdir");
@@ -42,16 +49,17 @@ impl PueuedFixture {
         );
         std::fs::write(&config_path, config).unwrap();
 
-        let child = Command::new("pueued")
+        let mut child = Command::new(program)
             .arg("--config")
             .arg(&config_path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("spawn pueued");
+            .unwrap_or_else(|e| panic!("spawn {program}: {e}"));
 
-        // Wait up to 3s for the socket to appear.
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // Wait for the socket to appear. A daemon that spawns but never binds
+        // is a broken fixture, not a reason to skip the test.
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if socket_path.exists() {
                 return Some(Self {
@@ -63,10 +71,22 @@ impl PueuedFixture {
             }
             sleep(Duration::from_millis(50));
         }
-        // Didn't come up; clean up and return None.
-        let _ = child.wait_with_output();
-        None
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "{program} did not create {} within {timeout:?}",
+            socket_path.display()
+        );
     }
+}
+
+/// A program that starts and exits without ever binding the socket is a broken
+/// fixture, not a reason to skip: `start_program` must panic, never return
+/// `None`. `true` stands in for such a daemon.
+#[test]
+#[should_panic(expected = "did not create")]
+fn start_program_panics_when_the_daemon_never_binds() {
+    PueuedFixture::start_program("true", Duration::from_millis(200));
 }
 
 impl Drop for PueuedFixture {
