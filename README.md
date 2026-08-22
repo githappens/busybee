@@ -87,7 +87,7 @@ early.
 | `ninja` | jobserver | same |
 | `cmake --build` | jobserver | same, via the generator; `CMAKE_BUILD_PARALLEL_LEVEL` is removed |
 | `cargo` | jobserver | `MAKEFLAGS`, `CARGO_MAKEFLAGS`, `RUST_TEST_THREADS`; the `rustc` processes cargo spawns take tokens through it |
-| `xcodebuild` | static | argv `-jobs`, one below its tokens (`-jobs N` runs N+1 compiles) |
+| `xcodebuild` | static | argv `-jobs max(1, N−1)`, since `-jobs N` runs N+1 compiles; the clamp means a one-token share still allows two |
 | `go` | static | `GOMAXPROCS=N` |
 | `ctest` | static | `CTEST_PARALLEL_LEVEL=N` |
 | `pytest` | static | `PYTEST_ADDOPTS` gains `-n N` |
