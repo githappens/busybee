@@ -70,9 +70,13 @@ TUI plus per-OS CPU sampling), `version_parse.rs` (shared with `build.rs`).
 
 `crates/bzbd/src/`: `lib.rs` (state directory, socket server, lifecycle),
 `leases.rs` (the actor owning the scheduler, the token pool, the live leases
-and the poll of pueue), `recovery.rs` (startup: `leases.json` cross-checked
-against pueue, stale fifos swept, the pool seeded short of what adopted leases
-hold), `submit.rs` (the connection to pueued, reconnected on demand).
+and the poll of pueue), `inject.rs` (pure: a `Plan` plus the fifo path and
+core count → the task's env and argv), `recovery.rs` (startup: `leases.json`
+cross-checked against pueue, stale fifos swept, the pool seeded short of what
+adopted leases hold), `submit.rs` (the connection to pueued, reconnected on
+demand). The pool size, the drain deadline and the override table all come from
+the config file; the integration tests write one of their own
+(`Fixture::start_on`) to run a daemon on a small, deterministic pool.
 
 ## Integration tests
 

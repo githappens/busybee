@@ -5,6 +5,7 @@
 //! pueued. A connection is a lease: `Submit` hands the request to the
 //! [`leases`] actor and streams that lease's events back until it finishes or
 //! the client hangs up.
+pub mod inject;
 pub mod leases;
 pub mod recovery;
 pub mod submit;
@@ -189,23 +190,19 @@ async fn serve(socket: &Path, ready: &mut Ready, config: SharedConfig) -> Result
     let mut interrupt = signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?;
     let mut hangup = signal(SignalKind::hangup()).context("cannot listen for SIGHUP")?;
 
-    // The file the daemon refused to start without: the scheduler opens on the
-    // pool it describes, not on a hardcoded one.
-    let params = config.lock().await.params();
-    let kill_grace_ms = config.lock().await.kill_grace_ms;
+    // The file the daemon refused to start without: the pool, the scheduler,
+    // the drain deadline and the override table all open on what it
+    // describes, not on anything hardcoded.
+    let loaded = config.lock().await.clone();
     // Before the socket exists, and before the fifo: the tasks a previous
     // daemon left running are on the machine, and a lease taken now would be
     // sized as though it were idle — its persist overwriting the only record
-    // of them. A daemon that cannot create its pool refuses to start rather
-    // than running anything ungoverned.
+    // of them. Recovery is what creates the pool, seeded short of what the
+    // leases it adopts still hold. A daemon that cannot create its pool
+    // refuses to start rather than running anything ungoverned.
     let leases_path = bzb_core::daemon::leases_path()?;
-    let recovered = recovery::recover(&state_dir()?, &leases_path, params.pool_size).await?;
-    let (actor, leases, commands) = Leases::new(
-        params,
-        Duration::from_millis(kill_grace_ms),
-        recovered,
-        leases_path,
-    );
+    let recovered = recovery::recover(&state_dir()?, &leases_path, loaded.pool_size).await?;
+    let (actor, leases, commands) = Leases::new(&loaded, recovered, leases_path);
     tokio::spawn(actor.run(commands));
 
     // Nothing else can be listening: this process holds the pid-file lock.
@@ -275,23 +272,21 @@ type SharedConfig = Arc<tokio::sync::Mutex<Config>>;
 /// scheduler last took. The applied values are returned rather than read back
 /// afterwards, for the same reason — the next reload may already own the lock.
 ///
-/// `drain_deadline_ms` is read per drain rather than pushed anywhere, so the
-/// stored [`Config`] is the whole of its application. The pool-size delta on
-/// the fifo is the other half of this and arrives with the drain (#8): until
-/// admission takes tokens from the [`bzb_core::jobserver::Jobserver`] bzbd
-/// seeds at startup, nothing holds any, so there is nothing a resize could
-/// release or acquire and nothing that could be clamped below what is held.
+/// The actor owns everything a reload changes — the scheduler's parameters,
+/// the fifo the pool-size delta is applied to, the drain deadline and the
+/// override table — so the whole [`Config`] goes to it and is applied in one
+/// place.
 async fn reload(config: &SharedConfig, leases: &Handle) -> Result<Applied, String> {
     let mut running = config.lock().await;
     match Config::load() {
         Ok(reloaded) => {
-            // The scheduler goes first, and only what it took is stored and
+            // The actor goes first, and only what it took is stored and
             // logged: on a signal the log is the whole reply, so a line saying
-            // the pool moved must not be readable before it has. A scheduler
+            // the pool moved must not be readable before it has. An actor
             // that cannot be reached is not a refused file either — the daemon
             // is on its way down, and saying the config was rejected would name
             // the wrong cause.
-            leases.set_params(reloaded.params()).await.map_err(|err| {
+            leases.set_config(reloaded.clone()).await.map_err(|err| {
                 format!("config reloaded but the scheduler did not take it: {err:#}")
             })?;
             let applied = Applied {
@@ -367,7 +362,10 @@ async fn handle(stream: UnixStream, leases: Handle, config: SharedConfig) -> Res
         };
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Ping) => pong(),
-            Ok(Request::Status) => Response::Status(leases.status().await?),
+            Ok(Request::Status) => match leases.status().await {
+                Ok(status) => Response::Status(status),
+                Err(err) => Response::error(format!("{err:#}")),
+            },
             // The connection is the lease from here on: it streams that
             // lease's events and answers nothing else.
             Ok(Request::Submit(request)) => {
@@ -667,7 +665,7 @@ fn open_log(log: &Path) -> Result<File> {
 pub(crate) mod tests {
     use super::*;
     use crate::{leases::Command, recovery::Recovered};
-    use bzb_core::{config::DEFAULT_KILL_GRACE_MS, jobserver::Jobserver};
+    use bzb_core::jobserver::Jobserver;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc, MutexGuard, PoisonError,
@@ -846,11 +844,10 @@ pub(crate) mod tests {
         // The actor is never spawned and its receiver is dropped, so every
         // command the handle sends fails the way it would on a daemon that is
         // already on its way down.
-        let params = running.lock().await.params();
+        let loaded = running.lock().await.clone();
         let (_actor, leases, commands) = Leases::new(
-            params,
-            Duration::from_millis(DEFAULT_KILL_GRACE_MS),
-            nothing_to_recover(tmp.path(), params.pool_size),
+            &loaded,
+            nothing_to_recover(tmp.path(), loaded.pool_size),
             tmp.path().join("leases.json"),
         );
         drop(commands);
@@ -890,11 +887,10 @@ pub(crate) mod tests {
         // No actor is spawned: this test is the scheduler, so it decides when
         // a reload's parameters land and can keep one in flight while the next
         // one tries to start.
-        let params = running.lock().await.params();
+        let loaded = running.lock().await.clone();
         let (_actor, leases, mut commands) = Leases::new(
-            params,
-            Duration::from_millis(DEFAULT_KILL_GRACE_MS),
-            nothing_to_recover(tmp.path(), params.pool_size),
+            &loaded,
+            nothing_to_recover(tmp.path(), loaded.pool_size),
             tmp.path().join("leases.json"),
         );
 
@@ -908,11 +904,11 @@ pub(crate) mod tests {
             .await
             .expect("the first reload sent nothing")
         {
-            Command::SetParams { params, done } => {
-                assert_eq!(params.pool_size, 6);
+            Command::SetConfig { config, done } => {
+                assert_eq!(config.pool_size, 6);
                 done
             }
-            _ => panic!("the first reload sent something other than set-params"),
+            _ => panic!("the first reload sent something other than set-config"),
         };
 
         // The first reload is in flight, waiting for the scheduler to take
@@ -939,11 +935,11 @@ pub(crate) mod tests {
             .await
             .expect("the second reload sent nothing")
         {
-            Command::SetParams { params, done } => {
-                assert_eq!(params.pool_size, 8);
+            Command::SetConfig { config, done } => {
+                assert_eq!(config.pool_size, 8);
                 done.send(()).expect("the second reload stopped waiting");
             }
-            _ => panic!("the second reload sent something other than set-params"),
+            _ => panic!("the second reload sent something other than set-config"),
         }
         second
             .await

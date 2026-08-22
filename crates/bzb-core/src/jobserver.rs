@@ -63,10 +63,14 @@ impl Jobserver {
     /// Create `<dir>/jobserver-<pid>` (mode 0600), open it, and seed it with
     /// `pool_size` tokens.
     pub fn create(dir: &Path, pool_size: u32) -> io::Result<Self> {
-        assert!(
-            pool_size <= MAX_POOL,
-            "pool_size {pool_size} exceeds the {MAX_POOL}-byte pipe capacity"
-        );
+        // A configuration error rather than a bug: the pool size comes from
+        // the user, so it is reported, not asserted.
+        if pool_size > MAX_POOL {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("pool_size {pool_size} exceeds the {MAX_POOL}-byte pipe capacity"),
+            ));
+        }
         // Clients split MAKEFLAGS on whitespace (make, ninja, the `jobserver`
         // crate), so a path containing any is silently truncated; reject it.
         let Some(dir) = dir.to_str().filter(|s| !s.contains(char::is_whitespace)) else {

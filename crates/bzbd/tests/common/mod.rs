@@ -24,11 +24,14 @@ pub fn isolated_config(dir: &Path) -> PathBuf {
 }
 
 pub fn sigterm(pid: u32) {
-    assert_eq!(
-        unsafe { libc::kill(pid as i32, libc::SIGTERM) },
-        0,
-        "kill failed"
-    );
+    signal(pid, libc::SIGTERM);
+}
+
+/// Sends an arbitrary signal to any pid — a test's own `pueued` as much as its
+/// daemon, which is why this is a free function and not only a [`Fixture`]
+/// method.
+pub fn signal(pid: u32, signal: libc::c_int) {
+    assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0, "kill failed");
 }
 
 /// A foreground `bzbd` with its own state directory, killed on drop.
