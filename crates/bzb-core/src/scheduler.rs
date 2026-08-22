@@ -26,6 +26,14 @@
 //! The machine is driven by [`Event`]s and answers with [`Action`]s; the
 //! daemon performs the IO (draining fifo tokens, submitting to pueued,
 //! notifying clients) and reports back with `Started`/`Finished`.
+//!
+//! Token accounting contract: the machine tracks tokens but never moves them.
+//! An ending lease's tokens must be back in the fifo before the daemon
+//! performs the actions returned for that event, because the next
+//! [`Action::Admit`] is sized as if they were already free. After
+//! [`Event::Finished`] the daemon has done that itself (the task exited), so
+//! no [`Action::Drop`] accompanies it; [`Event::Cancel`] and
+//! [`Event::DrainFailed`] need teardown, so they get one first.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -77,7 +85,8 @@ pub enum Event {
     Cancel(LeaseId),
     /// The daemon finished the drain and launched the task.
     Started { id: LeaseId, cores_held: u32 },
-    /// The task exited or was killed.
+    /// The task exited or was killed. The daemon has already returned the
+    /// lease's tokens to the fifo, so no [`Action::Drop`] is emitted for it.
     Finished(LeaseId),
     /// The daemon could not collect a single token in time. Should not happen
     /// (the implicit token guarantees one); keeps the machine honest.
@@ -100,7 +109,8 @@ pub enum Action {
     /// are in front of it.
     Notify { id: LeaseId, ahead: usize },
     /// The lease is gone: tear down anything started for it and return its
-    /// tokens.
+    /// tokens. Always emitted before the [`Action::Admit`]s in the same batch,
+    /// which are sized as if those tokens were already free.
     Drop(LeaseId),
 }
 
@@ -209,8 +219,16 @@ impl Scheduler {
     /// Config reload. Already-held tokens are never revoked: a shrunk
     /// `pool_size` only affects future admissions and clamps
     /// [`Snapshot::free_estimate`] at 0.
-    pub fn set_params(&mut self, p: Params) {
+    ///
+    /// Returns actions like [`Scheduler::handle`] does, because a raised
+    /// `max_concurrent` or `pool_size` can make the queue head eligible with
+    /// no other event in sight: without re-evaluating here the new capacity
+    /// would sit unused until a running task ends.
+    pub fn set_params(&mut self, p: Params) -> Vec<Action> {
         self.params = p;
+        let mut actions = self.admit_from_head();
+        actions.extend(self.notify_queue());
+        actions
     }
 
     /// Admit as long as the head qualifies. Only the head is ever considered.
@@ -637,6 +655,62 @@ mod tests {
                 drain_target: 4
             }]
         );
+    }
+
+    #[test]
+    fn set_params_raising_max_concurrent_admits_the_waiting_head() {
+        let mut s = Scheduler::new(params(8, 1));
+        submit_and_start(&mut s, req(1, Class::Jobserver, None), 0);
+        s.handle(Event::Submit(req(2, Class::Jobserver, None)));
+        s.handle(Event::Submit(req(3, Class::Jobserver, None)));
+
+        // Nothing else happens on the machine: without re-evaluation the new
+        // slot would stay unused until a running task ends.
+        let actions = s.set_params(params(8, 2));
+        assert_eq!(
+            actions,
+            vec![
+                Action::Admit {
+                    id: LeaseId(2),
+                    class: Class::Jobserver,
+                    drain_target: 0
+                },
+                Action::Notify {
+                    id: LeaseId(3),
+                    ahead: 0
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn set_params_that_admits_nothing_yields_no_actions() {
+        let mut s = Scheduler::new(params(8, 1));
+        submit_and_start(&mut s, req(1, Class::Jobserver, None), 0);
+        s.handle(Event::Submit(req(2, Class::Jobserver, None)));
+
+        assert_eq!(s.set_params(params(4, 1)), vec![]);
+    }
+
+    #[test]
+    fn finished_releases_the_lease_without_a_drop() {
+        let mut s = Scheduler::new(params(8, 1));
+        submit_and_start(&mut s, req(1, Class::Static, Some(4)), 4);
+        s.handle(Event::Submit(req(2, Class::None, None)));
+
+        // The task already exited, so there is nothing for the daemon to tear
+        // down; it returned the four tokens before feeding `Finished` in, so
+        // the exclusive lease may drain the whole pool.
+        let actions = s.handle(Event::Finished(LeaseId(1)));
+        assert_eq!(
+            actions,
+            vec![Action::Admit {
+                id: LeaseId(2),
+                class: Class::None,
+                drain_target: 8
+            }]
+        );
+        assert_eq!(s.snapshot().free_estimate, 8);
     }
 
     #[test]
