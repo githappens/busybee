@@ -208,7 +208,7 @@ When the acceptance criteria pass locally:
    back to you as a continuation turn; the PR merges automatically once the
    review reports no findings and CI is green. Human review comments also
    come back as continuation turns.
-{{ if .run.is_continuation }}
+{{ if or .run.is_continuation .review_comments .bot_review_comments .merge_conflict }}
 
 ## Continuation
 
@@ -263,7 +263,7 @@ triggers a fresh automated review; the PR merges automatically once that review
 reports no findings and CI is green.
 {{ end }}
 {{ end }}
-{{ if and .attempt (not .run.is_continuation) }}
+{{ if and .attempt (not .run.is_continuation) (not .review_comments) (not .bot_review_comments) (not .merge_conflict) }}
 
 ## Retry (attempt {{ .attempt }})
 
