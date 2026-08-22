@@ -12,7 +12,7 @@ use std::{
 
 use bzb_core::{
     daemon::Connection,
-    protocol::{Request, Response},
+    protocol::{Request, Response, MAX_LINE_BYTES},
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -166,6 +166,76 @@ async fn sigterm_removes_the_socket_and_the_pid_file() {
     assert!(!daemon.socket_path().exists(), "socket outlived SIGTERM");
     assert!(!daemon.pid_path().exists(), "pid file outlived SIGTERM");
     assert!(daemon.child.wait().expect("wait").success());
+}
+
+/// A line with no newline in sight must not be buffered without limit: the
+/// daemon outlives every client, so one hostile connection would otherwise take
+/// it down with the whole machine's memory.
+#[tokio::test]
+async fn an_oversized_hello_is_rejected_instead_of_buffered() {
+    let daemon = Fixture::start();
+
+    let message = oversized_line_error(&daemon, &[]).await;
+
+    assert!(
+        message.contains(&MAX_LINE_BYTES.to_string()),
+        "message was {message:?}"
+    );
+}
+
+/// Same limit after the handshake: the request loop reads from the same socket.
+#[tokio::test]
+async fn an_oversized_request_is_rejected_instead_of_buffered() {
+    let daemon = Fixture::start();
+
+    let message = oversized_line_error(&daemon, b"{\"hello\":1}\n").await;
+
+    assert!(
+        message.contains(&MAX_LINE_BYTES.to_string()),
+        "message was {message:?}"
+    );
+}
+
+/// Sends `prelude` (discarding one reply per line in it), then a newline-free
+/// line one byte over the limit, and returns the error the daemon answers with.
+/// Panics unless the daemon then closes the connection.
+async fn oversized_line_error(daemon: &Fixture, prelude: &[u8]) -> String {
+    let stream = tokio::net::UnixStream::connect(daemon.socket_path())
+        .await
+        .expect("connect");
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    writer.write_all(prelude).await.expect("write prelude");
+    for _ in prelude.iter().filter(|byte| **byte == b'\n') {
+        lines
+            .next_line()
+            .await
+            .expect("read")
+            .expect("a reply line");
+    }
+    // No trailing newline: the daemon has to stop on the byte count alone.
+    writer
+        .write_all(&vec![b'x'; MAX_LINE_BYTES + 1])
+        .await
+        .expect("write an oversized line");
+
+    // A daemon that buffers the line instead of rejecting it never answers, so
+    // this has to fail rather than hang.
+    let reply = tokio::time::timeout(Duration::from_secs(3), lines.next_line())
+        .await
+        .expect("the daemon did not answer within 3s")
+        .expect("read")
+        .expect("a reply line");
+    let message = match serde_json::from_str::<Response>(&reply).expect("decode reply") {
+        Response::Error { message } => message,
+        other => panic!("expected an Error, got {other:?}"),
+    };
+    assert!(
+        lines.next_line().await.expect("read").is_none(),
+        "connection stayed open"
+    );
+    message
 }
 
 #[tokio::test]

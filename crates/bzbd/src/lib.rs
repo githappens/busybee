@@ -19,11 +19,14 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use bzb_core::{
     daemon::{log_path, pid_path, socket_path, state_dir},
-    protocol::{Hello, Request, Response, PROTOCOL_VERSION},
+    protocol::{Hello, Request, Response, MAX_LINE_BYTES, PROTOCOL_VERSION},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    net::{unix::OwnedWriteHalf, UnixListener, UnixStream},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    net::{
+        unix::{OwnedReadHalf, OwnedWriteHalf},
+        UnixListener, UnixStream,
+    },
     signal::unix::{signal, SignalKind},
 };
 use tracing::Level;
@@ -133,10 +136,14 @@ async fn serve(socket: &Path, pid_file: &Path, ready: &mut Ready) -> Result<()> 
 
 async fn handle(stream: UnixStream) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut incoming = BufReader::new(reader).lines();
+    let mut incoming = BufReader::new(reader);
 
-    let Some(first) = incoming.next_line().await? else {
-        return Ok(());
+    let first = match next_line(&mut incoming).await? {
+        Line::Text(line) => line,
+        Line::Closed => return Ok(()),
+        // Dropping the writer closes the connection: a peer that ignores the
+        // limit has nothing left to say that we would read.
+        Line::TooLong => return reply(&mut writer, too_long()).await,
     };
     match serde_json::from_str::<Hello>(&first) {
         Ok(hello) if hello.hello == PROTOCOL_VERSION => {}
@@ -165,7 +172,12 @@ async fn handle(stream: UnixStream) -> Result<()> {
     }
     reply(&mut writer, pong()).await?;
 
-    while let Some(line) = incoming.next_line().await? {
+    loop {
+        let line = match next_line(&mut incoming).await? {
+            Line::Text(line) => line,
+            Line::Closed => return Ok(()),
+            Line::TooLong => return reply(&mut writer, too_long()).await,
+        };
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Ping) => pong(),
             // The token pool arrives with the scheduler. An all-zero StatusReply
@@ -180,7 +192,43 @@ async fn handle(stream: UnixStream) -> Result<()> {
         };
         reply(&mut writer, response).await?;
     }
-    Ok(())
+}
+
+/// What one read off a connection produced.
+enum Line {
+    Text(String),
+    /// The peer closed the connection.
+    Closed,
+    /// No newline within [`MAX_LINE_BYTES`]; the rest of the connection is
+    /// unparseable, since we cannot tell where the next message starts.
+    TooLong,
+}
+
+/// Reads one line, refusing to buffer more than [`MAX_LINE_BYTES`] of it.
+async fn next_line(reader: &mut BufReader<OwnedReadHalf>) -> Result<Line> {
+    let mut line = Vec::new();
+    reader
+        .take(MAX_LINE_BYTES as u64 + 1)
+        .read_until(b'\n', &mut line)
+        .await
+        .context("cannot read a request")?;
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    } else if line.len() > MAX_LINE_BYTES {
+        return Ok(Line::TooLong);
+    } else if line.is_empty() {
+        return Ok(Line::Closed);
+    }
+    // A truncated last line is left to the JSON decoder to reject.
+    Ok(Line::Text(
+        String::from_utf8(line).context("a request line was not valid utf-8")?,
+    ))
+}
+
+fn too_long() -> Response {
+    Response::Error {
+        message: format!("a line longer than {MAX_LINE_BYTES} bytes is not a request"),
+    }
 }
 
 fn pong() -> Response {

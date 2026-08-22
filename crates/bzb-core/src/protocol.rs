@@ -15,6 +15,11 @@ use crate::classify::Class;
 /// Bumped whenever a change to the types below is not backwards compatible.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// The longest line the daemon will read. Anyone who can open the socket could
+/// otherwise stream a newline-free message until the long-lived daemon runs out
+/// of memory; real messages are orders of magnitude smaller than this.
+pub const MAX_LINE_BYTES: usize = 64 * 1024;
+
 /// The client's first line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
