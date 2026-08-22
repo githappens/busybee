@@ -116,10 +116,17 @@ Blocked-by issues (all must already be merged on `main`): {{ range $i, $b := .is
    adjacent refactors, no speculative features. If something outside scope
    blocks you, write `blocked` to `.sortie/status` with one line explaining why,
    and stop.
-3. **Simplest thing that works.** If the `ponytail` skill is available, invoke it
-   before writing code and `ponytail-review` before opening the PR: standard
-   library before dependencies, one function before an abstraction, no
-   speculative flexibility. The issue's acceptance criteria are the whole scope.
+3. **Use these skills when they are available (check the skill list):**
+   - `ponytail:ponytail` before writing any code — simplest solution that
+     works: standard library before dependencies, one function before an
+     abstraction, no speculative flexibility.
+   - `ponytail:ponytail-review` on your diff before opening the PR; delete what
+     it flags.
+   - `superpowers:test-driven-development` while implementing.
+   - `superpowers:systematic-debugging` the moment a test fails unexpectedly or
+     behaviour surprises you — form a hypothesis from evidence before changing
+     code; no guess-and-rerun loops.
+   The issue's acceptance criteria are the whole scope.
 4. **TDD.** Write the failing test named in the issue first, then the code. Never
    weaken, skip, or delete an existing test to get green; if a test disagrees
    with your change, assume the code is wrong until proven otherwise.
