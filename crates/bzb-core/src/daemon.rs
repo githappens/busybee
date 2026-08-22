@@ -76,9 +76,11 @@ impl Connection {
         .await?;
         match conn.recv().await? {
             Response::Pong { .. } => Ok(conn),
-            Response::Error { message } => Err(BusybeeError::DaemonUnreachable {
-                context: format!("bzbd rejected the handshake: {message}"),
-            }),
+            // Reachable but incompatible: a protocol error, not an absent
+            // daemon, so callers do not try to spawn a replacement.
+            Response::Error { message } => Err(BusybeeError::Protocol(format!(
+                "bzbd rejected protocol version {PROTOCOL_VERSION}: {message}"
+            ))),
             other => Err(BusybeeError::Protocol(format!(
                 "expected a pong after the handshake, got {other:?}"
             ))),
@@ -138,26 +140,50 @@ impl Events<'_> {
     }
 }
 
+/// How long `connect_or_spawn_bzbd` spends reaching a daemon, spawn included.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Connects and handshakes, giving up at `deadline`. A daemon that accepts the
+/// connection but never answers would otherwise block the caller forever.
+async fn connect_by(socket: &Path, deadline: Instant) -> Result<Connection, BusybeeError> {
+    let budget = deadline.saturating_duration_since(Instant::now());
+    match tokio::time::timeout(budget, Connection::connect(socket)).await {
+        Ok(result) => result,
+        Err(_) => Err(BusybeeError::DaemonUnreachable {
+            context: format!(
+                "bzbd at {} did not complete the handshake within {} seconds",
+                socket.display(),
+                STARTUP_TIMEOUT.as_secs()
+            ),
+        }),
+    }
+}
+
 /// Connects to `bzbd`, starting it if the socket is unreachable.
 pub async fn connect_or_spawn_bzbd() -> Result<Connection, BusybeeError> {
     let socket = socket_path()?;
-    if let Ok(conn) = Connection::connect(&socket).await {
-        return Ok(conn);
-    }
-
-    spawn_bzbd()?;
-
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut spawned = false;
     loop {
-        if let Ok(conn) = Connection::connect(&socket).await {
-            return Ok(conn);
+        let last = match connect_by(&socket, deadline).await {
+            Ok(conn) => return Ok(conn),
+            // The daemon answered and refused us; a second one would exit as
+            // "already running" and we would lose the reason.
+            Err(refusal @ BusybeeError::Protocol(_)) => return Err(refusal),
+            Err(other) => other,
+        };
+        if !spawned {
+            spawn_bzbd()?;
+            spawned = true;
+            continue;
         }
         if Instant::now() >= deadline {
             return Err(BusybeeError::DaemonUnreachable {
                 context: format!(
-                    "bzbd did not start listening on {} within 3 seconds of auto-spawn; \
-                     see {}",
+                    "bzbd did not start listening on {} within {} seconds of auto-spawn \
+                     ({last}); see {}",
                     socket.display(),
+                    STARTUP_TIMEOUT.as_secs(),
                     log_path()?.display()
                 ),
             });
@@ -203,9 +229,9 @@ mod tests {
     use crate::protocol::{Hello, PROTOCOL_VERSION};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    /// A stand-in daemon that completes the handshake, then writes `lines`
-    /// verbatim and closes.
-    async fn fake_daemon(socket: PathBuf, lines: Vec<String>) {
+    /// A stand-in daemon that answers the handshake with `handshake`, then
+    /// writes `lines` verbatim and closes.
+    async fn fake_daemon(socket: PathBuf, handshake: Response, lines: Vec<String>) {
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
@@ -214,12 +240,8 @@ mod tests {
             let hello: Hello =
                 serde_json::from_str(&incoming.next_line().await.unwrap().unwrap()).unwrap();
             assert_eq!(hello.hello, PROTOCOL_VERSION);
-            let pong = Response::Pong {
-                version: "0".into(),
-                pid: 1,
-            };
             writer
-                .write_all(format!("{}\n", serde_json::to_string(&pong).unwrap()).as_bytes())
+                .write_all(format!("{}\n", serde_json::to_string(&handshake).unwrap()).as_bytes())
                 .await
                 .unwrap();
             for line in lines {
@@ -254,7 +276,15 @@ mod tests {
         let queued =
             serde_json::to_string(&Response::Event(LeaseEvent::Queued { id: 4, ahead: 1 }))
                 .unwrap();
-        fake_daemon(socket.clone(), vec![queued]).await;
+        fake_daemon(
+            socket.clone(),
+            Response::Pong {
+                version: "0".into(),
+                pid: 1,
+            },
+            vec![queued],
+        )
+        .await;
 
         let mut conn = Connection::connect(&socket).await.unwrap();
         let mut events = conn.events();
@@ -263,6 +293,52 @@ mod tests {
             Some(LeaseEvent::Queued { id: 4, ahead: 1 })
         ));
         assert!(events.next().await.unwrap().is_none());
+    }
+
+    /// A daemon that answered and refused our version is reachable: reporting
+    /// it as unreachable would send `connect_or_spawn_bzbd` off to spawn a
+    /// replacement that immediately exits as "already running", hiding the
+    /// real reason behind a startup timeout.
+    #[tokio::test]
+    async fn a_refused_handshake_is_a_protocol_error_not_an_unreachable_daemon() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("refuse.sock");
+        fake_daemon(
+            socket.clone(),
+            Response::Error {
+                message: "unsupported protocol version 99".into(),
+            },
+            vec![],
+        )
+        .await;
+
+        let Err(BusybeeError::Protocol(message)) = Connection::connect(&socket).await else {
+            panic!("expected the refusal to surface as a protocol error");
+        };
+        assert!(
+            message.contains("unsupported protocol version 99"),
+            "{message}"
+        );
+    }
+
+    /// A daemon that accepts connections but never answers must not hang the
+    /// client past its startup deadline.
+    #[tokio::test]
+    async fn a_stalled_daemon_fails_the_handshake_at_the_deadline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("stall.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let _accepted = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let Err(BusybeeError::DaemonUnreachable { .. }) = connect_by(&socket, deadline).await
+        else {
+            panic!("expected the stalled handshake to fail at the deadline");
+        };
+        assert!(Instant::now() < deadline + Duration::from_secs(1));
     }
 
     /// Sets environment variables around `body`, restoring them afterwards.

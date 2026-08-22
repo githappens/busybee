@@ -25,6 +25,10 @@
           path = "${repoRoot}/build/release/bzb";
           name = "bzb-bin";
         };
+        bzbdStorePath = builtins.path {
+          path = "${repoRoot}/build/release/bzbd";
+          name = "bzbd-bin";
+        };
       in
       {
         # Binary-only derivation: copies the pre-built release binary from
@@ -49,6 +53,10 @@
             chmod +x $out/bin/busybee
             cp "${bzbStorePath}" $out/bin/bzb
             chmod +x $out/bin/bzb
+            # bzbd must sit next to bzb: that is where the client looks for it
+            # before falling back to PATH.
+            cp "${bzbdStorePath}" $out/bin/bzbd
+            chmod +x $out/bin/bzbd
             runHook postInstall
           '';
           meta = {

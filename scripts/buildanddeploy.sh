@@ -19,6 +19,10 @@ if [ ! -f build/release/bzb ]; then
     echo "error: build/release/bzb not produced" >&2
     exit 1
 fi
+if [ ! -f build/release/bzbd ]; then
+    echo "error: build/release/bzbd not produced" >&2
+    exit 1
+fi
 
 echo "==> deploying to nix profile"
 # BUSYBEE_REPO tells the flake where to find build/release/busybee.
@@ -33,4 +37,5 @@ nix profile add --impure .
 echo "==> installed:"
 which busybee || { echo "busybee not on PATH — check ~/.nix-profile/bin"; exit 1; }
 which bzb || { echo "bzb not on PATH — check ~/.nix-profile/bin"; exit 1; }
+which bzbd || { echo "bzbd not on PATH — check ~/.nix-profile/bin"; exit 1; }
 busybee --help | head -3
