@@ -43,7 +43,9 @@ busybee (client)  ──unix socket──▶  bzbd (broker)  ──pueue-lib─�
                                       └ group `busybee` now parallel_tasks = 0
 ```
 
-**bzbd** (new crate `crates/bzbd`) is the only thing clients talk to and the only thing that talks to pueued. Auto-started by the client on demand, exactly as pueued is today (`bzb-core/src/client.rs::connect_or_spawn`). State dir: `$XDG_STATE_HOME/busybee/` (default `~/.local/state/busybee/`): `bzbd.sock`, `jobserver-<pid>` fifo, `leases.json`.
+**bzbd** (new crate `crates/bzbd`) is the only thing clients talk to and the only thing that talks to pueued. Auto-started by the client on demand, exactly as pueued is today (`bzb-core/src/client.rs::connect_or_spawn`). State dir: `$XDG_STATE_HOME/busybee/` (default `~/.local/state/busybee/`, overridden by `BUSYBEE_STATE_DIR`): `bzbd.sock`, `bzbd.pid` (also the single-instance `flock`), `bzbd.log`, `jobserver-<pid>` fifo, `leases.json`. The state dir is created mode `0700` and the socket is `0600`: the socket is bzbd's whole control surface, so on a shared machine it belongs to its owner alone.
+
+Clients and bzbd speak newline-delimited JSON over `bzbd.sock`, one UTF-8 message per line. The client's first line is `{"hello": <protocol_version>}`; bzbd answers `Pong { version, pid }`, or `Error` when it does not speak that version, and closes. A line may not exceed 64 KiB in either direction; bzbd answers `Error` and closes rather than buffering a message that never ends, and a client that is sent an over-long line reports a protocol error rather than buffering it. An `Error` reporting an undecodable line does not echo it back, and its message is truncated to a kilobyte — a decoder quotes the input it choked on, so neither the echo nor the quote can turn a request that fit within the limit into an answer that does not.
 
 **pueued** keeps what it is good at: spawning, process groups, log capture, persistence. Its dispatcher is bypassed (`parallel_tasks = 0` + `start_immediately`).
 

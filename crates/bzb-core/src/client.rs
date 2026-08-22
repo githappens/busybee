@@ -52,13 +52,13 @@ async fn try_connect(socket_path: &Path, settings: &Settings) -> Result<Client, 
     };
     let secret = std::fs::read(settings.shared.shared_secret_path()).map_err(|e| {
         BusybeeError::DaemonUnreachable {
-            context: format!("cannot read shared_secret: {e}"),
+            context: format!("cannot read pueued's shared_secret: {e}"),
         }
     })?;
     Client::new(conn, &secret, false)
         .await
         .map_err(|e| BusybeeError::DaemonUnreachable {
-            context: format!("handshake failed: {e}"),
+            context: format!("pueued handshake failed: {e}"),
         })
 }
 
@@ -72,7 +72,7 @@ fn spawn_pueued() -> Result<(), BusybeeError> {
         .stdin(Stdio::null())
         .spawn()
         .map_err(|e| BusybeeError::DaemonUnreachable {
-            context: format!("spawn pueued failed: {e}"),
+            context: format!("pueued is not running and auto-start failed: {e}"),
         })?;
     Ok(())
 }

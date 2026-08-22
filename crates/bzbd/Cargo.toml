@@ -1,0 +1,27 @@
+[package]
+name = "bzbd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "busybee's broker daemon: unix-socket server that brokers CPU leases for resource-heavy local tasks."
+repository = "https://github.com/githappens/busybee"
+homepage = "https://github.com/githappens/busybee"
+keywords = ["queue", "daemon", "scheduler", "build", "cpu"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
+readme = "../../README.md"
+
+[dependencies]
+bzb-core = { path = "../bzb-core", version = "0.1.0" }
+anyhow.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+# `BUSYBEE_STATE_DIR` and `PATH` are process-wide, so the tests that set them
+# cannot run alongside each other.
+serial_test = "3"
