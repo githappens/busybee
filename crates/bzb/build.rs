@@ -19,7 +19,12 @@ fn main() {
 
     // Rebuild when refs or tags change. Missing paths cause Cargo to always
     // rerun — acceptable since this script is cheap.
-    for rel in [".git/HEAD", ".git/refs/heads", ".git/refs/tags", ".git/packed-refs"] {
+    for rel in [
+        ".git/HEAD",
+        ".git/refs/heads",
+        ".git/refs/tags",
+        ".git/packed-refs",
+    ] {
         println!("cargo:rerun-if-changed={}", repo.join(rel).display());
     }
 
@@ -32,9 +37,13 @@ fn git_version(repo: &Path) -> Option<String> {
     let desc = Command::new("git")
         .current_dir(repo)
         .args([
-            "describe", "--tags", "--long",
-            "--match", "[0-9]*.[0-9]*.[0-9]*",
-            "--match", "v[0-9]*.[0-9]*.[0-9]*",
+            "describe",
+            "--tags",
+            "--long",
+            "--match",
+            "[0-9]*.[0-9]*.[0-9]*",
+            "--match",
+            "v[0-9]*.[0-9]*.[0-9]*",
         ])
         .output()
         .ok()?;
@@ -52,6 +61,10 @@ fn git_version(repo: &Path) -> Option<String> {
     if !count.status.success() {
         return None;
     }
-    let n: u64 = std::str::from_utf8(&count.stdout).ok()?.trim().parse().ok()?;
+    let n: u64 = std::str::from_utf8(&count.stdout)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
     Some(format!("0.0.{n}"))
 }

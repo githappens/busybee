@@ -1,7 +1,10 @@
-use std::{collections::{BTreeMap, HashMap}, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+};
 
-use pueue_lib::Client;
 use pueue_lib::message::{AddRequest, Request, Response};
+use pueue_lib::Client;
 
 use crate::env::color_envs;
 use crate::errors::BusybeeError;

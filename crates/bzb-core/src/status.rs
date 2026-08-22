@@ -21,10 +21,7 @@ impl QueueSnapshot {
     pub fn from_tasks<'a, I: IntoIterator<Item = &'a Task>>(tasks: I, group: &str) -> Self {
         let mut running = None;
         let mut queued = Vec::new();
-        let mut tasks: Vec<&Task> = tasks
-            .into_iter()
-            .filter(|t| t.group == group)
-            .collect();
+        let mut tasks: Vec<&Task> = tasks.into_iter().filter(|t| t.group == group).collect();
         tasks.sort_by_key(|t| t.id);
         for t in tasks {
             let view = TaskView {
@@ -71,7 +68,9 @@ mod tests {
             std::path::PathBuf::from("/"),
             Default::default(),
             group.into(),
-            TaskStatus::Queued { enqueued_at: Local::now() },
+            TaskStatus::Queued {
+                enqueued_at: Local::now(),
+            },
             Vec::new(),
             0,
             None,
@@ -83,7 +82,10 @@ mod tests {
     fn running(id: usize, group: &str) -> Task {
         let mut t = queued(id, group);
         let now = Local::now();
-        t.status = TaskStatus::Running { enqueued_at: now, start: now };
+        t.status = TaskStatus::Running {
+            enqueued_at: now,
+            start: now,
+        };
         t
     }
 
@@ -95,7 +97,11 @@ mod tests {
 
     #[test]
     fn count_ahead_counts_lower_queued_ids_same_group() {
-        let tasks = [queued(1, "busybee"), queued(2, "busybee"), queued(3, "busybee")];
+        let tasks = [
+            queued(1, "busybee"),
+            queued(2, "busybee"),
+            queued(3, "busybee"),
+        ];
         assert_eq!(count_ahead(&tasks, 3, "busybee"), 2);
     }
 
@@ -113,7 +119,11 @@ mod tests {
 
     #[test]
     fn snapshot_separates_running_and_queued() {
-        let tasks = [running(1, "busybee"), queued(2, "busybee"), queued(3, "busybee")];
+        let tasks = [
+            running(1, "busybee"),
+            queued(2, "busybee"),
+            queued(3, "busybee"),
+        ];
         let snap = QueueSnapshot::from_tasks(tasks.iter(), "busybee");
         assert_eq!(snap.running.as_ref().map(|v| v.id), Some(1));
         assert_eq!(snap.queued.len(), 2);
@@ -128,7 +138,10 @@ mod tests {
             std::path::PathBuf::from("/tmp/work"),
             Default::default(),
             "busybee".into(),
-            TaskStatus::Running { enqueued_at: now, start: now },
+            TaskStatus::Running {
+                enqueued_at: now,
+                start: now,
+            },
             Vec::new(),
             0,
             None,

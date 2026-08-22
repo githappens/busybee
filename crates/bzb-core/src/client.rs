@@ -4,9 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use pueue_lib::Client;
 use pueue_lib::network::socket::ConnectionSettings;
 use pueue_lib::settings::Settings;
+use pueue_lib::Client;
 use tokio::time::sleep;
 
 use crate::errors::BusybeeError;
@@ -14,11 +14,10 @@ use crate::errors::BusybeeError;
 /// Connects to pueued, spawning it in the background if the socket is
 /// unreachable. Returns a ready-to-use `Client` (handshake complete).
 pub async fn connect_or_spawn() -> Result<Client, BusybeeError> {
-    let (settings, _from_file) = Settings::read(&None).map_err(|e| {
-        BusybeeError::DaemonUnreachable {
+    let (settings, _from_file) =
+        Settings::read(&None).map_err(|e| BusybeeError::DaemonUnreachable {
             context: format!("failed to read pueue settings: {e}"),
-        }
-    })?;
+        })?;
 
     let socket_path = settings
         .shared
@@ -48,14 +47,19 @@ pub async fn connect_or_spawn() -> Result<Client, BusybeeError> {
 }
 
 async fn try_connect(socket_path: &Path, settings: &Settings) -> Result<Client, BusybeeError> {
-    let conn = ConnectionSettings::UnixSocket { path: socket_path.to_path_buf() };
-    let secret = std::fs::read(settings.shared.shared_secret_path())
-        .map_err(|e| BusybeeError::DaemonUnreachable {
+    let conn = ConnectionSettings::UnixSocket {
+        path: socket_path.to_path_buf(),
+    };
+    let secret = std::fs::read(settings.shared.shared_secret_path()).map_err(|e| {
+        BusybeeError::DaemonUnreachable {
             context: format!("cannot read shared_secret: {e}"),
-        })?;
-    Client::new(conn, &secret, false).await.map_err(|e| {
-        BusybeeError::DaemonUnreachable { context: format!("handshake failed: {e}") }
-    })
+        }
+    })?;
+    Client::new(conn, &secret, false)
+        .await
+        .map_err(|e| BusybeeError::DaemonUnreachable {
+            context: format!("handshake failed: {e}"),
+        })
 }
 
 fn spawn_pueued() -> Result<(), BusybeeError> {

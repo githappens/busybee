@@ -31,8 +31,14 @@ fn spawn_signal_task(
         let Ok(mut s) = signal(kind) else { return };
         while s.recv().await.is_some() {
             let n = seen.fetch_add(1, Ordering::SeqCst);
-            let event = if n == 0 { SignalEvent::SoftCancel } else { SignalEvent::HardKill };
-            if tx.send(event).is_err() { break; }
+            let event = if n == 0 {
+                SignalEvent::SoftCancel
+            } else {
+                SignalEvent::HardKill
+            };
+            if tx.send(event).is_err() {
+                break;
+            }
         }
     });
 }

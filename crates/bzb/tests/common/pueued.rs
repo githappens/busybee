@@ -43,7 +43,8 @@ impl PueuedFixture {
         std::fs::write(&config_path, config).unwrap();
 
         let child = Command::new("pueued")
-            .arg("--config").arg(&config_path)
+            .arg("--config")
+            .arg(&config_path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -53,7 +54,12 @@ impl PueuedFixture {
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
             if socket_path.exists() {
-                return Some(Self { child, _tmp: tmp, socket_path, config_path });
+                return Some(Self {
+                    child,
+                    _tmp: tmp,
+                    socket_path,
+                    config_path,
+                });
             }
             sleep(Duration::from_millis(50));
         }

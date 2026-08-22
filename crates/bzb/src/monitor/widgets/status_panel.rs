@@ -24,7 +24,13 @@ impl<'a> Widget for StatusPanel<'a> {
         }
 
         let (left, primary, right) = line_parts(self.snapshot);
-        let line = compose_line(&left, primary.as_deref(), &right, area.width as usize, self.elapsed);
+        let line = compose_line(
+            &left,
+            primary.as_deref(),
+            &right,
+            area.width as usize,
+            self.elapsed,
+        );
         write_line(buf, area, 0, &line, Style::default());
     }
 }
@@ -169,12 +175,19 @@ mod tests {
     fn render(snap: &QueueSnapshot, width: u16, elapsed: Duration) -> String {
         let area = Rect::new(0, 0, width, 1);
         let mut buf = Buffer::empty(area);
-        StatusPanel { snapshot: snap, elapsed }.render(area, &mut buf);
+        StatusPanel {
+            snapshot: snap,
+            elapsed,
+        }
+        .render(area, &mut buf);
         buf_lines(&buf, area).remove(0)
     }
 
     fn empty_snap() -> QueueSnapshot {
-        QueueSnapshot { running: None, queued: vec![] }
+        QueueSnapshot {
+            running: None,
+            queued: vec![],
+        }
     }
 
     fn running_snap(label: Option<&str>, command: &str, path: &str) -> QueueSnapshot {
@@ -293,7 +306,10 @@ mod tests {
         assert!(line.starts_with("Running: ls"));
         // No <folder>: ls pattern — check the remainder after "Running: " has no folder prefix.
         let remainder = &line["Running: ".len()..];
-        assert!(!remainder.contains(": ls"), "no folder prefix when path is root");
+        assert!(
+            !remainder.contains(": ls"),
+            "no folder prefix when path is root"
+        );
     }
 
     #[test]

@@ -16,7 +16,10 @@ mod tests {
     use super::*;
 
     fn m(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect()
     }
 
     #[test]
@@ -24,7 +27,10 @@ mod tests {
         let out = color_envs(BTreeMap::new());
         assert_eq!(out.get("CLICOLOR_FORCE").map(String::as_str), Some("1"));
         assert_eq!(out.get("FORCE_COLOR").map(String::as_str), Some("1"));
-        assert_eq!(out.get("CARGO_TERM_COLOR").map(String::as_str), Some("always"));
+        assert_eq!(
+            out.get("CARGO_TERM_COLOR").map(String::as_str),
+            Some("always")
+        );
     }
 
     #[test]

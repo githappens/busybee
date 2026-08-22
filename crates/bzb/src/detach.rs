@@ -25,7 +25,9 @@ fn shell_escape(s: &str) -> String {
     if s.is_empty() {
         return "''".into();
     }
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)) {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
+    {
         return s.into();
     }
     let escaped = s.replace('\'', r#"'\''"#);
@@ -38,10 +40,7 @@ mod tests {
 
     #[test]
     fn join_simple_words_is_passthrough() {
-        assert_eq!(
-            shell_escape_join(&["echo".into(), "hi".into()]),
-            "echo hi"
-        );
+        assert_eq!(shell_escape_join(&["echo".into(), "hi".into()]), "echo hi");
     }
 
     #[test]
