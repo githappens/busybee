@@ -46,12 +46,12 @@ jobs:
         run: |
           set -euo pipefail
           head=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+          export HEAD="$head"
           echo "head: $head"
 
           # Latest Codex review whose commit matches the current head.
           review_id=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-            --jq --arg u "$REVIEWER" --arg h "$head" \
-            '[.[] | select(.user.login==$u and .commit_id==$h)] | sort_by(.submitted_at) | last | .id // empty')
+            --jq '[.[] | select(.user.login==env.REVIEWER and .commit_id==env.HEAD)] | sort_by(.submitted_at) | last | .id // empty')
           if [ -z "$review_id" ]; then
             echo "no Codex review for head $head yet; leaving the review decision unchanged"
             exit 0
@@ -64,7 +64,7 @@ jobs:
 
           # Skip if github-actions already posted the same verdict for this head.
           mine=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-            --jq --arg h "$head" '[.[] | select(.user.login=="github-actions[bot]" and .commit_id==$h)] | sort_by(.submitted_at) | last | .state // empty')
+            --jq '[.[] | select(.user.login=="github-actions[bot]" and .commit_id==env.HEAD)] | sort_by(.submitted_at) | last | .state // empty')
           if [ "$blocking" -gt 0 ]; then
             [ "$mine" = "CHANGES_REQUESTED" ] && { echo "already requested changes for $head"; exit 0; }
             gh api -X POST "repos/$REPO/pulls/$PR/reviews" -f event=REQUEST_CHANGES -f commit_id="$head" \
