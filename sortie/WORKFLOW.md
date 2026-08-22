@@ -179,11 +179,14 @@ Blocked-by issues (all must already be merged on `main`): {{ range $i, $b := .is
 ## Keep the branch mergeable
 
 Before finishing, and at the start of every continuation, run `git fetch origin`
-and check whether `origin/main` has moved under you (`git merge-base --is-ancestor
-origin/main HEAD` fails). If so, rebase onto `origin/main`, resolve conflicts so
-the result still satisfies the issue and the spec, rerun the full test suite, and
-`git push --force-with-lease`. Never merge `main` into the branch; history stays
-linear for the squash merge. A PR that does not merge cleanly is never merged.
+and check the PR's mergeability (`gh pr view --json mergeable -q .mergeable`, or
+`git merge-tree --write-tree origin/main HEAD` before the PR exists). Rebase onto
+`origin/main` **only when it actually conflicts**: resolve the conflicts so the
+result still satisfies the issue and the spec, rerun the full test suite, and
+`git push --force-with-lease`. Do not rebase merely because `main` moved — every
+push discards the current automated review and restarts the cycle, and CI already
+tests the merge result. Never merge `main` into the branch; history stays linear
+for the squash merge. A PR that does not merge cleanly is never merged.
 
 ## Finishing
 
@@ -219,8 +222,9 @@ stopped. If a PR already exists, push to the same branch.
 {{ range .review_comments }}- (comment id {{ .id }}) {{ .reviewer }}{{ if .file }} on `{{ .file }}`{{ if .start_line }}:{{ .start_line }}{{ end }}{{ end }}: {{ .body }}
 {{ end }}
 First react 👀 on each comment (`gh api -X POST repos/githappens/busybee/pulls/comments/<id>/reactions -f content=eyes`)
-so the reviewer sees you are on it. Address every point, reply on each thread with
-what changed, and push.
+so the reviewer sees you are on it. Address every point and reply on each thread
+with what changed. Push only if you changed files; threads you already answered in
+an earlier turn need no new push.
 {{ end }}
 {{ if .merge_conflict }}
 
@@ -247,8 +251,16 @@ id above run
 Then, for each finding, either fix it or reply on its thread
 (`gh api -X POST repos/githappens/busybee/pulls/<pr>/comments -F in_reply_to=<id> -f body='…'`)
 with the reason it does not apply; reply on the thread with a one-line summary of
-the fix as well. Then push. A new push triggers a fresh automated review; the PR merges
-automatically once that review reports no findings and CI is green.
+the fix as well.
+
+A finding listed here may already have been handled in an earlier turn: the list
+is regenerated whenever the set of open comments changes, so threads that already
+carry your reply come back. Check each thread first; if the code already reflects
+the reply, there is nothing to do for it. **Push only if you changed files.** If
+nothing needed changing, do not commit, amend, rebase or push — a push discards
+the current review and restarts the cycle. Stop after the replies. A new push
+triggers a fresh automated review; the PR merges automatically once that review
+reports no findings and CI is green.
 {{ end }}
 {{ end }}
 {{ if and .attempt (not .run.is_continuation) }}
