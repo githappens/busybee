@@ -56,7 +56,7 @@ agent:
   kind: claude-code
   command: sortie/agent.sh   # picks the model per issue; see the before_run hook
   max_turns: 20
-  max_sessions: 3
+  max_sessions: 12   # continuation turns (review fixes, rebases) count as sessions
   max_concurrent_agents: 3   # hot-reloads; drop to 1 when bringing up a fresh setup
   turn_timeout_ms: 7200000
   read_timeout_ms: 10000
