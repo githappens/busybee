@@ -532,3 +532,78 @@ fn config_reload_without_a_daemon_is_an_error_that_says_why() {
         stderr(&out)
     );
 }
+
+/// Runs `busybee config reload` against a state directory of the test's own,
+/// and gives up on the process if it never exits — the thing under test here is
+/// a command that hangs, so without a deadline of the test's own a regression
+/// stalls the suite instead of failing it.
+async fn run_config_reload(state: &Path) -> Output {
+    let run = tokio::process::Command::new(env!("CARGO_BIN_EXE_busybee"))
+        .env("BUSYBEE_STATE_DIR", state)
+        .env("BUSYBEE_CONFIG", state.join("config.toml"))
+        .args(["config", "reload"])
+        .kill_on_drop(true)
+        .output();
+    tokio::time::timeout(PATIENCE, run)
+        .await
+        .expect("busybee config reload never exited")
+        .expect("run busybee config reload")
+}
+
+/// A daemon that accepts the connection and then fails — a dropped socket, a
+/// refused protocol version — is running. Calling that "not running" puts a
+/// false diagnosis at the top of the error, and the version refusal is exactly
+/// what an upgraded client meets across an in-place upgrade.
+#[tokio::test]
+async fn config_reload_against_a_listening_daemon_does_not_call_it_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::UnixListener::bind(tmp.path().join("bzbd.sock")).expect("bind");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        drop(stream);
+    });
+
+    let out = run_config_reload(tmp.path()).await;
+
+    assert!(!out.status.success(), "reload succeeded against a failure");
+    assert!(
+        !stderr(&out).contains("is not running"),
+        "a listening daemon was reported absent: {:?}",
+        stderr(&out)
+    );
+}
+
+/// The handshake has a deadline of its own; the request after it does not. A
+/// daemon that pongs and then wedges would hold this one-shot command open for
+/// as long as it stays wedged.
+#[tokio::test]
+async fn config_reload_against_a_wedged_daemon_gives_up() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let listener = tokio::net::UnixListener::bind(tmp.path().join("bzbd.sock")).expect("bind");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        lines.next_line().await.expect("read").expect("a hello");
+        let pong = Response::Pong {
+            version: "test".into(),
+            pid: std::process::id(),
+        };
+        let line = format!("{}\n", serde_json::to_string(&pong).expect("encode"));
+        writer.write_all(line.as_bytes()).await.expect("write");
+        // Handshaken, and silent from here: nothing answers the reload request
+        // and nothing closes the connection on it.
+        std::future::pending::<()>().await;
+    });
+
+    let out = run_config_reload(tmp.path()).await;
+
+    assert!(!out.status.success(), "reload succeeded against silence");
+    assert!(
+        stderr(&out).contains("did not answer"),
+        "stderr was {:?}",
+        stderr(&out)
+    );
+}
