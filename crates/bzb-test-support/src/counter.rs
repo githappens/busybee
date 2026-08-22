@@ -34,14 +34,18 @@ pub struct Sample {
 pub fn make_build(dir: &Path, targets: u32, sleep: &str) {
     let names: Vec<String> = (1..=targets).map(|i| format!("t{i}")).collect();
     let makefile = format!(
+        // Both counts come out of one listing: a second `ls` could miss a
+        // marker the first one saw, and a total above an own count is how a
+        // test tells a job of another build apart from one of its own.
         "COUNTER_NAME ?= a\n\
          TARGETS := {targets_list}\n\
          .PHONY: run $(TARGETS)\n\
          run: $(TARGETS)\n\
          $(TARGETS):\n\
          \t@s=$(COUNTER_NAME).$@.$$$$; m=markers/$$s; touch $$m; sleep {sleep}; \\\n\
-         \tprintf '%s %s\\n' \"$$(ls markers | wc -l)\" \
-         \"$$(ls markers | grep -c '^$(COUNTER_NAME)\\.')\" > pending/$$s; \\\n\
+         \tl=$$(ls markers); \\\n\
+         \tprintf '%s %s\\n' \"$$(printf '%s\\n' \"$$l\" | wc -l)\" \
+         \"$$(printf '%s\\n' \"$$l\" | grep -c '^$(COUNTER_NAME)\\.')\" > pending/$$s; \\\n\
          \tmv pending/$$s samples/$$s; rm $$m\n",
         targets_list = names.join(" "),
     );
