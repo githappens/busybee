@@ -108,6 +108,20 @@ The board (Projects → "busybee · bzbd", Kanban view) mirrors these labels thr
   and `polling.*` keys hot-reload, reactions need a restart (`sortie validate`
   tells you if the file is malformed).
 
+## Stall signatures (and the fix for each)
+
+| what you see | cause | fix |
+|---|---|---|
+| issue is `sortie:working`, `sortie_sessions_running 0`, last log line for it is `worker exiting exit_kind=normal` with no `handoff transition succeeded` after it | sortie skipped the handoff; reactions only run for issues in `sortie:review` | relabel the issue `sortie:review`; if nothing dispatches within two polls, restart `run.sh` (the startup scan re-detects pending Codex comments) |
+| `effort budget exhausted, blocking re-dispatch count=N max_sessions=N` | every continuation turn, including no-op review rounds, counts toward `agent.max_sessions` | raise it in `WORKFLOW.md` (hot-reloads), then restart `run.sh` — the blocked dispatch is not retried on its own |
+| `bot review continuation turns exhausted, escalating` → `needs-human` | `reactions.bot_review.max_continuation_turns` reached; each push costs two rounds (findings, then the post-verdict no-op) | raise it (needs a restart), remove `needs-human`; the counter resets per restart |
+| `no available orchestrator slots, rescheduling retry` repeating every 5 min for one issue | review-fix retries lose the slot race to fresh dispatches; each lost retry still increments `attempt` | raise `agent.max_concurrent_agents` by one (hot-reloads) |
+| a PR has a clean Codex 👍 for 20+ minutes and no gate approval | the 👍 raises no workflow event and the cron trigger is throttled on quiet repositories | `gh workflow run codex-gate.yml` (the `run.sh` sidecar does this every 10 min) |
+| approved PR, `mergeStateStatus UNSTABLE`, `auto_merge` idle | a check failed on the head (typically Linux-only behaviour; agents develop on macOS) | `reactions.ci_failure` hands the log excerpt to the agent; if it is missing from `WORKFLOW.md`, add it and restart |
+| a PR keeps getting new findings on code added for earlier findings | review scope creep on a large PR | `AGENTS.md` → *Stay within the issue's scope*; only branches containing that rule are reviewed under it |
+
+Restart `run.sh` when `sortie_sessions_running` is 0 (`/metrics`): a restart cancels in-flight turns, and they resume as retries. Reactions (`reactions.*`) load only at startup; `agent.*`, `polling.*` and the prompt body hot-reload. GitHub's reviews and comments endpoints page at 30 and agent replies count as reviews, so always `--paginate` when inspecting a long-lived PR.
+
 ## Where state lives (all under the gitignored `build/`)
 
 | path | what | safe to delete? |
