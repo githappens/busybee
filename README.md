@@ -97,9 +97,10 @@ jobserver rows assume make ≥ 4.4, ninja ≥ 1.13 and a Make or Ninja generator
 under `cmake --build`; nothing verifies it, so an older tool is still admitted
 as jobserver, ignores the fifo and runs at its own default. Your own count wins
 too: `make -j8`, `ninja -j8`, `cargo build -j8` and `cmake --build … --parallel
-8` keep your number. busybee still points `MAKEFLAGS` at the fifo and prints a
-notice, but your flag overrides it, and a jobserver task holds no tokens either
-way — so that build runs beside the pool rather than inside it.
+8` keep your number over busybee's `MAKEFLAGS`, and `env MAKEFLAGS=-j8 make`
+lands after busybee's environment, so the injection is dropped outright. Either
+way you get a notice and a jobserver task that holds no tokens — it runs beside
+the pool rather than inside it.
 
 **none** is the honest default for a command busybee cannot reason about: a
 benchmark, a render, an opaque `sh -c '…'`. It takes the whole pool and
@@ -148,13 +149,12 @@ static = "fair"           # or a fixed core count
 | `defaults.static` | `"fair"` or integer ≥ 1 | `"fair"` | Cores such a task asks for: `"fair"` is its share of the pool at the moment it starts. |
 | `overrides.<tool>` | table | none | One classification row, replacing the built-in one for that tool outright. |
 | `overrides.<tool>.class` | `"jobserver"`, `"static"` or `"none"` | required | How the tool shares the pool. |
-| `overrides.<tool>.env` | table of strings | empty | Variables to set for the task, on top of what the class injects. Values may contain `{cores}`, `{cores-1}` and `{fifo}`, and nothing else. A variable busybee owns — `MAKEFLAGS` and `CARGO_MAKEFLAGS` on a jobserver row, `BUSYBEE_CLASS`/`BUSYBEE_CORES` on every row — keeps busybee's value, and the row's is dropped with a notice. |
+| `overrides.<tool>.env` | table of strings | empty | Variables to set for the task, on top of what the class injects. Values may contain `{cores}`, `{cores-1}` and `{fifo}`, and nothing else. A variable busybee already set — `MAKEFLAGS` on a jobserver row, `BUSYBEE_CLASS`/`BUSYBEE_CORES` on every row — keeps busybee's value and the row's is dropped with a notice; a jobserver row also reserves `CARGO_MAKEFLAGS`, which cargo reads first, so that one is dropped with nothing put in its place. |
 
 An override key is matched against the tool's basename, so `"./build.sh"` and
 `"build.sh"` name the same row (two keys that collapse to one are an error).
 A row keeps one thing from the built-in it replaces — the flags that tool
-spells parallelism with, which the file cannot say: `cargo -j8` still earns its
-notice.
+spells parallelism with, which the file cannot say: `cargo -j8` earns its notice.
 
 A file that does not parse, names a key busybee does not read, or carries a
 value out of range is refused whole, with the line to fix: nothing is applied
