@@ -9,7 +9,7 @@ use std::{
 };
 
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
+    io::{AsyncWriteExt, BufReader},
     net::{
         unix::{OwnedReadHalf, OwnedWriteHalf},
         UnixStream,
@@ -19,7 +19,9 @@ use tokio::{
 };
 
 use crate::errors::BusybeeError;
-use crate::protocol::{Hello, LeaseEvent, Request, Response, PROTOCOL_VERSION};
+use crate::protocol::{
+    read_line, Hello, LeaseEvent, Line, Request, Response, MAX_LINE_BYTES, PROTOCOL_VERSION,
+};
 
 /// Directory holding `bzbd.sock`, `bzbd.pid` and `bzbd.log`.
 pub fn state_dir() -> Result<PathBuf, BusybeeError> {
@@ -65,7 +67,7 @@ pub fn log_path() -> Result<PathBuf, BusybeeError> {
 
 /// An open, handshaken connection to `bzbd`.
 pub struct Connection {
-    incoming: Lines<BufReader<OwnedReadHalf>>,
+    incoming: BufReader<OwnedReadHalf>,
     outgoing: OwnedWriteHalf,
 }
 
@@ -80,7 +82,7 @@ impl Connection {
                 })?;
         let (reader, outgoing) = stream.into_split();
         let mut conn = Self {
-            incoming: BufReader::new(reader).lines(),
+            incoming: BufReader::new(reader),
             outgoing,
         };
         conn.write_json(&Hello {
@@ -136,15 +138,22 @@ impl Connection {
     }
 
     async fn recv_opt(&mut self) -> Result<Option<Response>, BusybeeError> {
-        let Some(line) =
-            self.incoming
-                .next_line()
+        let read =
+            read_line(&mut self.incoming)
                 .await
                 .map_err(|e| BusybeeError::DaemonUnreachable {
                     context: format!("cannot read from bzbd: {e}"),
-                })?
-        else {
-            return Ok(None);
+                })?;
+        let line = match read {
+            Line::Text(line) => line,
+            Line::Closed => return Ok(None),
+            // The same bound the daemon reads under: a peer that ignores it is
+            // not speaking this protocol, and we cannot find the next message.
+            Line::TooLong => {
+                return Err(BusybeeError::Protocol(format!(
+                    "bzbd sent a line longer than {MAX_LINE_BYTES} bytes"
+                )))
+            }
         };
         serde_json::from_str(&line)
             .map(Some)
@@ -171,7 +180,9 @@ impl Events<'_> {
                 self.finished |= matches!(event, LeaseEvent::Finished { .. });
                 Ok(Some(event))
             }
-            Some(Response::Error { message }) => Err(BusybeeError::EnqueueRejected(message)),
+            // Not `EnqueueRejected`: that one reads "pueued rejected our
+            // request", and this refusal came from bzbd.
+            Some(Response::Error { message }) => Err(BusybeeError::Rejected(message)),
             Some(other) => Err(BusybeeError::Protocol(format!(
                 "expected an event, got {other:?}"
             ))),
@@ -289,7 +300,7 @@ async fn spawn_bzbd(program: &Path, deadline: Instant) -> Result<(), BusybeeErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Hello, PROTOCOL_VERSION};
+    use crate::protocol::{Hello, MAX_LINE_BYTES, PROTOCOL_VERSION};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     /// A stand-in daemon that answers the handshake with `handshake`, then
@@ -480,7 +491,7 @@ mod tests {
         drop(theirs);
         let (reader, outgoing) = ours.into_split();
         let mut conn = Connection {
-            incoming: BufReader::new(reader).lines(),
+            incoming: BufReader::new(reader),
             outgoing,
         };
 
@@ -492,6 +503,69 @@ mod tests {
             panic!("expected a write to a closed bzbd socket to name bzbd, got {error:?}");
         };
         assert!(context.contains("bzbd"), "{context}");
+    }
+
+    /// The daemon caps what it reads at [`MAX_LINE_BYTES`]; a client that does
+    /// not cap what it reads back is the same unbounded buffer with the roles
+    /// swapped, so a stale or buggy daemon could hang or exhaust it.
+    #[tokio::test]
+    async fn an_oversized_response_line_is_rejected_instead_of_buffered() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("flood.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (_reader, mut writer) = stream.into_split();
+            // A pong to get past the handshake, then a line that never ends.
+            writer
+                .write_all(format!("{}\n", serde_json::to_string(&pong()).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            let _ = writer.write_all(&vec![b'x'; MAX_LINE_BYTES + 1]).await;
+            std::future::pending::<()>().await;
+        });
+
+        let mut conn = Connection::connect(&socket).await.unwrap();
+        conn.send(Request::Ping).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(3), conn.recv())
+            .await
+            .expect("the client buffered the line instead of rejecting it");
+        let Err(BusybeeError::Protocol(message)) = reply else {
+            panic!("expected an oversized response line to be a protocol error, got {reply:?}");
+        };
+        assert!(
+            message.contains(&MAX_LINE_BYTES.to_string()),
+            "message was {message:?}"
+        );
+    }
+
+    /// A rejection that came from bzbd has to name bzbd: `EnqueueRejected`
+    /// reads "pueued rejected our request", which sends the user to the logs of
+    /// a daemon that was never involved.
+    #[tokio::test]
+    async fn a_rejected_lease_names_bzbd() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("rejected.sock");
+        fake_daemon(
+            socket.clone(),
+            pong(),
+            vec![serde_json::to_string(&Response::Error {
+                message: "not implemented".into(),
+            })
+            .unwrap()],
+        )
+        .await;
+
+        let mut conn = Connection::connect(&socket).await.unwrap();
+        let error = conn.events().next().await;
+        let Err(BusybeeError::Rejected(message)) = &error else {
+            panic!("expected a bzbd rejection, got {error:?}");
+        };
+        assert_eq!(message, "not implemented");
+        assert!(
+            error.unwrap_err().to_string().contains("bzbd"),
+            "the rejection has to name the daemon that refused"
+        );
     }
 
     /// A daemon that accepts connections but never answers must not hang the

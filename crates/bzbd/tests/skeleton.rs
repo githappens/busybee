@@ -238,6 +238,45 @@ async fn oversized_line_error(daemon: &Fixture, prelude: &[u8]) -> String {
     message
 }
 
+/// The limit binds both directions. Echoing an undecodable request back into
+/// the error message expands it: every quote and backslash costs two bytes
+/// once, then two more when the message is itself JSON-encoded, so a request
+/// that fits would be answered with a line that does not.
+#[tokio::test]
+async fn the_error_for_an_undecodable_request_stays_within_the_line_limit() {
+    let daemon = Fixture::start();
+    let stream = tokio::net::UnixStream::connect(daemon.socket_path())
+        .await
+        .expect("connect");
+    let (reader, mut writer) = stream.into_split();
+    let mut lines = BufReader::new(reader).lines();
+
+    writer.write_all(b"{\"hello\":1}\n").await.expect("hello");
+    lines.next_line().await.expect("read").expect("a pong");
+
+    let mut request = vec![b'"'; MAX_LINE_BYTES - 1];
+    request.push(b'\n');
+    writer.write_all(&request).await.expect("write request");
+
+    let reply = lines
+        .next_line()
+        .await
+        .expect("read")
+        .expect("a reply line");
+    assert!(
+        reply.len() <= MAX_LINE_BYTES,
+        "the daemon answered with {} bytes, over the {MAX_LINE_BYTES} byte limit",
+        reply.len()
+    );
+    match serde_json::from_str::<Response>(&reply).expect("decode reply") {
+        Response::Error { message } => assert!(
+            message.contains("decode"),
+            "expected a decode error, got {message:?}"
+        ),
+        other => panic!("expected an Error, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn a_protocol_version_mismatch_gets_an_error_and_the_connection_closes() {
     let daemon = Fixture::start();

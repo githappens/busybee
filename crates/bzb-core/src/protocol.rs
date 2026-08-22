@@ -6,19 +6,52 @@
 //! does not speak that version. Every line after the handshake is a
 //! [`Request`] from the client and a [`Response`] from the daemon.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, io, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
 use crate::classify::Class;
 
 /// Bumped whenever a change to the types below is not backwards compatible.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-/// The longest line the daemon will read. Anyone who can open the socket could
+/// The longest line either end will read. Anyone who can open the socket could
 /// otherwise stream a newline-free message until the long-lived daemon runs out
-/// of memory; real messages are orders of magnitude smaller than this.
+/// of memory; real messages are orders of magnitude smaller than this. It binds
+/// responses too, so a stale or wedged daemon cannot do the same to a client.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
+
+/// What one bounded read off a connection produced.
+#[derive(Debug)]
+pub enum Line {
+    Text(String),
+    /// The peer closed the connection.
+    Closed,
+    /// No newline within [`MAX_LINE_BYTES`]. The rest of the connection is
+    /// unparseable with it: we cannot tell where the next message starts.
+    TooLong,
+}
+
+/// Reads one line, refusing to buffer more than [`MAX_LINE_BYTES`] of it.
+pub async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Line> {
+    let mut line = Vec::new();
+    reader
+        .take(MAX_LINE_BYTES as u64 + 1)
+        .read_until(b'\n', &mut line)
+        .await?;
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    } else if line.len() > MAX_LINE_BYTES {
+        return Ok(Line::TooLong);
+    } else if line.is_empty() {
+        return Ok(Line::Closed);
+    }
+    // A truncated last line is left to the JSON decoder to reject.
+    let text = String::from_utf8(line)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("invalid utf-8: {e}")))?;
+    Ok(Line::Text(text))
+}
 
 /// The client's first line.
 #[derive(Debug, Clone, Serialize, Deserialize)]

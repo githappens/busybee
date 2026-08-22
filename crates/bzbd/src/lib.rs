@@ -19,10 +19,10 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use bzb_core::{
     daemon::{log_path, pid_path, socket_path, state_dir},
-    protocol::{Hello, Request, Response, MAX_LINE_BYTES, PROTOCOL_VERSION},
+    protocol::{read_line, Hello, Line, Request, Response, MAX_LINE_BYTES, PROTOCOL_VERSION},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncWriteExt, BufReader},
     net::{
         unix::{OwnedReadHalf, OwnedWriteHalf},
         UnixListener, UnixStream,
@@ -186,43 +186,20 @@ async fn handle(stream: UnixStream) -> Result<()> {
             Ok(Request::Status | Request::Submit(_) | Request::Cancel { .. }) => Response::Error {
                 message: "not implemented".into(),
             },
+            // Without the request itself: escaping it and then JSON-encoding
+            // the message quadruples it, so echoing a line that fit within
+            // MAX_LINE_BYTES would answer with one that does not. The decoder
+            // reports the offending line and column anyway.
             Err(err) => Response::Error {
-                message: format!("cannot decode {line:?}: {err}"),
+                message: format!("cannot decode the request: {err}"),
             },
         };
         reply(&mut writer, response).await?;
     }
 }
 
-/// What one read off a connection produced.
-enum Line {
-    Text(String),
-    /// The peer closed the connection.
-    Closed,
-    /// No newline within [`MAX_LINE_BYTES`]; the rest of the connection is
-    /// unparseable, since we cannot tell where the next message starts.
-    TooLong,
-}
-
-/// Reads one line, refusing to buffer more than [`MAX_LINE_BYTES`] of it.
 async fn next_line(reader: &mut BufReader<OwnedReadHalf>) -> Result<Line> {
-    let mut line = Vec::new();
-    reader
-        .take(MAX_LINE_BYTES as u64 + 1)
-        .read_until(b'\n', &mut line)
-        .await
-        .context("cannot read a request")?;
-    if line.last() == Some(&b'\n') {
-        line.pop();
-    } else if line.len() > MAX_LINE_BYTES {
-        return Ok(Line::TooLong);
-    } else if line.is_empty() {
-        return Ok(Line::Closed);
-    }
-    // A truncated last line is left to the JSON decoder to reject.
-    Ok(Line::Text(
-        String::from_utf8(line).context("a request line was not valid utf-8")?,
-    ))
+    read_line(reader).await.context("cannot read a request")
 }
 
 fn too_long() -> Response {

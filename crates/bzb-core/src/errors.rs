@@ -9,6 +9,10 @@ pub enum BusybeeError {
     #[error("pueued rejected our request: {0}")]
     EnqueueRejected(String),
 
+    /// The bzbd counterpart: same shape, different daemon in the message.
+    #[error("bzbd rejected our request: {0}")]
+    Rejected(String),
+
     #[error("pueue-lib I/O error: {0}")]
     Network(#[from] std::io::Error),
 
@@ -28,7 +32,9 @@ pub enum BusybeeError {
 /// Recommended process exit code for a given error.
 pub fn exit_code_for(err: &BusybeeError) -> i32 {
     match err {
-        BusybeeError::DaemonUnreachable { .. } | BusybeeError::EnqueueRejected(_) => 2,
+        BusybeeError::DaemonUnreachable { .. }
+        | BusybeeError::EnqueueRejected(_)
+        | BusybeeError::Rejected(_) => 2,
         _ => 1,
     }
 }
