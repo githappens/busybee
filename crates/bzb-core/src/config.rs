@@ -15,10 +15,12 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
+    ops::Range,
     path::{Path, PathBuf},
 };
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+use toml::Spanned;
 
 use crate::{
     classify::{basename, Class, Inject, Rule, Table},
@@ -211,82 +213,186 @@ impl Config {
     fn parse(text: &str, path: &Path) -> Result<Self, BusybeeError> {
         /// The file as written: every key optional, and nothing else allowed.
         /// A key nobody reads is a setting that silently does nothing.
+        ///
+        /// Every value [`Config::validate`] can refuse keeps the [`Spanned`]
+        /// position it was written at, so a refusal names a line the way a
+        /// parse error does. A value that is absent has no span and no way to
+        /// be wrong: it is the default.
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Written {
             #[serde(default)]
-            pool_size: Option<u32>,
+            pool_size: Option<Spanned<u32>>,
             #[serde(default)]
-            max_concurrent: Option<u32>,
+            max_concurrent: Option<Spanned<u32>>,
             #[serde(default)]
-            drain_deadline_ms: Option<u64>,
+            drain_deadline_ms: Option<Spanned<u64>>,
             #[serde(default)]
-            defaults: Defaults,
+            defaults: WrittenDefaults,
             #[serde(default)]
-            overrides: BTreeMap<String, Override>,
+            overrides: BTreeMap<String, Spanned<Override>>,
+        }
+
+        /// [`Defaults`] as written. Separate because [`Defaults`] is what the
+        /// daemon and `config show` carry, and a span belongs to neither.
+        #[derive(Deserialize, Default)]
+        #[serde(deny_unknown_fields)]
+        struct WrittenDefaults {
+            #[serde(default)]
+            r#static: Option<Spanned<StaticDefault>>,
         }
 
         let written: Written = toml::from_str(text)
             .map_err(|err| BusybeeError::Other(format!("{}: {err}", path.display())))?;
+        let spans = Spans {
+            pool_size: written.pool_size.as_ref().map(Spanned::span),
+            max_concurrent: written.max_concurrent.as_ref().map(Spanned::span),
+            drain_deadline_ms: written.drain_deadline_ms.as_ref().map(Spanned::span),
+            r#static: written.defaults.r#static.as_ref().map(Spanned::span),
+            overrides: written
+                .overrides
+                .iter()
+                .map(|(key, row)| (key.clone(), row.span()))
+                .collect(),
+        };
         let config = Config {
             pool_size: match written.pool_size {
-                Some(n) => n,
+                Some(n) => n.into_inner(),
                 None => logical_cores()?,
             },
-            max_concurrent: written.max_concurrent.unwrap_or(DEFAULT_MAX_CONCURRENT),
+            max_concurrent: written
+                .max_concurrent
+                .map_or(DEFAULT_MAX_CONCURRENT, Spanned::into_inner),
             drain_deadline_ms: written
                 .drain_deadline_ms
-                .unwrap_or(DEFAULT_DRAIN_DEADLINE_MS),
-            defaults: written.defaults,
-            overrides: written.overrides,
+                .map_or(DEFAULT_DRAIN_DEADLINE_MS, Spanned::into_inner),
+            defaults: Defaults {
+                r#static: written
+                    .defaults
+                    .r#static
+                    .map_or_else(StaticDefault::default, Spanned::into_inner),
+            },
+            overrides: written
+                .overrides
+                .into_iter()
+                .map(|(key, row)| (key, row.into_inner()))
+                .collect(),
         };
-        config
-            .validate()
-            .map_err(|reason| BusybeeError::Other(format!("{}: {reason}", path.display())))?;
+        config.validate(&spans).map_err(|refusal| {
+            BusybeeError::Other(format!(
+                "{}: {}",
+                location(path, text, refusal.at),
+                refusal.reason
+            ))
+        })?;
         Ok(config)
     }
 
     /// Ranges and placeholders. Anything refused here would otherwise reach
     /// the pool or a task as a value it cannot act on.
-    fn validate(&self) -> Result<(), String> {
+    fn validate(&self, spans: &Spans) -> Result<(), Refusal> {
         if !(1..=MAX_POOL_SIZE).contains(&self.pool_size) {
-            return Err(format!(
-                "pool_size must be between 1 and {MAX_POOL_SIZE}, got {}",
-                self.pool_size
+            return Err(Refusal::at(
+                &spans.pool_size,
+                format!(
+                    "pool_size must be between 1 and {MAX_POOL_SIZE}, got {}",
+                    self.pool_size
+                ),
             ));
         }
         if self.max_concurrent == 0 {
-            return Err("max_concurrent must be at least 1, got 0".to_string());
+            return Err(Refusal::at(
+                &spans.max_concurrent,
+                "max_concurrent must be at least 1, got 0".to_string(),
+            ));
         }
         if !(MIN_DRAIN_DEADLINE_MS..=MAX_DRAIN_DEADLINE_MS).contains(&self.drain_deadline_ms) {
-            return Err(format!(
-                "drain_deadline_ms must be between {MIN_DRAIN_DEADLINE_MS} and \
-                 {MAX_DRAIN_DEADLINE_MS}, got {}",
-                self.drain_deadline_ms
+            return Err(Refusal::at(
+                &spans.drain_deadline_ms,
+                format!(
+                    "drain_deadline_ms must be between {MIN_DRAIN_DEADLINE_MS} and \
+                     {MAX_DRAIN_DEADLINE_MS}, got {}",
+                    self.drain_deadline_ms
+                ),
             ));
         }
         if self.defaults.r#static.cores_wanted() == Some(0) {
-            return Err("defaults.static must be \"fair\" or at least 1, got 0".to_string());
+            return Err(Refusal::at(
+                &spans.r#static,
+                "defaults.static must be \"fair\" or at least 1, got 0".to_string(),
+            ));
         }
 
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         for (key, over) in &self.overrides {
+            let row = spans.overrides.get(key).cloned();
             // Rows are looked up by basename, so two keys that share one would
             // fight over a single row and the winner would be invisible.
             let tool = basename(key);
             if !seen.insert(tool) {
-                return Err(format!(
-                    "two overrides match the tool {tool:?}; keys are matched on the \
-                     basename, so only one of them can have the row"
+                return Err(Refusal::at(
+                    &row,
+                    format!(
+                        "two overrides match the tool {tool:?}; keys are matched on the \
+                         basename, so only one of them can have the row"
+                    ),
                 ));
             }
             for (name, value) in &over.env {
-                check_placeholders(value)
-                    .map_err(|reason| format!("overrides.{key}.env.{name}: {reason}"))?;
+                check_placeholders(value).map_err(|reason| {
+                    Refusal::at(&row, format!("overrides.{key}.env.{name}: {reason}"))
+                })?;
             }
         }
         Ok(())
     }
+}
+
+/// Where in the file each value that [`Config::validate`] can refuse was
+/// written. Without it a refusal names the key but not the line, which is the
+/// half of a parse error that makes a typo findable.
+struct Spans {
+    pool_size: Option<Range<usize>>,
+    max_concurrent: Option<Range<usize>>,
+    drain_deadline_ms: Option<Range<usize>>,
+    r#static: Option<Range<usize>>,
+    /// Keyed as the file wrote them; the span covers the whole row, which is
+    /// also where that row's `env` values are.
+    overrides: BTreeMap<String, Range<usize>>,
+}
+
+/// Why a file was refused, and where in it to look.
+struct Refusal {
+    reason: String,
+    at: Option<Range<usize>>,
+}
+
+impl Refusal {
+    fn at(span: &Option<Range<usize>>, reason: String) -> Self {
+        Refusal {
+            reason,
+            at: span.clone(),
+        }
+    }
+}
+
+/// The file, plus the line to look at when the refusal knows one — the same
+/// "line N" a parse error names.
+fn location(path: &Path, text: &str, at: Option<Range<usize>>) -> String {
+    match at {
+        Some(span) => format!("{} line {}", path.display(), line_of(text, span.start)),
+        None => path.display().to_string(),
+    }
+}
+
+/// The 1-based line the byte at `offset` sits on. Counted over bytes rather
+/// than by slicing, so a span the caller got wrong cannot panic here.
+fn line_of(text: &str, offset: usize) -> usize {
+    text.as_bytes()[..offset.min(text.len())]
+        .iter()
+        .filter(|byte| **byte == b'\n')
+        .count()
+        + 1
 }
 
 /// Rejects any `{…}` span that is not one the daemon substitutes: an unknown
@@ -444,20 +550,28 @@ static = "fair"
         assert!(message.contains("line 1"), "message was {message:?}");
     }
 
+    /// A value inside its type but outside its range is as hard to find as a
+    /// typo, so it is refused the same way: the key, and the line it is on.
+    /// The leading blank line puts each offender past line 1, where a message
+    /// that names no line at all cannot pass by accident.
     #[test]
-    fn out_of_range_values_are_refused() {
-        for (body, key) in [
-            ("pool_size = 0\n", "pool_size"),
-            ("pool_size = 4097\n", "pool_size"),
-            ("max_concurrent = 0\n", "max_concurrent"),
-            ("drain_deadline_ms = 99\n", "drain_deadline_ms"),
-            ("drain_deadline_ms = 60001\n", "drain_deadline_ms"),
-            ("[defaults]\nstatic = 0\n", "static"),
+    fn out_of_range_values_are_refused_with_their_line() {
+        for (body, key, line) in [
+            ("\npool_size = 0\n", "pool_size", 2),
+            ("\npool_size = 4097\n", "pool_size", 2),
+            ("\nmax_concurrent = 0\n", "max_concurrent", 2),
+            ("\ndrain_deadline_ms = 99\n", "drain_deadline_ms", 2),
+            ("\ndrain_deadline_ms = 60001\n", "drain_deadline_ms", 2),
+            ("\n[defaults]\nstatic = 0\n", "static", 3),
         ] {
             let message = error(body);
             assert!(
                 message.contains(key),
                 "{body:?} was refused with {message:?}, which does not name {key}"
+            );
+            assert!(
+                message.contains(&format!("line {line}")),
+                "{body:?} was refused with {message:?}, which does not name line {line}"
             );
         }
     }
@@ -475,7 +589,7 @@ static = "fair"
     #[test]
     fn an_unknown_placeholder_in_an_override_env_is_refused() {
         let message = error(
-            "[overrides]\nmytool = { class = \"static\", \
+            "\n[overrides]\nmytool = { class = \"static\", \
              env = { MYTOOL_THREADS = \"{threads}\" } }\n",
         );
 
@@ -484,6 +598,7 @@ static = "fair"
             message.contains("overrides.mytool.env.MYTOOL_THREADS"),
             "message was {message:?}"
         );
+        assert!(message.contains("line 3"), "message was {message:?}");
     }
 
     #[test]
@@ -508,6 +623,9 @@ static = "fair"
         );
 
         assert!(message.contains("build.sh"), "message was {message:?}");
+        // The line of the second of the two, which is the one that has no row
+        // of its own to take.
+        assert!(message.contains("line 3"), "message was {message:?}");
     }
 
     #[test]
