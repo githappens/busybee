@@ -8,13 +8,12 @@ live CPU + queue TUI.
 ## Why
 
 Running several agentic dev sessions in parallel is great — until they all fire
-off a `cmake --build`, `cargo build`, or big test suite at the same time.
-Saturating every core simultaneously means every session gets slower, agents
-time out, and the fans scream. Serialising them fixes the contention but wastes
-the machine: one `cargo build` rarely keeps every core busy. You prefix the
-heavy command with `busybee --`, and it runs with a share of the machine
-instead of a claim on all of it — full stdout and exit-code passthrough, as if
-you had typed it directly.
+off a `cmake --build`, `cargo build`, or big test suite at once. Saturating
+every core means every session gets slower, agents time out, and the fans
+scream. Serialising them fixes the contention but wastes the machine: one
+`cargo build` rarely keeps every core busy. Prefix the heavy command with
+`busybee --` and it runs with a share of the machine instead of a claim on all
+of it — full stdout and exit-code passthrough, as if you had typed it directly.
 
 ## How it works
 
@@ -40,7 +39,8 @@ compile unit. No daemon decision is involved. The caveat is static tasks: their
 tools read the core count once at startup, so a static task is **locked at the
 number it was admitted with** until it exits, even if the machine empties out.
 (Injection lands with [#8](https://github.com/githappens/busybee/issues/8);
-until then every task is admitted `none` and says so.)
+until then every task is admitted `none`, `--class` and `--cores` only earn a
+notice, and busybee says as much on stderr.)
 
 ## Usage
 
@@ -73,11 +73,10 @@ the same live under the CPU gauges. Neither starts a daemon: with none running
 `status` reports an idle pool on stderr and exits 0 with stdout empty, unless the
 daemon died leaving tasks behind.
 
-Press `q` in the monitor to quit. Press `Ctrl-C` while blocked to cancel — the
-queued or running task is killed and busybee exits 130. `--detach` prints a
-lease id and returns, and the task keeps running after the client is gone, so
-`Ctrl-C` cannot reach it: `busybee cancel <id>` is the only way to end one
-early.
+Press `q` in the monitor to quit. `Ctrl-C` while blocked cancels: the queued or
+running task is killed and busybee exits 130. `--detach` prints a lease id and
+returns, and the task outlives the client, so `Ctrl-C` cannot reach it —
+`busybee cancel <id>` is the only way to end one early.
 
 ## Tools
 
@@ -98,7 +97,9 @@ jobserver rows assume make ≥ 4.4, ninja ≥ 1.13 and a Make or Ninja generator
 under `cmake --build`; nothing verifies it, so an older tool is still admitted
 as jobserver, ignores the fifo and runs at its own default. Your own count wins
 too: `make -j8`, `cargo build -j8`, `cmake --build … --parallel 8` keep your
-number — no injection, no tokens, a notice saying so, running beside the pool.
+number. busybee still points `MAKEFLAGS` at the fifo and prints a notice, but
+your flag overrides it, and a jobserver task holds no tokens either way — so
+that build runs beside the pool rather than inside it.
 
 **none** is the honest default for a command busybee cannot reason about: a
 benchmark, a render, an opaque `sh -c '…'`. It takes the whole pool and
@@ -122,9 +123,8 @@ busybee config show      # the effective configuration (defaults merged), as TOM
 busybee config reload    # make a running bzbd re-read the file (same as SIGHUP)
 ```
 
-The file lives at `$XDG_CONFIG_HOME/busybee/config.toml`, or
-`~/.config/busybee/config.toml` when `XDG_CONFIG_HOME` is unset. `BUSYBEE_CONFIG`
-names a different file outright (it must be an absolute path).
+It lives at `busybee/config.toml` under `$XDG_CONFIG_HOME`, or under
+`~/.config` when that is unset; `BUSYBEE_CONFIG` (absolute) names another file.
 
 ```toml
 pool_size = 18            # default: logical cores
@@ -152,9 +152,9 @@ static = "fair"           # or a fixed core count
 
 An override key is matched against the tool's basename, so `"./build.sh"` and
 `"build.sh"` name the same row (two keys that collapse to one are an error).
-What a row keeps from the built-in one is the flags that tool spells
-parallelism with, which the file has no way to say: `cargo -j8` still earns its
-notice under an override.
+A row keeps one thing from the built-in it replaces — the flags that tool
+spells parallelism with, which the file cannot say: `cargo -j8` still earns its
+notice.
 
 A file that does not parse, names a key busybee does not read, or carries a
 value out of range is refused whole, with the line to fix: nothing is applied
