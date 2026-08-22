@@ -462,8 +462,11 @@ async fn a_restarted_daemon_finishes_the_teardown_it_was_killed_in() {
         return;
     };
     let mut daemon = pool_of_four_patient_kill(&pueued.config_path);
-    // `trap` makes the shell ignore SIGTERM, and `sleep` inherits that.
-    let (conn, _, survivor) = run(&daemon, request(&["sh", "-c", "trap '' TERM; sleep 5"])).await;
+    // `trap` makes the shell ignore SIGTERM, and `sleep` inherits that. It
+    // sleeps far longer than the test runs: the point is a task that is still
+    // there when the daemon is killed, so one that could end on its own first
+    // would make the test pass or fail on how busy the machine is.
+    let (conn, _, survivor) = run(&daemon, request(&["sh", "-c", "trap '' TERM; sleep 300"])).await;
 
     // The client hangs up; the daemon sends SIGTERM and waits for pueued to
     // confirm the task gone, which it will not for another second.
