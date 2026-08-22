@@ -1,26 +1,31 @@
-# Turn Codex's automated review into a review decision the orchestrator can act
-# on. Codex (chatgpt-codex-connector[bot]) posts comment-only reviews; this job
-# reads the latest Codex review for the PR's head commit and submits, as
-# github-actions[bot], REQUEST_CHANGES when it carries any inline finding and
-# APPROVE when it carries none (a clean re-review after a push is the merge
-# signal). With a ruleset requiring one approval on main,
-# that is what moves `reviewDecision` from REVIEW_REQUIRED to APPROVED.
+# Merge gate: turn Codex's automated review into a review decision.
 #
-# Reviews submitted by the Codex app have been observed not to fire the
-# pull_request_review trigger, so a schedule sweeps every open PR; the event
-# triggers only make it faster when they do fire. Evaluation is idempotent.
+# Codex (chatgpt-codex-connector[bot]) reviews every push but never approves or
+# requests changes; it posts a review with inline findings when it has
+# something to say and otherwise only an issue comment. This workflow
 #
-# Requires the repository setting "Allow GitHub Actions to create and approve
-# pull requests" (Settings → Actions → General → Workflow permissions).
+#   1. selects (deterministically) the open PRs where Codex has said something
+#      about the current head commit that the gate has not yet judged,
+#   2. has a small Claude model read that material and decide APPROVE,
+#      REQUEST_CHANGES, or UNSURE (the model never holds the review token), and
+#   3. posts the verdict as github-actions[bot]. UNSURE posts nothing, so the
+#      PR waits for a human instead of the gate guessing.
+#
+# With the ruleset on main requiring one approval (dismissed on push), the
+# verdict is what moves `reviewDecision`, which the orchestrator's auto-merge
+# reads. Requires the repository setting "Allow GitHub Actions to create and
+# approve pull requests" and the CLAUDE_CODE_OAUTH_TOKEN secret.
 name: codex-gate
 
 on:
   schedule:
     - cron: "*/5 * * * *"
-  pull_request_review:
-    types: [submitted]
   pull_request:
     types: [synchronize]
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
   workflow_dispatch:
     inputs:
       pr:
@@ -28,65 +33,155 @@ on:
         required: false
 
 permissions:
-  pull-requests: write
   contents: read
+  pull-requests: write
+  issues: read
 
 concurrency:
   group: codex-gate
   cancel-in-progress: false
 
+env:
+  REVIEWER: chatgpt-codex-connector[bot]
+  GATE: github-actions[bot]
+
 jobs:
-  gate:
+  select:
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ github.token }}
-      REPO: ${{ github.repository }}
-      ONLY_PR: ${{ github.event.pull_request.number || inputs.pr }}
-      REVIEWER: chatgpt-codex-connector[bot]
+    outputs:
+      prs: ${{ steps.pick.outputs.prs }}
     steps:
-      - name: Evaluate the latest Codex review for each PR head
+      - name: Find PRs with unjudged Codex activity on their head commit
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ONLY_PR: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
         run: |
           set -euo pipefail
-          if [ -n "$ONLY_PR" ]; then
+          if [ -n "$ONLY_PR" ] && gh api "repos/$REPO/pulls/$ONLY_PR" --jq .state 2>/dev/null | grep -q open; then
             prs="$ONLY_PR"
           else
             prs=$(gh pr list --repo "$REPO" --state open --limit 100 --json number --jq '.[].number')
           fi
+          picked=()
           for PR in $prs; do
             export HEAD=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
-            echo "== PR #$PR head $HEAD"
-
-            # Codex with findings: a review object pinned to the head commit.
-            # Codex with nothing to flag: no review, just an issue comment
-            # "Codex Review: Didn't find any major issues" (no commit id), so
-            # accept one dated after the head commit. A later push dismisses the
-            # gate's approval anyway (ruleset), so a stale verdict cannot carry over.
-            review_id=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-              --jq '[.[] | select(.user.login==env.REVIEWER and .commit_id==env.HEAD)] | sort_by(.submitted_at) | last | .id // empty')
-            if [ -n "$review_id" ]; then
-              findings=$(gh api "repos/$REPO/pulls/$PR/reviews/$review_id/comments" --paginate --jq 'length')
-              verdict="review $review_id"
+            export HEAD_DATE=$(gh api "repos/$REPO/commits/$HEAD" --jq .commit.committer.date)
+            reviews=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate)
+            codex_at=$(jq -r '[.[] | select(.user.login==env.REVIEWER and .commit_id==env.HEAD) | .submitted_at] | max // empty' <<<"$reviews")
+            comment_at=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+              --jq '[.[] | select(.user.login==env.REVIEWER and .created_at > env.HEAD_DATE) | .created_at] | max // empty')
+            latest=$(printf '%s\n%s\n' "$codex_at" "$comment_at" | sort | tail -1)
+            gate_at=$(jq -r '[.[] | select(.user.login==env.GATE and .commit_id==env.HEAD) | .submitted_at] | max // empty' <<<"$reviews")
+            if [ -n "$latest" ] && { [ -z "$gate_at" ] || [[ "$latest" > "$gate_at" ]]; }; then
+              echo "PR #$PR: Codex activity at $latest, last verdict ${gate_at:-none} -> judge"
+              picked+=("$PR")
             else
-              export HEAD_DATE=$(gh api "repos/$REPO/commits/$HEAD" --jq .commit.committer.date)
-              clean=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-                --jq '[.[] | select(.user.login==env.REVIEWER and (.body | test("Didn.t find any major issues")) and .created_at > env.HEAD_DATE)] | length')
-              if [ "$clean" -gt 0 ]; then findings=0; verdict="clean comment after $HEAD_DATE"
-              else echo "   no Codex verdict for this head yet"; continue; fi
-            fi
-
-            mine=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-              --jq '[.[] | select(.user.login=="github-actions[bot]" and .commit_id==env.HEAD)] | sort_by(.submitted_at) | last | .state // empty')
-            echo "   codex $verdict: $findings finding(s); gate so far: ${mine:-none}"
-
-            if [ "$findings" -gt 0 ]; then
-              [ "$mine" = "CHANGES_REQUESTED" ] && continue
-              gh api -X POST "repos/$REPO/pulls/$PR/reviews" -f event=REQUEST_CHANGES -f commit_id="$HEAD" \
-                -f body="codex-gate: Codex left $findings finding(s) on $HEAD. Fix each one, or reply on its thread with why it does not apply, then push; the gate re-evaluates on the next Codex review." >/dev/null
-              echo "   -> REQUEST_CHANGES"
-            else
-              [ "$mine" = "APPROVED" ] && continue
-              gh api -X POST "repos/$REPO/pulls/$PR/reviews" -f event=APPROVE -f commit_id="$HEAD" \
-                -f body="codex-gate: Codex reports no findings on $HEAD ($verdict)." >/dev/null
-              echo "   -> APPROVE"
+              echo "PR #$PR: nothing new (codex ${latest:-none}, verdict ${gate_at:-none})"
             fi
           done
+          printf 'prs=%s\n' "$(printf '%s\n' "${picked[@]:-}" | grep -v '^$' | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+
+  judge:
+    needs: select
+    if: needs.select.outputs.prs != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 2
+      fail-fast: false
+      matrix:
+        pr: ${{ fromJSON(needs.select.outputs.prs) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR: ${{ matrix.pr }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Collect the review material for the head commit
+        run: |
+          set -euo pipefail
+          mkdir -p gate
+          export HEAD=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+          export HEAD_DATE=$(gh api "repos/$REPO/commits/$HEAD" --jq .commit.committer.date)
+          {
+            echo "# PR #$PR — review material for head $HEAD (committed $HEAD_DATE)"
+            echo
+            gh api "repos/$REPO/pulls/$PR" --jq '"Title: \(.title)\nAuthor: \(.user.login)\nBranch: \(.head.ref) -> \(.base.ref)\n\n## PR description\n\(.body // "(none)")"'
+            echo
+            echo "## Codex reviews pinned to this head (newest last)"
+            gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
+              --jq '[.[] | select(.user.login==env.REVIEWER and .commit_id==env.HEAD)] | sort_by(.submitted_at) | .[] | "\n### review \(.id) at \(.submitted_at) state=\(.state)\n\(.body)"'
+            echo
+            echo "## Inline review comments on this PR created after the head commit (all authors; replies included)"
+            gh api "repos/$REPO/pulls/$PR/comments" --paginate \
+              --jq '[.[] | select(.created_at > env.HEAD_DATE)] | sort_by(.created_at) | .[] | "\n- [\(.created_at)] \(.user.login) on \(.path):\(.line // .original_line // "?")\(if .in_reply_to_id then " (reply to \(.in_reply_to_id))" else "" end) id=\(.id)\n  \(.body | gsub("\n"; "\n  "))"'
+            echo
+            echo "## Issue comments on this PR created after the head commit (all authors)"
+            gh api "repos/$REPO/issues/$PR/comments" --paginate \
+              --jq '[.[] | select(.created_at > env.HEAD_DATE)] | sort_by(.created_at) | .[] | "\n- [\(.created_at)] \(.user.login):\n  \(.body | gsub("\n"; "\n  "))"'
+            echo
+            echo "## Previous gate verdicts on this head"
+            gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
+              --jq '[.[] | select(.user.login==env.GATE and .commit_id==env.HEAD)] | .[] | "- \(.submitted_at) \(.state): \(.body)"'
+          } > gate/context.md
+          echo "HEAD=$HEAD" >> "$GITHUB_ENV"
+          wc -c gate/context.md
+
+      - name: Decide
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: |
+            --model claude-haiku-4-5
+            --max-turns 6
+            --allowedTools "Read,Write,Glob,Grep,Bash(gh pr diff:*)"
+          prompt: |
+            You are the merge gate for pull request #${{ matrix.pr }} in ${{ github.repository }}.
+            Read `gate/context.md` (all the automated-review material for the PR's
+            current head commit) and, only if you need it, `gh pr diff ${{ matrix.pr }}`
+            and `AGENTS.md`. Then write your decision to `gate/verdict.json` as
+            `{"verdict": "APPROVE" | "REQUEST_CHANGES" | "UNSURE", "reason": "<one or two sentences>"}`
+            and stop. Do not post comments, do not edit other files.
+
+            How the automated reviewer (Codex, login chatgpt-codex-connector[bot]) behaves:
+            it reviews every push. When it has findings it submits a review pinned to
+            the head commit with inline comments, each usually carrying a priority
+            badge (P0/P1/P2). When it has nothing to flag it submits no review and
+            instead posts an issue comment saying, in some wording, that it found no
+            major issues. Wording and formatting may vary between versions; judge the
+            meaning, not the exact text.
+
+            Decision rules:
+            - APPROVE only when Codex's latest signal for THIS head is clean: either an
+              issue comment after the head commit saying it found nothing, or a review
+              on this head with zero inline findings.
+            - REQUEST_CHANGES when Codex's latest review on this head has one or more
+              inline findings. Replies or rebuttals by the PR author do NOT lift a block:
+              the author must fix or justify and push, and Codex's re-review of the new
+              head is the signal. Summarise the open findings in the reason.
+            - UNSURE when you cannot tell what Codex concluded about this head (for
+              example only a "task started" or acknowledgement comment, a review whose
+              commit differs from the head, or contradictory material). Say why.
+            Never approve because the material is empty or ambiguous.
+
+      - name: Post the verdict as github-actions[bot]
+        run: |
+          set -euo pipefail
+          [ -s gate/verdict.json ] || { echo "::error::no verdict written by the model"; exit 1; }
+          verdict=$(jq -r .verdict gate/verdict.json)
+          reason=$(jq -r .reason gate/verdict.json)
+          echo "verdict: $verdict — $reason"
+          case "$verdict" in
+            APPROVE|REQUEST_CHANGES) ;;
+            UNSURE) echo "::warning::gate unsure for PR #$PR: $reason"; exit 0 ;;
+            *) echo "::error::invalid verdict '$verdict'"; exit 1 ;;
+          esac
+          current=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
+            --jq '[.[] | select(.user.login==env.GATE and .commit_id==env.HEAD)] | sort_by(.submitted_at) | last | .state // empty')
+          state="CHANGES_REQUESTED"; [ "$verdict" = APPROVE ] && state="APPROVED"
+          if [ "$current" = "$state" ]; then echo "already $state for $HEAD"; exit 0; fi
+          gh api -X POST "repos/$REPO/pulls/$PR/reviews" -f event="$verdict" -f commit_id="$HEAD" \
+            -f body="codex-gate ($verdict on $HEAD): $reason" >/dev/null
+          echo "posted $verdict"
