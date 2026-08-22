@@ -104,12 +104,17 @@ nix develop -c cargo test -p bzb --test smoke
   be loud — logged and visible in the result — never the quiet default. The
   design document applies this to the daemon too: if it cannot create its fifo
   or socket it refuses to start rather than running the command ungoverned.
+  One known exception predates the rule: `group::enforce_parallel` drops the
+  daemon's reply, so a hand-raised `parallel_tasks` is silently not restored.
+  Do not copy that pattern; new code propagates.
 - **Pure state machines, IO at the edges.** `wait.rs` is the model: it takes a
   status snapshot and returns events, with no sockets or clocks inside, so it
   is testable without a daemon. New scheduling and classification logic follows
   the same shape.
 - **stdout belongs to the wrapped task.** Every message busybee emits about
-  itself goes to stderr, prefixed `busybee: `.
+  itself goes to stderr, prefixed `busybee: `. The exception is `--detach`,
+  whose `busybee: enqueued task <id>` line is its result and so goes to stdout
+  — `crates/bzb/tests/smoke.rs` asserts that channel.
 - **`exit_code.rs` is the single source of truth** for translating a task
   result into a process exit code. Do not map results anywhere else.
 
