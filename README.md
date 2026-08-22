@@ -104,7 +104,9 @@ static = "fair"           # or a fixed core count
 An override key is matched against the tool's basename, so `"./build.sh"` and
 `"build.sh"` name the same row (two keys that collapse to one are an error).
 The row it produces replaces the built-in one for that tool outright, class and
-injection together.
+injection together. What it keeps is the flags that tool spells parallelism
+with, which the file has no way to say: `cargo -j8` still earns its notice
+under an override.
 
 A file that does not parse, names a key busybee does not read, or carries a
 value out of range is refused whole, with the line to fix: nothing is applied

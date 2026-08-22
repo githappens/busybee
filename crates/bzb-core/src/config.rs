@@ -179,6 +179,17 @@ impl Config {
     pub fn apply_overrides(&self, table: &mut Table) {
         for (key, over) in &self.overrides {
             let tool = basename(key);
+            // How a tool spells parallelism is not something the file can say,
+            // so it is not something a row replaces either: the notice a
+            // user's own `-j` earns is promised for every tool that has one
+            // (`docs/design/bzbd.md` §Classification), and it outlives the
+            // built-in row that knew the flags.
+            let parallel_flags = table
+                .rows
+                .iter()
+                .find(|row| row.tool == tool && !row.parallel_flags.is_empty())
+                .map(|row| row.parallel_flags.clone())
+                .unwrap_or_default();
             table.rows.retain(|row| row.tool != tool);
             table.rows.push(Rule {
                 tool: tool.to_string(),
@@ -191,9 +202,7 @@ impl Config {
                     Class::Jobserver => Inject::Jobserver,
                     Class::Static | Class::None => Inject::None,
                 },
-                // The file cannot say which flags the tool spells parallelism
-                // with, so there is no user-flag notice for these rows.
-                parallel_flags: Vec::new(),
+                parallel_flags,
                 env_set: over
                     .env
                     .iter()
@@ -711,6 +720,29 @@ static = "fair"
             !plan.env_set.iter().any(|(k, _)| k == "MAKEFLAGS"),
             "the replaced row must not keep cargo's jobserver injection: {:?}",
             plan.env_set
+        );
+    }
+
+    /// The file has no way to spell how a tool writes parallelism, so that is
+    /// not part of what a row replaces: `docs/design/bzbd.md` §Classification
+    /// promises a notice for every user-supplied parallelism flag, and a
+    /// replaced row that lost the built-in scanner would stop earning it.
+    #[test]
+    fn an_override_keeps_the_replaced_rows_parallelism_flags() {
+        let config = load("[overrides]\ncargo = { class = \"jobserver\" }\n").expect("parse");
+        let mut table = default_table();
+        config.apply_overrides(&mut table);
+
+        let plan = classify(
+            &["cargo".to_string(), "build".to_string(), "-j8".to_string()],
+            &Overrides::default(),
+            &table,
+        );
+
+        assert!(
+            plan.notices.iter().any(|n| n.contains("-j8")),
+            "notices were {:?}",
+            plan.notices
         );
     }
 
