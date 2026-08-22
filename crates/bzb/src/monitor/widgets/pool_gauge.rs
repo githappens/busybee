@@ -111,18 +111,21 @@ fn segments(reply: &StatusReply, width: u64) -> (u64, u64, u64) {
 }
 
 fn legend(reply: &StatusReply, stale: Option<Duration>) -> String {
-    let mut legend = format!(
+    // The counts are the last ones bzbd sent, and a poll has failed since: say
+    // how old they are rather than let them read as current. The marker leads
+    // because the counts are variable-length and the line is clipped from the
+    // right, so a trailing marker is the first thing a narrow terminal drops.
+    let mut legend = match stale {
+        Some(age) => format!("(stale {}s) · ", age.as_secs()),
+        None => String::new(),
+    };
+    legend.push_str(&format!(
         "{} tokens · {} held · ~{} in use · {} free",
         reply.pool_size,
         reply.held,
         approx_in_use(reply),
         reply.free
-    );
-    // The numbers above are the last ones bzbd sent, and a poll has failed
-    // since: say how old they are rather than let them read as current.
-    if let Some(age) = stale {
-        legend.push_str(&format!(" · (stale {}s)", age.as_secs()));
-    }
+    ));
     legend
 }
 
@@ -239,10 +242,26 @@ mod tests {
             60,
         );
         assert!(
-            lines[1].trim_end().ends_with("(stale 3s)"),
+            lines[1].trim_end().starts_with("(stale 3s)"),
             "legend was {:?}",
             lines[1]
         );
+    }
+
+    /// The counts are variable-length, so a marker after them is the first
+    /// thing a narrow terminal clips — and clipping it turns a degraded poll
+    /// into numbers that read as current.
+    #[test]
+    fn a_narrow_terminal_clips_the_counts_before_the_stale_marker() {
+        let reply = busy();
+        let lines = draw(
+            &PoolView::Known {
+                reply: &reply,
+                stale: Some(Duration::from_secs(3)),
+            },
+            12,
+        );
+        assert!(lines[1].contains("stale 3s"), "legend was {:?}", lines[1]);
     }
 
     #[test]

@@ -29,6 +29,24 @@ const WIDTHS: [Constraint; 7] = [
     Constraint::Min(0),
 ];
 
+/// `WIDTHS` with the id column widened to the ids actually on screen. bzbd's
+/// counter climbs for as long as the daemon lives, and a clipped id is one the
+/// operator would pass to `busybee cancel` wrong.
+fn widths(leases: &[LeaseView]) -> [Constraint; 7] {
+    let mut widths = WIDTHS;
+    let widest = leases
+        .iter()
+        .map(|lease| id(lease).len() as u16)
+        .max()
+        .unwrap_or(0);
+    widths[0] = Constraint::Length(widest.max(5));
+    widths
+}
+
+fn id(lease: &LeaseView) -> String {
+    format!("#{}", lease.id)
+}
+
 impl Widget for LeaseTable<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let (running, queued): (Vec<_>, Vec<_>) = self
@@ -36,7 +54,7 @@ impl Widget for LeaseTable<'_> {
             .iter()
             .partition(|lease| lease.state == "running");
         let rows: Vec<Row> = running.into_iter().chain(queued).map(row).collect();
-        Table::new(rows, WIDTHS).render(area, buf);
+        Table::new(rows, widths(self.leases)).render(area, buf);
     }
 }
 
@@ -47,7 +65,7 @@ fn row(lease: &LeaseView) -> Row<'static> {
         Style::default().fg(Color::DarkGray)
     };
     Row::new(vec![
-        format!("#{}", lease.id),
+        id(lease),
         lease.state.clone(),
         elapsed(lease.elapsed_ms),
         printable(&lease.tool),
@@ -160,6 +178,17 @@ mod tests {
             "row was {:?}",
             lines[0]
         );
+    }
+
+    /// The id column is what `busybee cancel <id>` takes, and bzbd's counter
+    /// keeps going up for as long as the daemon lives: a clipped `#10000` is
+    /// an id the operator would type wrong.
+    #[test]
+    fn a_lease_id_wider_than_the_column_widens_it() {
+        let leases = vec![lease(10_000, "running", "static")];
+        let lines = draw(&leases, 90, 1);
+        assert!(lines[0].starts_with("#10000"), "row was {:?}", lines[0]);
+        assert!(lines[0].contains("xcodebuild") || lines[0].contains("cargo"));
     }
 
     #[test]

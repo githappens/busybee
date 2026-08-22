@@ -315,7 +315,7 @@ mod tests {
         ));
         assert_eq!(
             legend(&view),
-            "18 tokens · 9 held · ~3 in use · 6 free · (stale 3s)"
+            "(stale 3s) · 18 tokens · 9 held · ~3 in use · 6 free"
         );
     }
 
