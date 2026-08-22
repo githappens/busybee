@@ -82,10 +82,12 @@ const FILE_UMASK: libc::mode_t = 0o177;
 /// creation is always a window: a unix socket in particular is connectable
 /// from the moment it is bound. The umask makes owner-only part of every
 /// creation instead, before the first of them happens.
-fn restrict_umask(mask: libc::mode_t) {
+/// Returns the mask it replaced, which is what lets a test put the process
+/// back the way it found it.
+fn restrict_umask(mask: libc::mode_t) -> libc::mode_t {
     // SAFETY: `umask` is a process-wide setting with no preconditions. It is
     // not thread-safe against a concurrent file creation, hence this early.
-    unsafe { libc::umask(mask) };
+    unsafe { libc::umask(mask) }
 }
 
 /// Creates the state directory owner-only. The socket inside it is the
@@ -111,7 +113,7 @@ fn start(ready: &mut Ready, log: &Path) -> Result<()> {
     init_logging(log)?;
 
     let pid_file = pid_path()?;
-    let Some(_locked) = lock_pid_file(&pid_file)? else {
+    let Some(locked) = lock_pid_file(&pid_file)? else {
         // Someone else is already serving, which is what the caller wanted.
         ready.report(SERVING);
         eprintln!("bzbd: already running");
@@ -119,9 +121,20 @@ fn start(ready: &mut Ready, log: &Path) -> Result<()> {
         return Ok(());
     };
 
-    tokio::runtime::Runtime::new()
-        .context("cannot start the tokio runtime")?
-        .block_on(serve(&socket_path()?, &pid_file, ready))
+    let runtime = tokio::runtime::Runtime::new().context("cannot start the tokio runtime")?;
+    let served = runtime.block_on(serve(&socket_path()?, ready));
+    // Every connection task dies with the runtime, so this is the point at
+    // which no daemon work is left. Unlinking `bzbd.pid` before it would let a
+    // concurrently launched bzbd create a fresh inode, lock that instead, and
+    // start serving alongside us — the lock only excludes what shares its
+    // inode. Hence the unlink lives here rather than in `serve`, and `locked`
+    // outlives it.
+    drop(runtime);
+    served?;
+    std::fs::remove_file(&pid_file)
+        .with_context(|| format!("cannot remove the pid file {}", pid_file.display()))?;
+    drop(locked);
+    Ok(())
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<bool> {
@@ -135,7 +148,10 @@ fn parse_args(args: impl Iterator<Item = String>) -> Result<bool> {
     Ok(foreground)
 }
 
-async fn serve(socket: &Path, pid_file: &Path, ready: &mut Ready) -> Result<()> {
+/// Serves until SIGTERM or SIGINT, then closes the listener and unlinks the
+/// socket. The pid file is `start`'s to unlink, once the runtime this runs on
+/// is gone: while it survives, so does the daemon work its lock excludes.
+async fn serve(socket: &Path, ready: &mut Ready) -> Result<()> {
     // Before the socket exists: the socket is how everyone else finds us, and
     // a SIGTERM landing before these are installed kills us on the spot,
     // leaving the socket and the pid file behind.
@@ -175,8 +191,6 @@ async fn serve(socket: &Path, pid_file: &Path, ready: &mut Ready) -> Result<()> 
     drop(listener);
     std::fs::remove_file(socket)
         .with_context(|| format!("cannot remove the socket {}", socket.display()))?;
-    std::fs::remove_file(pid_file)
-        .with_context(|| format!("cannot remove the pid file {}", pid_file.display()))?;
     Ok(())
 }
 
@@ -446,8 +460,38 @@ mod tests {
     use super::*;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, MutexGuard, PoisonError,
     };
+
+    /// Every test here that creates a file or a directory takes this. `umask`
+    /// is process-wide, and the test harness runs these on threads of one
+    /// process: a mask leaking out of the test that set it would give a
+    /// neighbour's `tempdir` no execute bit, and nothing can be created inside
+    /// a directory that cannot be traversed.
+    static UMASK: Mutex<()> = Mutex::new(());
+
+    /// Holds [`UMASK`] and puts the process-wide mask back on the way out.
+    struct Umask {
+        _lock: MutexGuard<'static, ()>,
+        previous: libc::mode_t,
+    }
+
+    impl Drop for Umask {
+        fn drop(&mut self) {
+            restrict_umask(self.previous);
+        }
+    }
+
+    /// Sets the umask for the rest of the test, excluding the other tests
+    /// meanwhile. A panic while it is held poisons nothing that matters — the
+    /// mask is restored by the drop either way — so the poison is ignored.
+    fn hold_umask(mask: libc::mode_t) -> Umask {
+        let lock = UMASK.lock().unwrap_or_else(PoisonError::into_inner);
+        Umask {
+            previous: restrict_umask(mask),
+            _lock: lock,
+        }
+    }
 
     #[test]
     fn foreground_is_off_unless_asked_for() {
@@ -490,10 +534,10 @@ mod tests {
     /// each other across the test harness's threads.
     #[test]
     fn the_state_directory_and_the_socket_are_born_owner_only() {
+        let _umask = hold_umask(DIR_UMASK);
         let tmp = tempfile::tempdir().expect("create tempdir");
         let nested = tmp.path().join("outer/state");
 
-        restrict_umask(DIR_UMASK);
         create_state_dir(&nested).expect("create the state directory");
 
         for dir in [nested.parent().expect("outer"), nested.as_path()] {
@@ -518,6 +562,9 @@ mod tests {
     /// at. Refuse instead, loudly.
     #[test]
     fn a_symlinked_pid_file_is_refused() {
+        // A mask a tempdir survives, held so the owner-only test cannot set
+        // its own while this one is creating files.
+        let _umask = hold_umask(0o022);
         let tmp = tempfile::tempdir().expect("create tempdir");
         let target = tmp.path().join("precious");
         std::fs::write(&target, "keep me").expect("write the target");
