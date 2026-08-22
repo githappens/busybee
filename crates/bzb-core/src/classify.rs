@@ -59,12 +59,6 @@ impl Class {
     }
 }
 
-impl std::fmt::Display for Class {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 impl FromStr for Class {
     type Err = String;
 
@@ -101,28 +95,6 @@ pub enum Inject {
     Ctest,
     /// Append `-n {cores}` to `PYTEST_ADDOPTS`.
     Pytest,
-}
-
-/// Which class an injection recipe is meaningful for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Style {
-    /// Nothing to keep or drop.
-    Empty,
-    /// Hands the task the shared fifo: only valid for [`Class::Jobserver`].
-    Fifo,
-    /// Tells the task a fixed core count: valid for [`Class::Static`] and
-    /// [`Class::None`], both of which hold a fixed number of tokens.
-    Count,
-}
-
-impl Inject {
-    fn style(self) -> Style {
-        match self {
-            Inject::None => Style::Empty,
-            Inject::Jobserver | Inject::Cmake | Inject::Cargo => Style::Fifo,
-            Inject::Xcodebuild | Inject::Go | Inject::Ctest | Inject::Pytest => Style::Count,
-        }
-    }
 }
 
 /// One row of the classification table.
@@ -258,38 +230,28 @@ pub fn default_table() -> Table {
     }
 }
 
-/// What the wrapper-unwrapping loop found at the head of the command line.
-enum Head<'a> {
-    /// Nothing to classify (empty argv, or a wrapper we refuse to parse).
-    Opaque(&'a str),
-    Tool {
-        tool: String,
-        args: &'a [String],
-    },
-}
-
 /// Classify `argv` into a [`Plan`]. Total: any argv, including an empty one,
 /// yields a plan.
 pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
-    let head = unwrap_wrappers(argv);
-
-    let (tool, args): (String, &[String]) = match head {
-        Head::Opaque(label) => (label.to_string(), &[]),
-        Head::Tool { tool, args } => (tool, args),
-    };
+    let (tool, args) = unwrap_wrappers(argv);
 
     let rule = table.lookup(&tool, args);
     let table_class = rule.map_or(Class::None, |r| r.class);
     let class = overrides.class.unwrap_or(table_class);
 
     // Keep the table's injection when it still makes sense for the effective
-    // class; a forced jobserver class always gets the fifo handed to it, which
-    // is the only way `--class jobserver ./build.sh` can do anything.
+    // class: fifo recipes only suit Jobserver, core-count recipes only suit
+    // Static/None (both hold a fixed number of tokens). A forced jobserver
+    // class always gets the fifo handed to it, which is the only way
+    // `--class jobserver ./build.sh` can do anything.
     let table_inject = rule.map_or(Inject::None, |r| r.inject);
-    let inject = match (class, table_inject.style()) {
-        (Class::Jobserver, Style::Fifo) => table_inject,
+    let inject = match (class, table_inject) {
+        (Class::Jobserver, Inject::Jobserver | Inject::Cmake | Inject::Cargo) => table_inject,
         (Class::Jobserver, _) => Inject::Jobserver,
-        (Class::Static | Class::None, Style::Count) => table_inject,
+        (
+            Class::Static | Class::None,
+            Inject::Xcodebuild | Inject::Go | Inject::Ctest | Inject::Pytest,
+        ) => table_inject,
         _ => Inject::None,
     };
 
@@ -401,18 +363,21 @@ fn flag_notice(tool: &str, flag: &str, inject: Inject, class: Class) -> String {
 }
 
 /// Skip wrapper commands until the first token that actually runs something.
-fn unwrap_wrappers(argv: &[String]) -> Head<'_> {
+/// Returns the tool's basename and the tokens after it; an opaque command
+/// (empty argv, a shell string, a wrapper we refuse to parse) yields a label
+/// and no arguments, so no table row can match it.
+fn unwrap_wrappers(argv: &[String]) -> (String, &[String]) {
     let mut rest = argv;
 
     loop {
         let Some(first) = rest.first() else {
-            return Head::Opaque(TOOL_UNKNOWN);
+            return (TOOL_UNKNOWN.to_string(), &[]);
         };
         let name = basename(first);
         let args = &rest[1..];
 
         if SHELLS.contains(&name) {
-            return Head::Opaque(TOOL_SHELL);
+            return (TOOL_SHELL.to_string(), &[]);
         }
 
         let skipped = match name {
@@ -426,14 +391,9 @@ fn unwrap_wrappers(argv: &[String]) -> Head<'_> {
         match skipped {
             // A wrapper that swallowed the rest of the line (`nix develop`
             // with no `-c`, `env -i …`) is opaque: we cannot say what runs.
-            Some(0) => return Head::Opaque(name),
+            Some(0) => return (name.to_string(), &[]),
             Some(n) => rest = &args[n..],
-            None => {
-                return Head::Tool {
-                    tool: name.to_string(),
-                    args,
-                }
-            }
+            None => return (name.to_string(), args),
         }
     }
 }
