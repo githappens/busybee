@@ -314,17 +314,21 @@ If you changed no files — every listed finding already carries your reply, or 
 are declining all of them as wrong or out of scope — do not commit, amend, rebase
 or push.
 
-**First check whether the current head is already clean.** If the reviewer has left
-a 👍 reaction on the PR, or a "no major issues" comment dated after the head commit,
-it has nothing outstanding against this head and the merge gate approves on that
-signal by itself: end the turn now. Asking for another review replaces the 👍 with
-👀, and the gate answers UNSURE while a review is in flight, so the request throws
-away an approval that was about to land.
+**First check whether the current head is already approvable.** It is when
+either holds:
 
-A head whose only findings are P2/P3 needs no re-review: once each thread has
-your answer the gate approves on the replies alone. Only when the head carries a
-P0/P1 finding you declined and no clean signal, ask the reviewer to look at it
-again, so it reconsiders with your replies visible in the threads:
+- the reviewer has left a 👍 reaction on the PR, or a "no major issues" comment
+  dated after the head commit — nothing is outstanding against this head; or
+- every finding on this head is P2/P3 and every one of those threads already
+  carries a reply with a reason — the gate approves on the replies alone.
+
+In both cases end the turn now. Asking for another review replaces the 👍 (or the
+answered findings) with 👀, and the gate answers UNSURE while a review is in
+flight, so the request throws away an approval that was about to land.
+
+Only when the head carries a P0/P1 finding you declined and no clean signal, ask
+the reviewer to look at it again, so it reconsiders with your replies visible in
+the threads:
 
 ```sh
 gh api -X POST repos/githappens/busybee/issues/<pr>/comments -f body='@codex review
