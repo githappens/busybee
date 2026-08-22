@@ -148,14 +148,18 @@ fn the_task_s_exit_code_is_the_client_s_exit_code() {
     let Some(busybee) = Busybee::start() else {
         return;
     };
+    // A task that dies by a signal of its own is deliberately not here: pueued
+    // runs every task under `sh -c`, and whether that wrapper reports the
+    // signal (pueue: `Killed`, so 130) or collapses it into the shell's own
+    // 128+N exit code depends on whether the platform's /bin/sh execs a single
+    // simple command instead of forking it. That is a property of /bin/sh, not
+    // of busybee. The exit code for a task busybee itself ends is fixed, and
+    // `a_cancelled_task_gives_its_client_130` covers it.
     for (command, expected) in [
         ("exit 0", 0),
         ("exit 42", 42),
         // sh's own code for a command it cannot find.
         ("this-command-does-not-exist", 127),
-        // Death by signal: no exit code of its own, so it takes the one
-        // busybee uses for a task that did not finish on its own terms.
-        ("kill -TERM $$", 130),
     ] {
         let out = busybee.run(&["--", "sh", "-c", command]);
         assert_eq!(
@@ -166,6 +170,37 @@ fn the_task_s_exit_code_is_the_client_s_exit_code() {
             stderr(&out)
         );
     }
+}
+
+/// A lease cancelled out from under a client that is still attached: bzbd
+/// kills the task and reports the lease finished as killed, which is the 130
+/// the client exits with. Nothing about it goes through the task's own shell,
+/// so it holds wherever the tests run.
+#[test]
+#[serial_test::serial]
+fn a_cancelled_task_gives_its_client_130() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let mut client = busybee
+        .cmd(&["--", "sleep", "30"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the client");
+    busybee.wait_for_a_running_task();
+
+    let lease = busybee.status().expect("bzbd is up").leases[0].id;
+    let cancelled = busybee.run(&["cancel", &lease.to_string()]);
+    assert!(cancelled.status.success(), "stderr: {}", stderr(&cancelled));
+
+    let status = client.wait().expect("wait for the cancelled client");
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "exit code was {:?}",
+        status.code()
+    );
 }
 
 /// stdout is the task's (`docs/design/bzbd.md` §Client output contract), so
