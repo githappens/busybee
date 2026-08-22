@@ -1,4 +1,4 @@
-# busybee
+# busybee [![CI](https://github.com/githappens/busybee/actions/workflows/ci.yml/badge.svg)](https://github.com/githappens/busybee/actions/workflows/ci.yml)
 
 A queued runner for resource-heavy tasks, with a live CPU + queue TUI.
 

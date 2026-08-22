@@ -1,0 +1,110 @@
+# Format, lint and test on the two platforms busybee targets. Both jobs are
+# meant to be required checks; neither needs secrets or non-default
+# repository settings.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A newer push to the same branch makes the older run pointless. macOS
+# runners are limited to 5 concurrent jobs on the free plan, so don't sit on
+# one for a superseded commit.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # pueue 4.x is the daemon protocol pueue-lib 0.31 speaks. Taken as a
+  # release binary rather than `cargo install pueue --locked`: the daemon is
+  # a test fixture, not a dependency we build, and downloading it costs
+  # seconds instead of a multi-minute compile plus its own cache.
+  PUEUE_VERSION: "4.0.4"
+  # The jobserver tests need GNU make's fifo jobserver, which landed in 4.4.
+  # Neither runner image is new enough (Ubuntu 24.04 ships 4.3, macOS ships
+  # 3.81), so make is installed below instead of taken from the image.
+  MAKE_VERSION: "4.4.1"
+
+jobs:
+  check:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            pueued_asset: pueued-x86_64-unknown-linux-musl
+          - os: macos-latest
+            pueued_asset: pueued-aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Show the active toolchain
+        # rustup resolves rust-toolchain.toml here, installing the pinned
+        # channel and its components if the image doesn't already have them.
+        run: |
+          rustup show active-toolchain
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # .cargo/config.toml redirects the target dir to build/.
+          workspaces: ". -> build"
+
+      - name: Install pueued ${{ env.PUEUE_VERSION }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL -o "$HOME/.local/bin/pueued" \
+            "https://github.com/Nukesor/pueue/releases/download/v$PUEUE_VERSION/${{ matrix.pueued_asset }}"
+          chmod +x "$HOME/.local/bin/pueued"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Cache GNU make ${{ env.MAKE_VERSION }}
+        uses: actions/cache@v6
+        with:
+          path: ~/.local/gnumake
+          key: gnumake-${{ env.MAKE_VERSION }}-${{ matrix.os }}
+
+      - name: Install GNU make ${{ env.MAKE_VERSION }}
+        # Built from source on both platforms: there is no distro or
+        # Homebrew package that pins the version, and one code path beats
+        # two. Roughly a minute on a cold cache, skipped entirely on a hit.
+        run: |
+          set -euo pipefail
+          prefix="$HOME/.local/gnumake"
+          if [ ! -x "$prefix/bin/make" ]; then
+            curl -fsSL "https://ftp.gnu.org/gnu/make/make-$MAKE_VERSION.tar.gz" \
+              | tar xz -C "$RUNNER_TEMP"
+            cd "$RUNNER_TEMP/make-$MAKE_VERSION"
+            ./configure --prefix="$prefix" --quiet
+            make -j"$(getconf _NPROCESSORS_ONLN)"
+            make install
+          fi
+          echo "$prefix/bin" >> "$GITHUB_PATH"
+
+      - name: Assert tool versions
+        # ninja comes from the runner image. Assert every version the tests
+        # depend on so an image or package downgrade fails here, loudly,
+        # instead of silently skipping the tests that need them.
+        run: |
+          set -euo pipefail
+          atleast() { # atleast <tool> <minimum> <actual>
+            if [ "$(printf '%s\n%s\n' "$2" "$3" | sort -V | head -1)" != "$2" ]; then
+              echo "$1 $3 is older than the required $2" >&2
+              exit 1
+            fi
+            echo "$1 $3 (>= $2)"
+          }
+          atleast make 4.4 "$(make --version | sed -n '1s/^GNU Make //p')"
+          atleast ninja 1.13 "$(ninja --version)"
+          atleast pueued 4.0 "$(pueued --version | awk '{print $2}')"
+
+      - run: cargo fmt --all --check
+
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - run: cargo test --workspace
