@@ -27,7 +27,8 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    if: contains(github.event.issue.labels.*.name, 'sortie')
+    # Any sortie state label (the marker label is absent on blocked issues).
+    if: contains(join(github.event.issue.labels.*.name, ','), 'sortie')
     steps:
       - name: Map labels to Status and update the board
         env:
