@@ -11,10 +11,6 @@ keywords = ["queue", "daemon", "scheduler", "build", "cpu"]
 categories = ["command-line-utilities", "development-tools::build-utils"]
 readme = "../../README.md"
 
-[[bin]]
-name = "bzbd"
-path = "src/main.rs"
-
 [dependencies]
 bzb-core = { path = "../bzb-core", version = "0.1.0" }
 anyhow.workspace = true
