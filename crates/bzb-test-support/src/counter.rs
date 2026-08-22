@@ -8,12 +8,14 @@
 //! build can be sure of catching.
 //!
 //! Each sample is a file of its own rather than a line in a shared log: its
-//! mtime is the instant the count was read, which is what lets a test ask what
-//! the concurrency was *during* some window rather than only over the whole
-//! run. Markers and samples are named after the build (`COUNTER_NAME`, `a` by
-//! default) so two builds can share one directory and still be told apart:
-//! each sample carries the total across both builds and the count of the
-//! build's own jobs.
+//! mtime is the instant the markers were listed, which is what lets a test ask
+//! what the concurrency was *during* some window rather than only over the
+//! whole run. A sample holds the listing itself, written by the `ls` that took
+//! it, so nothing runs between the snapshot and the timestamp that stands for
+//! it; the counting is [`samples`]'s job. Markers and samples are named after
+//! the build (`COUNTER_NAME`, `a` by default) so two builds can share one
+//! directory and still be told apart: each listing gives both the total across
+//! the builds and the count of the sampling build's own jobs.
 
 use std::{fs, path::Path, time::SystemTime};
 
@@ -25,7 +27,7 @@ pub struct Sample {
     pub total: u32,
     /// Jobs running in this sample's own build.
     pub own: u32,
-    /// When the count was read.
+    /// When the markers were listed.
     pub at: SystemTime,
 }
 
@@ -34,32 +36,29 @@ pub struct Sample {
 pub fn make_build(dir: &Path, targets: u32, sleep: &str) {
     let names: Vec<String> = (1..=targets).map(|i| format!("t{i}")).collect();
     let makefile = format!(
-        // Both counts come out of one listing: a second `ls` could miss a
-        // marker the first one saw, and a total above an own count is how a
-        // test tells a job of another build apart from one of its own.
+        // The listing goes into the sample as it comes, so the file's mtime is
+        // the `ls` that took it and not something later: a test that asks what
+        // was running after some instant must not be handed an older snapshot
+        // stamped after it.
         "COUNTER_NAME ?= a\n\
          TARGETS := {targets_list}\n\
          .PHONY: run $(TARGETS)\n\
          run: $(TARGETS)\n\
          $(TARGETS):\n\
          \t@s=$(COUNTER_NAME).$@.$$$$; m=markers/$$s; touch $$m; sleep {sleep}; \\\n\
-         \tl=$$(ls markers); \\\n\
-         \tprintf '%s %s\\n' \"$$(printf '%s\\n' \"$$l\" | wc -l)\" \
-         \"$$(printf '%s\\n' \"$$l\" | grep -c '^$(COUNTER_NAME)\\.')\" > pending/$$s; \\\n\
-         \tmv pending/$$s samples/$$s; rm $$m\n",
+         \tls markers > pending/$$s; mv pending/$$s samples/$$s; rm $$m\n",
         targets_list = names.join(" "),
     );
     prepare(dir);
     fs::write(dir.join("Makefile"), makefile).expect("write the Makefile");
 }
 
-/// The same build for ninja, which has no second build to count against: every
-/// sample's own count is the total.
+/// The same build for ninja, whose jobs are all named `n.…`: it has no second
+/// build to count against, so every sample's own count is the total.
 pub fn ninja_build(dir: &Path, targets: u32, sleep: &str) {
     let mut file = format!(
-        "rule job\n  command = m=markers/$out.$$$$; touch $$m; sleep {sleep}; \
-         c=$$(ls markers | wc -l); printf '%s %s\\n' \"$$c\" \"$$c\" > pending/n.$out.$$$$; \
-         mv pending/n.$out.$$$$ samples/n.$out.$$$$; rm $$m\n",
+        "rule job\n  command = s=n.$out.$$$$; m=markers/$$s; touch $$m; sleep {sleep}; \
+         ls markers > pending/$$s; mv pending/$$s samples/$$s; rm $$m\n",
     );
     for i in 1..=targets {
         file.push_str(&format!("build t{i}: job\n"));
@@ -128,18 +127,19 @@ pub fn samples(dir: &Path) -> Vec<Sample> {
                 .modified()
                 .expect("a sample's mtime");
             let file = entry.file_name().to_string_lossy().into_owned();
-            let text = fs::read_to_string(entry.path()).expect("read a sample");
-            let mut counts = text.split_whitespace().map(|count| {
-                count
-                    .parse()
-                    .unwrap_or_else(|_| panic!("{file} is not a pair of counts: {text:?}"))
-            });
-            let (total, own) = (
-                counts.next().expect("a total"),
-                counts.next().expect("an own count"),
-            );
+            let listing = fs::read_to_string(entry.path()).expect("read a sample");
+            let name = file.split('.').next().expect("a build name").to_string();
+            let prefix = format!("{name}.");
+            let total = listing.lines().count() as u32;
+            let own = listing
+                .lines()
+                .filter(|marker| marker.starts_with(&prefix))
+                .count() as u32;
+            // The job's own marker was there when it looked, so a listing
+            // without it is a broken recipe rather than a quiet build.
+            assert!(own >= 1, "{file} listed no marker of its own: {listing:?}");
             Sample {
-                name: file.split('.').next().expect("a build name").to_string(),
+                name,
                 total,
                 own,
                 at,
