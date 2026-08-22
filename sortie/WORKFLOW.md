@@ -203,7 +203,21 @@ for the squash merge. A PR that does not merge cleanly is never merged.
 
 ## Finishing
 
-When the acceptance criteria pass locally:
+When the acceptance criteria pass locally, review the whole change before anyone
+else does. The automated reviewer surfaces one or two findings per pass and
+re-reviews every push, so each defect that reaches it costs a full round trip;
+the ones you catch here cost nothing.
+
+Dispatch a subagent with a fresh context and give it only the diff
+(`git diff origin/main...HEAD`), `AGENTS.md` (§Code Review Rules is what the
+reviewer applies), the issue text, and the spec sections the change touches. Ask
+it to review as that reviewer would: spec conformance, silent fallbacks, resource
+accounting on every exit path, tests as the contract, scope. Fix what it finds
+that is real and within the issue's scope; rerun the suite. One pass — do not
+loop on it, and do not widen the change to satisfy a suggestion outside the
+acceptance criteria.
+
+Then:
 
 1. `git add -A && git commit` with a conventional message
    (`feat(bzb-core): …`, `test(bzbd): …`, `docs: …`); reference the issue as
@@ -218,9 +232,9 @@ When the acceptance criteria pass locally:
    echo needs-human-review > .sortie/status
    ```
 5. Stop. An automated reviewer (Codex) reviews every push and its findings come
-   back to you as a continuation turn; the PR merges automatically once the
-   review reports no findings and CI is green. Human review comments also
-   come back as continuation turns.
+   back to you as a continuation turn; the PR merges automatically once CI is
+   green and the head carries no P0/P1 finding and every P2/P3 finding has your
+   answer. Human review comments also come back as continuation turns.
 {{ if or .run.is_continuation .review_comments .bot_review_comments .merge_conflict .ci_failure }}
 
 ## Continuation
@@ -261,10 +275,28 @@ squash merge. Keep the PR's scope unchanged.
 First, acknowledge every finding so humans can see you are on it: for each comment
 id above run
 `gh api -X POST repos/githappens/busybee/pulls/comments/<id>/reactions -f content=eyes`.
-Then, for each finding, either fix it or reply on its thread
-(`gh api -X POST repos/githappens/busybee/pulls/<pr>/comments -F in_reply_to=<id> -f body='…'`)
-with the reason it does not apply; reply on the thread with a one-line summary of
-the fix as well.
+Each finding carries a priority badge (P0/P1/P2, occasionally P3). They are not
+all the same kind of work:
+
+- **P0/P1 block the merge.** Fix it, or — when it is wrong, out of the issue's
+  scope, or about a path the spec assigns to another issue — decline it on its
+  thread with the reason and ask for a re-review (below). A P1 block lifts only
+  when the reviewer itself clears the head.
+- **P2/P3 do not block.** The gate approves the head once every such thread
+  carries your answer. Fix one only when the fix is small, clearly inside the
+  issue's acceptance criteria, and does not add new state, new persistence, or a
+  new code path for the reviewer to read next round. Otherwise answer on the
+  thread: why it does not apply, or that it is deferred — file a follow-up issue
+  (`gh issue create`) with the finding's text and link it in the reply. A finding
+  about code that exists only to satisfy an earlier finding, whose consequence
+  needs two independent faults, is a deferral, not a fix. A bare acknowledgement
+  is not an answer; the gate waits for a reason.
+
+Reply on each thread
+(`gh api -X POST repos/githappens/busybee/pulls/<pr>/comments -F in_reply_to=<id> -f body='…'`):
+a one-line summary of the fix, or the reason it does not apply / the follow-up
+issue. The gate reads these replies; write them so a reader who has only the
+thread understands the decision.
 
 A finding listed here may already have been handled in an earlier turn: the list
 is regenerated whenever the set of open comments changes, so threads that already
@@ -289,8 +321,10 @@ signal by itself: end the turn now. Asking for another review replaces the 👍 
 👀, and the gate answers UNSURE while a review is in flight, so the request throws
 away an approval that was about to land.
 
-Only when the head carries findings and no clean signal, ask the reviewer to look
-at it again, so it reconsiders with your replies visible in the threads:
+A head whose only findings are P2/P3 needs no re-review: once each thread has
+your answer the gate approves on the replies alone. Only when the head carries a
+P0/P1 finding you declined and no clean signal, ask the reviewer to look at it
+again, so it reconsiders with your replies visible in the threads:
 
 ```sh
 gh api -X POST repos/githappens/busybee/issues/<pr>/comments -f body='@codex review
@@ -300,16 +334,18 @@ gh api -X POST repos/githappens/busybee/issues/<pr>/comments -f body='@codex rev
 
 Ask at most once per head: read the PR's issue comments first and skip this if you
 already asked for the current head. A re-review that finds nothing posts a "no
-major issues" comment, and that is the signal the merge gate approves on. A reply
-on its own never lifts a block, so a turn that ends with replies, no clean signal
-and no re-review request leaves the PR blocked for good.
+major issues" comment, and that is the signal the merge gate approves on. For a
+declined P0/P1 a reply on its own never lifts the block, so a turn that ends with
+such a decline, no clean signal and no re-review request leaves the PR blocked
+for good.
 
-If a finding you already declined on an earlier head comes back after a re-review,
-do not argue it a second time: write `blocked` to `.sortie/status` with one line
-naming the finding, and stop. A human settles it from there.
+If a P0/P1 finding you already declined on an earlier head comes back after a
+re-review, do not argue it a second time: write `blocked` to `.sortie/status`
+with one line naming the finding, and stop. A human settles it from there.
 
-A new push triggers a fresh automated review; the PR merges automatically once that
-review reports no findings and CI is green.
+A new push triggers a fresh automated review; the PR merges automatically once CI
+is green and the head carries no P0/P1 finding and every P2/P3 finding has your
+answer.
 {{ end }}
 {{ if .ci_failure }}
 

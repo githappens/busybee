@@ -85,12 +85,18 @@ The board (Projects → "busybee · bzbd", Kanban view) mirrors these labels thr
   2. `.github/workflows/codex-gate.yml` (every 5 min and on PR events) selects PRs
      with new Codex activity on their head commit, has Claude Haiku read that
      material and decide APPROVE / REQUEST_CHANGES / UNSURE, and posts the verdict
-     as `github-actions[bot]` (UNSURE posts nothing; the PR waits). A rebuttal never
-     lifts a block on its own — only a later clean Codex signal for the head does,
-     from either a re-review requested on the same head (`@codex review`, which the
-     agent posts when it declines every finding) or a review of a new head. The `main`
-     ruleset requires one approval and dismisses it on push, so the review decision
-     tracks the latest verdict. Needs the repo setting "Allow GitHub Actions to
+     as `github-actions[bot]` (UNSURE posts nothing; the PR waits). Severity
+     decides what blocks: a P0/P1 finding blocks, and that block lifts only on a
+     later clean Codex signal for the head — a re-review requested on the same
+     head (`@codex review`, which the agent posts after declining a P0/P1) or a
+     review of a new head. P2/P3 findings do not block: the gate approves the head
+     once the author has answered every such thread with a reason (out of scope,
+     not applicable, follow-up issue); until then it posts REQUEST_CHANGES naming
+     the waiting threads, and an author reply re-triggers the judgement. The
+     policy comes from an audit of 49 findings over four PRs: every
+     would-have-shipped bug was a round-1/2 P1, the P2 tail was one cascade or
+     edge case per round. The `main` ruleset requires one approval and dismisses
+     it on push, so the review decision tracks the latest verdict. Needs the repo setting "Allow GitHub Actions to
      create and approve pull requests" and the `CLAUDE_CODE_OAUTH_TOKEN` secret
      (from `claude setup-token`; tied to the Max subscription, so it expires with
      it and shares its rate window).
@@ -121,7 +127,7 @@ The board (Projects → "busybee · bzbd", Kanban view) mirrors these labels thr
 | a PR has a clean Codex 👍 for 20+ minutes and no gate approval | the 👍 raises no workflow event and the cron trigger is throttled on quiet repositories | `gh workflow run codex-gate.yml` (the `run.sh` sidecar does this every 10 min) |
 | approved PR, `mergeStateStatus UNSTABLE`, `auto_merge` idle | a check failed on the head (typically Linux-only behaviour; agents develop on macOS) | `reactions.ci_failure` hands the log excerpt to the agent; if it is missing from `WORKFLOW.md`, add it and restart |
 | a PR keeps getting new findings on code added for earlier findings | review scope creep on a large PR | `AGENTS.md` → *Stay within the issue's scope*; only branches containing that rule are reviewed under it |
-| PR blocked at `CHANGES_REQUESTED`, head unchanged for 10+ min, every finding carries an agent reply and no push | the agent declined the findings; a reply alone never clears the gate, and its own replies re-trigger the bot-review turn, so it argues in a circle until `max_continuation_turns` | the prompt now has it post `@codex review` on the same head after a decline; if the branch predates that, post the comment yourself, and if Codex re-raises a declined finding decide it by hand (the gate will not) |
+| PR blocked at `CHANGES_REQUESTED`, head unchanged for 10+ min, every finding carries an agent reply and no push | a declined P0/P1: a reply alone never clears that, only a Codex re-review does. (Declined P2/P3 findings approve on the reply; if the verdict still says it is waiting, the reply gave no reason — a bare acknowledgement does not count) | the prompt has the agent post `@codex review` on the same head after a P0/P1 decline; if the branch predates that, post the comment yourself, and if Codex re-raises a declined finding decide it by hand (the gate will not) |
 
 Restart `run.sh` when `sortie_sessions_running` is 0 (`/metrics`): a restart cancels in-flight turns, and they resume as retries. Reactions (`reactions.*`) load only at startup; `agent.*`, `polling.*` and the prompt body hot-reload. GitHub's reviews and comments endpoints page at 30 and agent replies count as reviews, so always `--paginate` when inspecting a long-lived PR.
 

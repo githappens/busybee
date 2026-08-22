@@ -12,6 +12,16 @@
 #   3. posts the verdict as github-actions[bot]. UNSURE posts nothing, so the
 #      PR waits for a human instead of the gate guessing.
 #
+# Severity policy. Codex tags each finding P0/P1/P2 (P3 exists in principle).
+# Only P0/P1 block, and a block lifts only on a later clean Codex signal for
+# the head. A P2/P3 finding is a follow-up, not a blocker: the head is approved
+# once the author has answered every such thread with a reason (out of scope,
+# not applicable, follow-up issue filed). An audit of 49 findings over four PRs
+# found every would-have-shipped bug in rounds 1-2 and the P2 tail to be
+# cascades from earlier fixes and edge-of-edge cases, one per round, because
+# Codex surfaces one or two findings per pass; blocking on them turned a
+# 2-round review into 11.
+#
 # With the ruleset on main requiring one approval (dismissed on push), the
 # verdict is what moves `reviewDecision`, which the orchestrator's auto-merge
 # reads. Requires the repository setting "Allow GitHub Actions to create and
@@ -25,6 +35,8 @@ on:
     types: [synchronize]
   pull_request_review:
     types: [submitted]
+  pull_request_review_comment:
+    types: [created]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -90,7 +102,16 @@ jobs:
             else
               comment_at=""
             fi
-            latest=$(printf '%s\n%s\n%s\n' "$codex_at" "$comment_at" "$reaction_at" | sort | tail -1)
+            # An author reply on a finding's thread can resolve a P2/P3 finding,
+            # so it re-opens the judgement — but only once Codex has reviewed this
+            # head; before that there is nothing to judge the reply against.
+            reply_at=""
+            if [ -n "$codex_at" ]; then
+              export AUTHOR=$(gh api "repos/$REPO/pulls/$PR" --jq .user.login)
+              reply_at=$(gh api "repos/$REPO/pulls/$PR/comments" --paginate \
+                --jq '[.[] | select(.user.login==env.AUTHOR and .in_reply_to_id != null and .created_at > env.HEAD_DATE) | .created_at] | max // empty')
+            fi
+            latest=$(printf '%s\n%s\n%s\n%s\n' "$codex_at" "$comment_at" "$reaction_at" "$reply_at" | sort | tail -1)
             gate_at=$(jq -r '[.[] | select(.user.login==env.GATE and .commit_id==env.HEAD) | .submitted_at] | max // empty' <<<"$reviews")
             if [ -n "$latest" ] && { [ -z "$gate_at" ] || [[ "$latest" > "$gate_at" ]]; }; then
               echo "PR #$PR: Codex activity at $latest, last verdict ${gate_at:-none} -> judge"
@@ -138,6 +159,27 @@ jobs:
             echo "## Codex reviews pinned to this head (newest last)"
             gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
               --jq '[.[] | select(.user.login==env.REVIEWER and .commit_id==env.HEAD)] | sort_by(.submitted_at) | .[] | "\n### review \(.id) at \(.submitted_at) state=\(.state)\n\(.body)"'
+            echo
+            # A finding belongs to this head when its review is pinned here; the
+            # comment's own commit_id drifts to the newest commit its line survives
+            # in, so it cannot be used. The priority is the badge in the body.
+            echo "## Codex findings on this head, with priority and the author's replies"
+            export AUTHOR=$(gh api "repos/$REPO/pulls/$PR" --jq .user.login)
+            export REVIEW_IDS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
+              --jq '[.[] | select(.user.login==env.REVIEWER and .commit_id==env.HEAD) | .id]' | jq -sc add)
+            gh api "repos/$REPO/pulls/$PR/comments" --paginate | jq -s add | jq -r '
+              (env.REVIEW_IDS | fromjson) as $reviews
+              | . as $all
+              | [ .[] | select(.user.login==env.REVIEWER and .in_reply_to_id==null and (.pull_request_review_id as $r | $reviews | index($r) != null)) ]
+              | sort_by(.created_at)
+              | if length == 0 then "- (none: no findings-review is pinned to this head)" else
+                .[] | . as $f
+                | (($f.body | capture("badge/(?<p>P[0-9])") | .p) // "unbadged") as $p
+                | ($f.body | split("\n") | map(select(length > 0)) | .[0] | gsub("<[^>]*>|!\\[[^\\]]*\\]\\([^)]*\\)|\\*\\*"; "") | gsub("^ +| +$"; "")) as $title
+                | "- id=\($f.id) priority=\($p) \($f.path):\($f.line // $f.original_line // "?") — \($title)"
+                , ( [ $all[] | select(.in_reply_to_id == $f.id and .user.login == env.AUTHOR) ] | sort_by(.created_at)
+                    | if length == 0 then "    author reply: none" else .[] | "    author reply [\(.created_at)]: \(.body | gsub("\n"; " ") | .[0:400])" end )
+                end'
             echo
             echo "## Inline review comments on this PR created after the head commit (all authors; replies included)"
             gh api "repos/$REPO/pulls/$PR/comments" --paginate \
@@ -188,23 +230,43 @@ jobs:
             found no major issues. Only signals dated after the head commit count.
             Wording and formatting may vary between versions; judge the meaning.
 
+            Severity policy: a finding's priority is the badge Codex put on it (P0, P1,
+            P2, P3); the section "Codex findings on this head" lists each finding with
+            its priority and the PR author's replies on its thread. P0 and P1 block.
+            P2 and P3 do not block: they are follow-ups, and the author answers each
+            one on its thread — declined as out of scope, not applicable, or already
+            covered, or deferred to a follow-up issue — or fixes it, which produces a
+            new head. A finding with no badge counts as blocking.
+
             Decision rules:
-            - APPROVE only when Codex's latest signal for THIS head is clean: a 👍
-              reaction or a "no major issues" comment dated after the head commit, or a
-              review on this head with zero inline findings — and no later Codex review
-              on this head carries findings. Reactions and comments are not pinned to
-              a commit: if a Codex 👀 reaction is present, or the head commit is less
-              than 8 minutes old, a review may still be running for this head and an
-              earlier clean signal may belong to a previous push — answer UNSURE.
-            - REQUEST_CHANGES when Codex's latest review on this head has one or more
-              inline findings. Replies or rebuttals by the PR author do NOT lift a block
-              on their own: only a later clean Codex signal for this head does. That
-              signal is either a re-review requested on the same head (the author
-              justified the findings and asked Codex to look again) or Codex's review
-              of a new head after a fix. Summarise the open findings in the reason.
-            - UNSURE when you cannot tell what Codex concluded about this head (for
-              example only a "task started" or acknowledgement comment, a review whose
-              commit differs from the head, or contradictory material). Say why.
+            - UNSURE first: if a Codex 👀 reaction is present, or the head commit is
+              less than 8 minutes old and the only clean signal is a reaction or
+              comment, a review may still be running for this head and an earlier
+              clean signal may belong to a previous push. Also UNSURE when you cannot
+              tell what Codex concluded about this head (only a "task started" or
+              acknowledgement comment, a review whose commit differs from the head,
+              contradictory material). Say why.
+            - REQUEST_CHANGES when the latest Codex review on this head has at least
+              one P0/P1 (or unbadged) finding. Replies or rebuttals by the author do
+              NOT lift that block: only a later clean Codex signal for this head does
+              — a re-review the author requested on the same head, or Codex's review
+              of a new head. Name the blocking findings in the reason.
+            - REQUEST_CHANGES also when every finding on this head is P2/P3 but at
+              least one has no author reply yet, or the author's reply on one says or
+              implies a fix is coming ("fixed in …", "will address", "on it"): a push
+              is expected, so this head is not the one to approve. Say which threads
+              are waiting in the reason; this verdict is replaced when the author
+              answers.
+            - APPROVE when Codex's latest signal for THIS head is clean — a 👍
+              reaction or a "no major issues" comment dated after the head commit, or
+              a review on this head with zero inline findings — and no later Codex
+              review on this head carries findings.
+            - APPROVE also when the latest Codex review on this head has findings,
+              none is P0/P1 or unbadged, and every P2/P3 finding carries an author
+              reply that states a reason for not changing the code on this PR (scope,
+              spec, not applicable, follow-up issue). A bare acknowledgement or
+              reaction is not an answer. Quote the threads and the reasons in one
+              line each.
             Never approve because the material is empty or ambiguous.
 
       - name: Post the verdict as github-actions[bot]
