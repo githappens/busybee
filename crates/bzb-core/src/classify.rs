@@ -45,8 +45,9 @@ const TOOL_UNKNOWN: &str = "<unknown>";
 const SHELLS: [&str; 4] = ["sh", "bash", "zsh", "dash"];
 
 /// GNU make short options that consume a value, which in a cluster is the rest
-/// of the token (`-Cout`) or the next argument (`-C out`).
-const MAKE_VALUE_OPTIONS: &str = "CfIjloW";
+/// of the token (`-Cout`, `-EFOO=1`) or, for the ones whose value is mandatory,
+/// the next argument (`-C out`).
+const MAKE_VALUE_OPTIONS: &str = "CEfIjloOW";
 
 /// How a task is admitted against the token pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,8 +113,8 @@ pub enum Inject {
 pub struct Rule {
     /// Basename the row matches, after wrapper unwrapping.
     pub tool: String,
-    /// Extra token that must appear in the tool's arguments for the row to
-    /// match (`--build` for cmake, `build` for docker).
+    /// Token that must be the tool's first argument for the row to match
+    /// (`--build` for cmake, `build` for docker).
     pub requires: Option<String>,
     pub class: Class,
     pub inject: Inject,
@@ -130,34 +131,21 @@ pub struct Table {
 }
 
 impl Table {
-    /// First row matching `tool` whose `requires` token (if any) appears in
-    /// `args` (the tokens after the tool).
+    /// First row matching `tool` whose `requires` token (if any) is the tool's
+    /// first argument — the position that selects a mode. cmake dispatches on
+    /// it exactly (`--build`, `--install`, `--open`, `-E`), so a `--build`
+    /// anywhere else is another mode's operand (`cmake --install --build`) or
+    /// an argument of a payload command (`cmake -E env ./x --build`), and every
+    /// non-build cmake mode falls through to `none`.
     pub fn lookup(&self, tool: &str, args: &[String]) -> Option<&Rule> {
         self.rows.iter().find(|row| {
             row.tool == tool
                 && match &row.requires {
-                    Some(needle) => in_leading_options(needle, args),
+                    Some(needle) => args.first().is_some_and(|arg| arg == needle),
                     None => true,
                 }
         })
     }
-}
-
-/// Whether `needle` is one of the tool's own leading arguments: the scan stops
-/// at the first token that is not an option, because that token selects a mode
-/// and everything after it belongs to the mode, not to the tool. `cmake -E env
-/// ./x --build` is command mode handing `--build` to another program, and
-/// `docker buildx bake` is not `docker build`.
-fn in_leading_options(needle: &str, args: &[String]) -> bool {
-    for arg in args {
-        if arg == needle {
-            return true;
-        }
-        if !arg.starts_with('-') {
-            return false;
-        }
-    }
-    false
 }
 
 /// User-supplied overrides (`--class`, `--cores`).

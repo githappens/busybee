@@ -92,7 +92,7 @@ Operates on the argv the client received (the shell has already handled `|`, `&&
 | `docker` with `build` | none | — | the VM has its own CPU cap |
 | everything else | none | — | |
 
-A required token (`--build`, `build`) counts only among the tool's own leading arguments: the scan stops at the first token that is not an option, because that token selects a mode and the rest belongs to the mode. `cmake -E env ./x --build` is command mode passing `--build` to another program, so it is **none**, as are cmake's other non-build modes.
+A required token (`--build`, `build`) counts only as the tool's *first* argument, the position that selects a mode. cmake dispatches on that position exactly — `--build`, `--install`, `--open`, `-E` — so a `--build` anywhere else is another mode's operand (`cmake --install --build` installs into a directory named `--build`) or an argument of a payload command (`cmake -E env ./x --build`). Those, and cmake's other non-build modes, are **none**.
 
 3. Overrides: `--class jobserver|static|none`, `--cores N` (static target; ignored with a notice for jobserver class). A user-supplied parallelism flag always wins over injection and produces a one-line notice.
 4. Every task additionally gets `BUSYBEE_CLASS=<class>` and `BUSYBEE_CORES=<fair share>` in its env so opaque scripts can cooperate (`xcodebuild ... -jobs "${BUSYBEE_CORES:-8}"`). This is the only remedy for argv-only tools hidden inside scripts.

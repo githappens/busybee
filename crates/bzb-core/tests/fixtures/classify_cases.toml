@@ -51,6 +51,14 @@ env_set_absent = ["MAKEFLAGS"]
 no_notices = true
 
 [[case]]
+name = "cmake --install takes --build as its directory operand"
+argv = ["cmake", "--install", "--build"]
+class = "none"
+tool = "cmake"
+env_set_absent = ["MAKEFLAGS"]
+no_notices = true
+
+[[case]]
 name = "plain make"
 argv = ["make", "-C", "out"]
 class = "jobserver"
@@ -82,6 +90,20 @@ notices_contain = ["-kj"]
 [[case]]
 name = "make -C with a glued directory is not a job count"
 argv = ["make", "-Cjobs", "all"]
+class = "jobserver"
+tool = "make"
+no_notices = true
+
+[[case]]
+name = "make -E with a glued expression is not a job count"
+argv = ["make", "-EFOO=j", "all"]
+class = "jobserver"
+tool = "make"
+no_notices = true
+
+[[case]]
+name = "make -O with a glued sync type is not a job count"
+argv = ["make", "-Ojobs", "all"]
 class = "jobserver"
 tool = "make"
 no_notices = true
