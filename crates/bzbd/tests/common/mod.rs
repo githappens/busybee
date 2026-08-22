@@ -25,16 +25,22 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn start() -> Self {
-        Self::spawn(None)
+        Self::spawn(None, None)
     }
 
     /// Same, but pointed at an isolated `pueued` through the config path its
     /// fixture generated.
     pub fn start_with_pueue(config: &Path) -> Self {
-        Self::spawn(Some(config))
+        Self::spawn(Some(config), None)
     }
 
-    fn spawn(pueue_config: Option<&Path>) -> Self {
+    /// Same again, with a `PATH` of the test's choosing: it is where bzbd
+    /// looks for `pueued` when it has to spawn one.
+    pub fn start_with_pueue_and_path(config: &Path, path: &Path) -> Self {
+        Self::spawn(Some(config), Some(path))
+    }
+
+    fn spawn(pueue_config: Option<&Path>, path: Option<&Path>) -> Self {
         let tmp = TempDir::new().expect("create tempdir");
         // A directory bzbd has to create itself, so its mode is the daemon's
         // doing rather than tempfile's.
@@ -43,6 +49,9 @@ impl Fixture {
         command.arg("--foreground").env("BUSYBEE_STATE_DIR", &state);
         if let Some(config) = pueue_config {
             command.env("PUEUE_CONFIG_PATH", config);
+        }
+        if let Some(path) = path {
+            command.env("PATH", path);
         }
         let child = command.spawn().expect("spawn bzbd");
         let fixture = Self {

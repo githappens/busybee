@@ -16,6 +16,7 @@ bzb-core = { path = "../bzb-core", version = "0.1.0" }
 anyhow.workspace = true
 tokio.workspace = true
 pueue-lib.workspace = true
+chrono = "0.4"
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
@@ -24,7 +25,6 @@ libc.workspace = true
 
 [dev-dependencies]
 bzb-test-support = { path = "../bzb-test-support" }
-chrono = "0.4"
 tempfile = "3"
 # `BUSYBEE_STATE_DIR` and `PATH` are process-wide, so the tests that set them
 # cannot run alongside each other.

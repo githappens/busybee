@@ -83,6 +83,13 @@ impl PueuedFixture {
             socket_path.display()
         );
     }
+
+    /// Kills the daemon now, for a test about what happens when pueued dies.
+    /// Idempotent: `Drop` kills it again and does not mind.
+    pub fn kill(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for PueuedFixture {

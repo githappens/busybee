@@ -352,3 +352,41 @@ async fn leases_json_holds_the_running_lease_and_nothing_once_it_ends() {
         leases_json(&daemon)
     );
 }
+
+/// `docs/design/bzbd.md` §Failure and recovery: a pueued that dies takes the
+/// running leases with it — their clients are told, and told why, rather than
+/// waiting for a completion that can no longer arrive.
+#[tokio::test]
+async fn a_pueued_that_never_comes_back_ends_the_running_leases() {
+    let Some(mut pueued) = PueuedFixture::try_start() else {
+        return;
+    };
+    // bzbd respawns pueued by name off its `PATH`; an empty one is a pueued
+    // that is not coming back.
+    let nothing_on_path = tempfile::tempdir().expect("create tempdir");
+    let daemon = Fixture::start_with_pueue_and_path(&pueued.config_path, nothing_on_path.path());
+
+    let mut conn = submit(&daemon, &["sh", "-c", "sleep 5"]).await;
+    assert!(matches!(
+        event(&mut conn).await,
+        LeaseEvent::Queued { ahead: 0, .. }
+    ));
+    admitted(event(&mut conn).await);
+
+    pueued.kill();
+
+    match event(&mut conn).await {
+        LeaseEvent::Notice { text } => assert!(
+            text.contains("pueued"),
+            "the notice must name what was lost, got {text:?}"
+        ),
+        other => panic!("expected a Notice, got {other:?}"),
+    }
+    match event(&mut conn).await {
+        // Non-zero: the command's own exit code went with pueued.
+        LeaseEvent::Finished { exit_code, .. } => assert_ne!(exit_code, 0),
+        other => panic!("expected a Finished event, got {other:?}"),
+    }
+    // And bzbd keeps serving: the lost lease is off its books.
+    wait_for_no_leases(&daemon, Duration::from_secs(2)).await;
+}

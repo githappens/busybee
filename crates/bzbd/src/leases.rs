@@ -13,7 +13,7 @@
 //! queue, after admission its task is killed first.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -22,11 +22,13 @@ use anyhow::{Context, Result};
 use bzb_core::{
     classify::Class,
     enqueue::{shell_escape_join, TaskSpec},
+    errors::BusybeeError,
     exit_code::task_result_to_exit_code,
     protocol::{LeaseEvent, LeaseRequest, LeaseView, StatusReply},
     scheduler::{Action, Event, LeaseId, Params, Request as LeaseSpec, Scheduler},
 };
-use pueue_lib::{message::Signal, task::TaskStatus};
+use chrono::{DateTime, Local};
+use pueue_lib::{message::Signal, task::Task, task::TaskStatus};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
@@ -45,6 +47,11 @@ const KILL_GRACE: Duration = Duration::from_secs(1);
 /// The exit code a lease reports when its own client hung up: nobody is left
 /// to read it, but the code has to say the task did not finish on its own.
 const KILLED: i32 = 130;
+
+/// How many polls in a row may fail before pueued counts as gone. A failed
+/// request drops the connection and the next poll reconnects — spawning pueued
+/// if it has to — so a run of failures means it is not coming back.
+const LOST_AFTER_FAILED_POLLS: u32 = 5;
 
 /// Where a lease's events go: the connection that asked for it.
 pub type Events = mpsc::UnboundedSender<LeaseEvent>;
@@ -125,10 +132,14 @@ pub struct Leases {
     pueue: Pueue,
     /// pueue tasks being torn down, until pueued confirms they are gone.
     killing: BTreeMap<usize, Kill>,
-    /// Admissions held back while [`Leases::killing`] is non-empty. The task
-    /// being killed may still be on the machine, and the admission machine has
-    /// already forgotten its lease, so starting the next one now would run two
-    /// exclusive tasks at once.
+    /// Submissions pueued may or may not have started; see [`Unreconciled`].
+    unreconciled: Vec<Unreconciled>,
+    /// Consecutive failed polls. Enough of them and pueued counts as gone.
+    failed_polls: u32,
+    /// Admissions held back while a task bzbd cannot account for may still be
+    /// on the machine — one being killed, or one submitted without an answer.
+    /// The admission machine has already forgotten its lease, so starting the
+    /// next one now would run two exclusive tasks at once.
     deferred: VecDeque<Action>,
     leases_path: PathBuf,
 }
@@ -137,9 +148,21 @@ pub struct Leases {
 struct Kill {
     /// When SIGKILL follows, for a task that ignores SIGTERM.
     deadline: Instant,
-    /// Whether it already has: the escalation happens once, and then the wait
-    /// is for pueued to report the task gone.
+    /// Whether it already has: the escalation happens once delivered, and then
+    /// the wait is for pueued to report the task gone.
     escalated: bool,
+}
+
+/// A submission whose answer never arrived. The task id comes back in that
+/// answer, so without it bzbd cannot tell a submission that never landed from
+/// one pueued has already started — and it starts them on arrival. The next
+/// poll settles it, and admissions wait until it has.
+struct Unreconciled {
+    /// The label the task would carry.
+    label: String,
+    /// When the submission went out: a task created before it is somebody
+    /// else's.
+    since: DateTime<Local>,
 }
 
 impl Leases {
@@ -153,6 +176,8 @@ impl Leases {
             next_id: 1,
             pueue: Pueue::default(),
             killing: BTreeMap::new(),
+            unreconciled: Vec::new(),
+            failed_polls: 0,
             deferred: VecDeque::new(),
             leases_path,
         };
@@ -257,11 +282,12 @@ impl Leases {
         while let Some(action) = pending.pop_front() {
             match action {
                 // The machine sizes an admission as if the lease it replaces
-                // were already gone. While a task is being killed that is not
-                // yet true, so the admission waits for the poll that sees the
-                // task end; teardowns and queue positions carry on meanwhile.
-                Action::Admit { .. } if !self.killing.is_empty() => {
-                    tracing::debug!("holding an admission back until the killed task is gone");
+                // were already gone. While a task bzbd cannot account for may
+                // still be running that is not yet true, so the admission waits
+                // for the poll that settles it; teardowns and queue positions
+                // carry on meanwhile.
+                Action::Admit { .. } if self.holding() => {
+                    tracing::debug!("holding an admission back until the machine is accounted for");
                     self.deferred.push_back(action);
                 }
                 Action::Admit { id, cores, .. } => pending.extend(self.admit(id, cores).await),
@@ -277,6 +303,12 @@ impl Leases {
         }
     }
 
+    /// Whether an admission has to wait, because a task the admission machine
+    /// has stopped counting may still be on the machine.
+    fn holding(&self) -> bool {
+        !self.killing.is_empty() || !self.unreconciled.is_empty()
+    }
+
     /// Submits an admitted lease to pueued and tells its client it is running.
     async fn admit(&mut self, id: LeaseId, cores: Option<u32>) -> Vec<Action> {
         let Some(lease) = self.leases.get(&id) else {
@@ -285,25 +317,34 @@ impl Leases {
             tracing::error!(lease = id.0, "admitted a lease that no longer exists");
             return self.scheduler.handle(Event::DrainFailed(id));
         };
+        let label = lease.label();
         let spec = TaskSpec {
             command: shell_escape_join(&lease.request.argv),
             cwd: lease.request.cwd.clone(),
             env: lease.request.env.clone(),
-            label: Some(lease.label()),
+            label: Some(label.clone()),
             // The group is at `parallel_tasks = 0`, so pueue's dispatcher will
             // never start it: admission is bzbd's decision and it has been made.
             start_immediately: true,
         };
         let class = lease.class;
 
+        let sent_at = Local::now();
         let task_id = match self.pueue.add(spec).await {
             Ok(task_id) => task_id,
             Err(err) => {
                 tracing::error!(lease = id.0, "cannot submit to pueued: {err:#}");
+                // pueued may have started it anyway — the id is in the answer
+                // that did not arrive — so the next poll goes looking before
+                // anything else is admitted.
+                self.unreconciled.push(Unreconciled {
+                    label,
+                    since: sent_at,
+                });
                 let actions = self.scheduler.handle(Event::DrainFailed(id));
-                // No task was created, so the machine's teardown has nothing
-                // to act on; the lease ends here instead, and never silently:
-                // the client hears why its command is not going to run.
+                // The machine's teardown has no task id to act on; the lease
+                // ends here instead, and never silently: the client hears why
+                // its command is not going to run.
                 let actions = actions
                     .into_iter()
                     .filter(|a| !matches!(a, Action::Drop(dropped) if *dropped == id))
@@ -356,18 +397,7 @@ impl Leases {
         self.deferred
             .retain(|a| !matches!(a, Action::Admit { id: held, .. } if *held == id));
         if let Some(task_id) = lease.pueue_task_id {
-            if let Err(err) = self.pueue.kill(task_id, Signal::SigTerm).await {
-                tracing::error!(task = task_id, "cannot stop the task: {err:#}");
-            }
-            // SIGKILL follows on the poll after the grace period, for a task
-            // that ignores the first signal.
-            self.killing.insert(
-                task_id,
-                Kill {
-                    deadline: Instant::now() + KILL_GRACE,
-                    escalated: false,
-                },
-            );
+            self.kill_task(task_id).await;
         }
         let _ = lease.conn.send(LeaseEvent::Finished {
             id: id.0,
@@ -375,19 +405,43 @@ impl Leases {
         });
     }
 
+    /// Signals a task and waits for pueued to confirm it is gone; SIGKILL
+    /// follows on the poll after the grace period, for a task that ignores the
+    /// first signal.
+    async fn kill_task(&mut self, task_id: usize) {
+        if let Err(err) = self.pueue.kill(task_id, Signal::SigTerm).await {
+            tracing::error!(task = task_id, "cannot stop the task: {err:#}");
+        }
+        self.killing.insert(
+            task_id,
+            Kill {
+                deadline: Instant::now() + KILL_GRACE,
+                escalated: false,
+            },
+        );
+    }
+
     /// One tick: ask pueued about every task we are waiting on, and act on the
     /// ones that ended.
     async fn poll(&mut self) {
         let watching = self.leases.values().any(|l| l.pueue_task_id.is_some());
-        if !watching && self.killing.is_empty() && self.deferred.is_empty() {
+        if !watching && !self.holding() && self.deferred.is_empty() {
             return;
         }
         let state = match self.pueue.status().await {
-            Ok(state) => state,
+            Ok(state) => {
+                self.failed_polls = 0;
+                state
+            }
             Err(err) => {
                 // Loud, and retried on the next tick: a poll that cannot run
                 // leaves leases running, not finished.
-                tracing::error!("cannot poll pueued: {err:#}");
+                self.failed_polls += 1;
+                tracing::error!(failures = self.failed_polls, "cannot poll pueued: {err:#}");
+                if self.failed_polls >= LOST_AFTER_FAILED_POLLS {
+                    self.failed_polls = 0;
+                    self.lose_running_leases(&err).await;
+                }
                 return;
             }
         };
@@ -403,14 +457,45 @@ impl Leases {
                 _ if kill.escalated => {}
                 _ if Instant::now() >= kill.deadline => {
                     tracing::warn!(task = task_id, "still running after SIGTERM; killing");
-                    if let Err(err) = self.pueue.kill(task_id, Signal::SigKill).await {
-                        tracing::error!(task = task_id, "cannot kill the task: {err:#}");
+                    match self.pueue.kill(task_id, Signal::SigKill).await {
+                        // Only a delivered SIGKILL counts as the escalation:
+                        // one recorded but never sent would leave the task
+                        // running and everything queued behind it stuck.
+                        Ok(()) => kill.escalated = true,
+                        Err(err) => {
+                            tracing::error!(task = task_id, "cannot kill the task: {err:#}");
+                        }
                     }
-                    kill.escalated = true;
                 }
                 _ => {}
             }
             self.killing.insert(task_id, kill);
+        }
+
+        // A submission whose answer was lost: if pueued did start the task, it
+        // is running with nothing to account for it, so it is killed like any
+        // other orphan. Either way the admission it held up may go ahead.
+        if !self.unreconciled.is_empty() {
+            let tracked: BTreeSet<usize> = self
+                .leases
+                .values()
+                .filter_map(|l| l.pueue_task_id)
+                .collect();
+            for pending in std::mem::take(&mut self.unreconciled) {
+                match orphan(&state.tasks, &pending, &tracked) {
+                    Some(task_id) => {
+                        tracing::error!(
+                            task = task_id,
+                            "pueued started a task whose submission failed; stopping it"
+                        );
+                        self.kill_task(task_id).await;
+                    }
+                    None => tracing::info!(
+                        label = pending.label,
+                        "the failed submission never reached pueued"
+                    ),
+                }
+            }
         }
 
         let ended: Vec<(LeaseId, Completion)> = self
@@ -430,14 +515,54 @@ impl Leases {
             self.drive(actions).await;
         }
 
-        // Every task that was being killed is gone, so the admissions that
-        // waited for them may go ahead. Only now, at the end of the tick: the
-        // task they submit is not in the `state` read above, and the scan for
-        // ended leases would take it for one that vanished.
-        if self.killing.is_empty() && !self.deferred.is_empty() {
+        // Every task bzbd could not account for is now accounted for, so the
+        // admissions that waited on them may go ahead. Only now, at the end of
+        // the tick: the task they submit is not in the `state` read above, and
+        // the scan for ended leases would take it for one that vanished.
+        if !self.holding() && !self.deferred.is_empty() {
             let waiting = std::mem::take(&mut self.deferred);
             self.drive(waiting.into()).await;
         }
+    }
+
+    /// pueued has stopped answering for long enough to count as gone
+    /// (`docs/design/bzbd.md` §Failure and recovery). Nothing it was running
+    /// can be accounted for any more, so the leases that depend on it are
+    /// marked lost and their clients told why; bzbd keeps serving, and the next
+    /// submission spawns pueued again.
+    async fn lose_running_leases(&mut self, err: &BusybeeError) {
+        // Confirmations that will never arrive. Waiting for them would hold
+        // every remaining admission behind a task nobody can ask about.
+        if self.holding() {
+            tracing::error!(
+                teardowns = self.killing.len(),
+                submissions = self.unreconciled.len(),
+                "giving up on what pueued was asked to do: it is gone"
+            );
+            self.killing.clear();
+            self.unreconciled.clear();
+        }
+        let running: Vec<LeaseId> = self
+            .leases
+            .iter()
+            .filter(|(_, lease)| lease.pueue_task_id.is_some())
+            .map(|(id, _)| *id)
+            .collect();
+        for id in running {
+            self.send(
+                id,
+                LeaseEvent::Notice {
+                    text: format!(
+                        "bzbd lost contact with pueued: {err}; this task is no longer tracked"
+                    ),
+                },
+            );
+            self.finish(id, 1);
+            let actions = self.scheduler.handle(Event::Finished(id));
+            self.drive(actions).await;
+        }
+        let waiting = std::mem::take(&mut self.deferred);
+        self.drive(waiting.into()).await;
     }
 
     /// Ends a lease that is over: it leaves the books before its client hears
@@ -467,31 +592,31 @@ impl Leases {
 
     fn status(&self) -> StatusReply {
         let snapshot = self.scheduler.snapshot();
-        let admitted_count = snapshot.admitted.len();
-        let view = |id: LeaseId, class: Class, cores: u32, state: &str, ahead: Option<usize>| {
-            let lease = self.leases.get(&id);
-            LeaseView {
-                id: id.0,
-                label: lease.map(Lease::label).unwrap_or_default(),
-                class: class.as_str().to_string(),
-                cores,
-                state: state.to_string(),
-                elapsed_ms: lease.map_or(0, |l| elapsed_ms(l.started_at)),
-                ahead,
-                pueue_task_id: lease.and_then(|l| l.pueue_task_id),
-            }
-        };
         let leases = snapshot
             .admitted
             .iter()
-            .map(|l| view(l.id, l.class, l.cores_held, "running", None))
-            .chain(
-                snapshot
-                    .queued
-                    .iter()
-                    .enumerate()
-                    .map(|(i, r)| view(r.id, r.class, 0, "queued", Some(admitted_count + i))),
-            )
+            .map(|l| (l.id, l.class, l.cores_held))
+            .chain(snapshot.queued.iter().map(|r| (r.id, r.class, 0)))
+            .enumerate()
+            .map(|(position, (id, class, cores))| {
+                let lease = self.leases.get(&id);
+                // An admitted lease with no task of its own has not started:
+                // it is held back while an earlier task is torn down, and
+                // reporting it as running would show a command nobody is
+                // executing. What is ahead of it is what precedes it here.
+                let pueue_task_id = lease.and_then(|l| l.pueue_task_id);
+                let running = pueue_task_id.is_some();
+                LeaseView {
+                    id: id.0,
+                    label: lease.map(Lease::label).unwrap_or_default(),
+                    class: class.as_str().to_string(),
+                    cores,
+                    state: if running { "running" } else { "queued" }.to_string(),
+                    elapsed_ms: lease.map_or(0, |l| elapsed_ms(l.started_at)),
+                    ahead: (!running).then_some(position),
+                    pueue_task_id,
+                }
+            })
             .collect();
         StatusReply {
             pool_size: self.params.pool_size,
@@ -543,6 +668,26 @@ fn write_json(path: &Path, records: &[Record]) -> Result<()> {
     std::fs::write(&temporary, encoded)
         .with_context(|| format!("cannot write {}", temporary.display()))?;
     std::fs::rename(&temporary, path).with_context(|| format!("cannot replace {}", path.display()))
+}
+
+/// The task an unanswered submission may have started: it carries the label
+/// bzbd asked for, pueued created it no earlier than the submission, it is
+/// still alive, and no lease claims it. Anything else is somebody's task and
+/// is left alone.
+fn orphan(
+    tasks: &BTreeMap<usize, Task>,
+    pending: &Unreconciled,
+    tracked: &BTreeSet<usize>,
+) -> Option<usize> {
+    tasks
+        .values()
+        .find(|task| {
+            task.label.as_deref() == Some(pending.label.as_str())
+                && task.created_at >= pending.since
+                && !tracked.contains(&task.id)
+                && !matches!(task.status, TaskStatus::Done { .. })
+        })
+        .map(|task| task.id)
 }
 
 /// What a poll of pueue's task list says about a lease's task; `None` while it
@@ -633,6 +778,125 @@ mod tests {
     /// `pueue clean` takes a task's record with it. Waiting for a status that
     /// will never arrive would hang the client forever, so the lease ends —
     /// non-zero, because the exit code went with the record.
+    fn task(id: usize, label: &str, created_at: DateTime<Local>, status: TaskStatus) -> Task {
+        let mut task = Task::new(
+            "sleep 1".into(),
+            PathBuf::from("/tmp"),
+            Default::default(),
+            "busybee".into(),
+            status,
+            Vec::new(),
+            0,
+            Some(label.into()),
+        );
+        task.id = id;
+        task.created_at = created_at;
+        task
+    }
+
+    fn running() -> TaskStatus {
+        let now = Local::now();
+        TaskStatus::Running {
+            enqueued_at: now,
+            start: now,
+        }
+    }
+
+    fn tasks(tasks: Vec<Task>) -> BTreeMap<usize, Task> {
+        tasks.into_iter().map(|t| (t.id, t)).collect()
+    }
+
+    /// A submission whose answer was lost may still have started a task, and
+    /// `start_immediately` means it is already running. Nothing accounts for
+    /// it, so the poll has to find it.
+    #[test]
+    fn an_unanswered_submission_finds_the_task_pueued_started() {
+        let since = Local::now();
+        let state = tasks(vec![task(4, "cargo build", since, running())]);
+        let pending = Unreconciled {
+            label: "cargo build".into(),
+            since,
+        };
+        assert_eq!(orphan(&state, &pending, &BTreeSet::new()), Some(4));
+    }
+
+    /// The task a live lease is watching is accounted for, even when its label
+    /// is the same — two sessions building the same project is the ordinary
+    /// case, and killing the other one would be the bug this guards against.
+    #[test]
+    fn a_task_a_lease_holds_is_not_an_orphan() {
+        let since = Local::now();
+        let state = tasks(vec![task(4, "cargo build", since, running())]);
+        let pending = Unreconciled {
+            label: "cargo build".into(),
+            since,
+        };
+        assert_eq!(orphan(&state, &pending, &BTreeSet::from([4])), None);
+    }
+
+    /// Nor is one that predates the submission: it cannot be the task the
+    /// submission would have created.
+    #[test]
+    fn a_task_older_than_the_submission_is_not_an_orphan() {
+        let since = Local::now();
+        let state = tasks(vec![task(
+            4,
+            "cargo build",
+            since - chrono::Duration::seconds(1),
+            running(),
+        )]);
+        let pending = Unreconciled {
+            label: "cargo build".into(),
+            since,
+        };
+        assert_eq!(orphan(&state, &pending, &BTreeSet::new()), None);
+    }
+
+    /// An admission held back while an earlier task is torn down has no task
+    /// of its own, and its client has not been told it is running. `busybee
+    /// status` must not say otherwise.
+    #[tokio::test]
+    async fn an_admission_held_back_is_reported_as_queued() {
+        let directory = tempfile::tempdir().expect("create a tempdir");
+        let params = Params {
+            pool_size: 8,
+            max_concurrent: 4,
+        };
+        let (mut actor, _handle, _commands) =
+            Leases::new(params, directory.path().join("leases.json"));
+        // A teardown in flight: what holds the admission back.
+        actor.killing.insert(
+            9,
+            Kill {
+                deadline: Instant::now() + KILL_GRACE,
+                escalated: false,
+            },
+        );
+
+        let (events, _stream) = mpsc::unbounded_channel();
+        let (id, _asked) = oneshot::channel();
+        actor
+            .submit(
+                LeaseRequest {
+                    argv: vec!["cargo".into(), "build".into()],
+                    cwd: PathBuf::from("/tmp"),
+                    env: Default::default(),
+                    label: None,
+                    class_override: None,
+                    cores_wanted: None,
+                },
+                events,
+                id,
+            )
+            .await;
+
+        let status = actor.status();
+        assert_eq!(status.leases.len(), 1, "leases were {:?}", status.leases);
+        assert_eq!(status.leases[0].state, "queued");
+        assert_eq!(status.leases[0].pueue_task_id, None);
+        assert_eq!(status.leases[0].ahead, Some(0));
+    }
+
     #[test]
     fn a_task_that_vanished_ends_the_lease_with_a_notice() {
         let completion = completion(7, None).expect("a vanished task ends its lease");
