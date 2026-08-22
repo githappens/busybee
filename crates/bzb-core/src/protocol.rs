@@ -116,18 +116,22 @@ pub enum Response {
 /// explanation helps the peer.
 const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
 
+/// Marks a message [`Response::error`] cut short. Its bytes come out of
+/// [`MAX_ERROR_MESSAGE_BYTES`], not on top of it.
+const ELLIPSIS: char = '…';
+
 impl Response {
     /// An [`Response::Error`] whose encoded line fits [`MAX_LINE_BYTES`]
     /// whatever the message quotes.
     pub fn error(message: impl std::fmt::Display) -> Self {
         let mut message = message.to_string();
         if message.len() > MAX_ERROR_MESSAGE_BYTES {
-            let mut end = MAX_ERROR_MESSAGE_BYTES;
+            let mut end = MAX_ERROR_MESSAGE_BYTES - ELLIPSIS.len_utf8();
             while !message.is_char_boundary(end) {
                 end -= 1;
             }
             message.truncate(end);
-            message.push('…');
+            message.push(ELLIPSIS);
         }
         Response::Error { message }
     }
@@ -228,6 +232,21 @@ mod tests {
             serde_json::from_str::<Class>(r#""statik""#).is_err(),
             "an unknown class must not decode"
         );
+    }
+
+    /// The cap is on the message the peer receives, so the ellipsis has to
+    /// come out of the budget rather than be added on top of it.
+    #[test]
+    fn a_truncated_error_message_stays_within_the_cap() {
+        let Response::Error { message } = Response::error("x".repeat(5000)) else {
+            panic!("expected an error response");
+        };
+        assert!(
+            message.len() <= MAX_ERROR_MESSAGE_BYTES,
+            "message was {} bytes",
+            message.len()
+        );
+        assert!(message.ends_with('…'), "message was {message:?}");
     }
 
     #[test]
