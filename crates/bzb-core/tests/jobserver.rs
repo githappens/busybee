@@ -1,10 +1,8 @@
 //! Integration tests for `bzb_core::jobserver` against real GNU make and ninja.
 //!
-//! Each build fixture has 16 independent targets. A target creates a marker
-//! file under `run/`, sleeps 0.3 s, appends the number of markers currently
-//! present to `counts.log`, and removes its marker. The maximum value in
-//! `counts.log` is the peak concurrency the tool actually reached. Markers
-//! are per-process (`$$`) so two builds can share one fixture directory.
+//! Each build fixture has 16 independent targets that count each other; see
+//! [`bzb_test_support::counter`] for how, and `crates/bzb/tests/e2e_pool.rs`
+//! for the same fixture under the whole daemon.
 //!
 //! Tests that need an external tool print why they are skipped when the tool
 //! is missing or too old (visible with `--nocapture`); see `tests/README.md`.
@@ -15,64 +13,20 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use bzb_core::jobserver::Jobserver;
+use bzb_test_support::counter::{self, available};
 
-const MAKEFILE: &str = "\
-T := t1 t2 t3 t4 t5 t6 t7 t8 t9 t10 t11 t12 t13 t14 t15 t16
-all: $(T)
-$(T):
-\t@f=run/$@.$$$$; touch $$f; sleep 0.3; ls run | wc -l >> counts.log; rm $$f
-";
+/// Targets in a build fixture, which is also how many samples it leaves.
+const JOBS: usize = 16;
 
-fn ninja_file() -> String {
-    let mut s = String::from(
-        "rule job\n  command = f=run/$out.$$$$; touch $$f; sleep 0.3; ls run | wc -l >> counts.log; rm $$f\n",
-    );
-    for i in 1..=16 {
-        s.push_str(&format!("build t{i}: job\n"));
-    }
-    s.push_str("build all: phony");
-    for i in 1..=16 {
-        s.push_str(&format!(" t{i}"));
-    }
-    s.push_str("\ndefault all\n");
-    s
-}
+/// Long enough that the tool has time to reach its peak before the first job
+/// finishes, short enough to keep the suite quick.
+const SLEEP: &str = "0.3";
 
-/// `(major, minor)` from the first line of `tool --version`, `None` if the
-/// tool cannot be run. Handles both "GNU Make 4.4.1" and ninja's bare "1.13.2".
-fn version(tool: &str) -> Option<(u32, u32)> {
-    let out = Command::new(tool).arg("--version").output().ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let last_word = text.lines().next()?.split_whitespace().last()?;
-    let mut parts = last_word.split('.').map(|p| p.parse::<u32>().ok());
-    Some((parts.next()??, parts.next()??))
-}
-
-/// True when `tool` is present and at least `min`; otherwise prints the
-/// reason the calling test is being skipped and returns false.
-fn available(tool: &str, min: (u32, u32)) -> bool {
-    match version(tool) {
-        Some(v) if v >= min => true,
-        Some((maj, min_)) => {
-            eprintln!(
-                "skipping: {tool} {maj}.{min_} is older than the required {}.{}",
-                min.0, min.1
-            );
-            false
-        }
-        None => {
-            eprintln!("skipping: {tool} not found in PATH");
-            false
-        }
-    }
-}
-
-/// Fresh per-test directory containing `run/` and the build file.
-fn fixture(name: &str, file: &str, content: &str) -> PathBuf {
+/// Fresh per-test directory, empty but for whatever the caller puts in it.
+fn fixture(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("bzb-jobserver-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(dir.join("run")).unwrap();
-    fs::write(dir.join(file), content).unwrap();
+    fs::create_dir_all(&dir).unwrap();
     dir
 }
 
@@ -92,24 +46,18 @@ fn run(cmd: &mut Command) {
     );
 }
 
-fn peak_concurrency(dir: &Path) -> u32 {
-    let log = fs::read_to_string(dir.join("counts.log")).unwrap();
-    let counts: Vec<u32> = log.lines().map(|l| l.trim().parse().unwrap()).collect();
-    assert_eq!(counts.len() % 16, 0, "every target must log exactly once");
-    counts.into_iter().max().unwrap()
-}
-
 #[test]
 fn make_respects_pool_of_four() {
     if !available("make", (4, 4)) {
         return;
     }
-    let dir = fixture("make", "Makefile", MAKEFILE);
+    let dir = fixture("make");
+    counter::make_build(&dir, JOBS as u32, SLEEP);
     let js = Jobserver::create(&dir, 4).unwrap();
 
-    run(&mut build_cmd("make", &dir, &js));
+    run(build_cmd("make", &dir, &js).arg("run"));
 
-    let peak = peak_concurrency(&dir);
+    let peak = counter::peak(&dir, JOBS);
     assert!(
         (2..=5).contains(&peak),
         "peak concurrency {peak}, expected 2..=5"
@@ -124,15 +72,24 @@ fn two_makes_share_one_pool() {
     if !available("make", (4, 4)) {
         return;
     }
-    let dir = fixture("make2", "Makefile", MAKEFILE);
+    let dir = fixture("make2");
+    counter::make_build(&dir, JOBS as u32, SLEEP);
     let js = Jobserver::create(&dir, 4).unwrap();
 
-    let mut a = build_cmd("make", &dir, &js).spawn().unwrap();
-    let mut b = build_cmd("make", &dir, &js).spawn().unwrap();
+    // Two names, so the two builds' samples cannot collide even if the shells
+    // running a target happen to be given the same pid.
+    let mut a = build_cmd("make", &dir, &js)
+        .args(["COUNTER_NAME=a", "run"])
+        .spawn()
+        .unwrap();
+    let mut b = build_cmd("make", &dir, &js)
+        .args(["COUNTER_NAME=b", "run"])
+        .spawn()
+        .unwrap();
     assert!(a.wait().unwrap().success());
     assert!(b.wait().unwrap().success());
 
-    let peak = peak_concurrency(&dir);
+    let peak = counter::peak(&dir, 2 * JOBS);
     assert!(peak <= 6, "combined peak concurrency {peak}, expected <= 6");
     assert_eq!(js.free().unwrap(), 4);
     drop(js);
@@ -141,7 +98,7 @@ fn two_makes_share_one_pool() {
 
 #[test]
 fn acquire_and_release_round_trip() {
-    let dir = fixture("acquire", ".keep", "");
+    let dir = fixture("acquire");
     let js = Jobserver::create(&dir, 4).unwrap();
     assert_eq!(js.free().unwrap(), 4);
 
@@ -156,7 +113,7 @@ fn acquire_and_release_round_trip() {
 
 #[test]
 fn acquire_on_empty_pool_times_out() {
-    let dir = fixture("timeout", ".keep", "");
+    let dir = fixture("timeout");
     let js = Jobserver::create(&dir, 0).unwrap();
 
     let start = Instant::now();
@@ -174,7 +131,7 @@ fn acquire_on_empty_pool_times_out() {
 
 #[test]
 fn drain_excess_removes_extra_tokens() {
-    let dir = fixture("drain", ".keep", "");
+    let dir = fixture("drain");
     let js = Jobserver::create(&dir, 4).unwrap();
 
     // A misbehaving tool writing two bytes it never read.
@@ -190,7 +147,7 @@ fn drain_excess_removes_extra_tokens() {
 
 #[test]
 fn drop_unlinks_fifo() {
-    let dir = fixture("drop", ".keep", "");
+    let dir = fixture("drop");
     let js = Jobserver::create(&dir, 1).unwrap();
     let path = js.path().to_path_buf();
     assert_eq!(
@@ -212,7 +169,7 @@ fn leave_keeps_the_fifo_and_its_tokens_for_whoever_holds_it() {
     use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::io::AsRawFd;
 
-    let dir = fixture("leave", ".keep", "");
+    let dir = fixture("leave");
     let mut js = Jobserver::create(&dir, 3).unwrap();
     let path = js.path().to_path_buf();
     let holder = fs::OpenOptions::new()
@@ -242,7 +199,7 @@ fn close_reports_unlink_failure() {
         eprintln!("skipping: running as root, directory permissions are not enforced");
         return;
     }
-    let dir = fixture("close", ".keep", "");
+    let dir = fixture("close");
     let js = Jobserver::create(&dir, 1).unwrap();
     let path = js.path().to_path_buf();
 
@@ -260,7 +217,7 @@ fn close_reports_unlink_failure() {
 #[test]
 fn create_rejects_dir_makeflags_cannot_carry() {
     // MAKEFLAGS is split on whitespace, so make would open only "fifo:<prefix>".
-    let dir = fixture("with space", ".keep", "");
+    let dir = fixture("with space");
     let err = Jobserver::create(&dir, 4)
         .err()
         .expect("create must fail for a whitespace path");
@@ -278,7 +235,7 @@ fn create_rejects_dir_makeflags_cannot_carry() {
 fn create_rejects_a_pool_the_pipe_cannot_hold() {
     // Every token must fit in the pipe at once; 4096 is the smallest capacity
     // on the supported platforms, so one more is an error, not a panic.
-    let dir = fixture("too-many-tokens", ".keep", "");
+    let dir = fixture("too-many-tokens");
     let err = Jobserver::create(&dir, 4097)
         .err()
         .expect("create must fail for a pool larger than the pipe");
@@ -298,12 +255,13 @@ fn ninja_respects_pool_of_four() {
     if !available("ninja", (1, 13)) {
         return;
     }
-    let dir = fixture("ninja", "build.ninja", &ninja_file());
+    let dir = fixture("ninja");
+    counter::ninja_build(&dir, JOBS as u32, SLEEP);
     let js = Jobserver::create(&dir, 4).unwrap();
 
     run(&mut build_cmd("ninja", &dir, &js));
 
-    let peak = peak_concurrency(&dir);
+    let peak = counter::peak(&dir, JOBS);
     assert!(
         (2..=5).contains(&peak),
         "peak concurrency {peak}, expected 2..=5"

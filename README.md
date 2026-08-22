@@ -236,9 +236,10 @@ busybee (client)  ──unix socket──▶  bzbd (broker)  ──pueue-lib─�
 [pueue](https://github.com/Nukesor/pueue) keeps what it is good at — spawning,
 process groups, log capture, persistence — while `bzbd` decides what runs.
 [`docs/design/bzbd.md`](docs/design/bzbd.md) is the specification, tracked in
-[#2](https://github.com/githappens/busybee/issues/2), and
-[#21](https://github.com/githappens/busybee/issues/21) will add the worked
-example: `crates/bzb/tests/e2e_pool.rs`, two jobserver builds and a static task.
+[#2](https://github.com/githappens/busybee/issues/2). The worked example is
+[`crates/bzb/tests/e2e_pool.rs`](crates/bzb/tests/e2e_pool.rs): real GNU make
+builds taking, sharing and giving back a six-token pool, with a static task and
+an unrecognised command among them.
 
 ## Not yet
 

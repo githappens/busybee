@@ -1,151 +1,18 @@
-//! The client end to end, against daemons of the test's own: an isolated
-//! `pueued` and a `bzbd` in a temporary state directory.
-//!
-//! `busybee` starts bzbd itself when the socket is unreachable, so no test
-//! spawns one by hand — the auto-start is the path under test. What every test
-//! does is point `BUSYBEE_STATE_DIR` and `PUEUE_CONFIG_PATH` somewhere of its
-//! own, so nothing here can reach a developer's daemon or queue.
+//! The client end to end, against daemons of the test's own: see
+//! [`common::Busybee`]. `crates/bzb/tests/e2e_pool.rs` is the same client
+//! under real builds sharing the pool.
+
+mod common;
 
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
 
-use bzb_core::{
-    daemon::Connection,
-    protocol::{Request, Response, StatusReply},
-};
-use bzb_test_support::PueuedFixture;
+use bzb_core::protocol::Response;
+use common::{stderr, stdout, Busybee, PATIENCE};
 use tempfile::TempDir;
-
-/// Long enough for a poll tick (1 s) plus the daemons' own latency, short
-/// enough that a task which never runs fails the test instead of hanging it.
-const PATIENCE: Duration = Duration::from_secs(15);
-
-/// A busybee client with daemons of its own.
-struct Busybee {
-    _pueue: PueuedFixture,
-    tmp: TempDir,
-}
-
-impl Busybee {
-    /// `None` when `pueued` is not on `PATH`, which is how these tests skip
-    /// themselves outside the dev shell.
-    fn start() -> Option<Self> {
-        let pueue = PueuedFixture::try_start()?;
-        // bzbd is started by the client, from next to the client's own binary.
-        let bzbd = Path::new(env!("CARGO_BIN_EXE_busybee"))
-            .parent()
-            .expect("the client binary has a directory")
-            .join("bzbd");
-        assert!(
-            bzbd.is_file(),
-            "{} is missing; build the whole workspace (cargo build --workspace) \
-             so the client has a daemon to start",
-            bzbd.display()
-        );
-        let tmp = TempDir::new().expect("create tempdir");
-        // A config file of the test's own: the pool size is pinned rather
-        // than left to the core count of whatever runs the tests, and the
-        // developer's config stays out of it.
-        std::fs::write(tmp.path().join("config.toml"), "pool_size = 4\n")
-            .expect("write the config");
-        Some(Self { _pueue: pueue, tmp })
-    }
-
-    /// A `busybee` invocation pointed at this test's daemons. The bzbd it
-    /// auto-starts inherits this environment, config file included.
-    fn cmd(&self, args: &[&str]) -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_busybee"));
-        cmd.env("BUSYBEE_STATE_DIR", self.state_dir())
-            .env("BUSYBEE_CONFIG", self.tmp.path().join("config.toml"))
-            .env("PUEUE_CONFIG_PATH", &self._pueue.config_path)
-            .args(args);
-        cmd
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
-        self.cmd(args).output().expect("run busybee")
-    }
-
-    fn state_dir(&self) -> PathBuf {
-        self.tmp.path().join("state")
-    }
-
-    fn socket(&self) -> PathBuf {
-        self.state_dir().join("bzbd.sock")
-    }
-
-    /// bzbd is started by the client under test, so a test that only spawned
-    /// one has a window in which there is no socket to ask yet. The error is
-    /// returned rather than raised: to the waiters below it is a "not yet".
-    fn status(&self) -> anyhow::Result<StatusReply> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        runtime.block_on(async {
-            let mut conn = Connection::connect(&self.socket()).await?;
-            conn.send(Request::Status).await?;
-            match conn.recv().await? {
-                Response::Status(status) => Ok(status),
-                other => anyhow::bail!("expected a status reply, got {other:?}"),
-            }
-        })
-    }
-
-    /// Waits for bzbd to hold `count` leases, or fails saying what it held.
-    fn wait_for_leases(&self, count: usize) {
-        self.wait_for(&format!("{count} lease(s)"), |status| {
-            status.leases.len() == count
-        });
-    }
-
-    /// Waits for a task to be running, which is the point at which bzbd has it
-    /// on the machine rather than merely on the queue.
-    fn wait_for_a_running_task(&self) {
-        self.wait_for("a running task", |status| {
-            status.leases.iter().any(|l| l.state == "running")
-        });
-    }
-
-    fn wait_for(&self, what: &str, ready: impl Fn(&StatusReply) -> bool) {
-        let deadline = Instant::now() + PATIENCE;
-        loop {
-            // Kept for the failure message, so a wait that never reached bzbd
-            // at all says that instead of blaming the condition.
-            let why = match self.status() {
-                Ok(status) if ready(&status) => return,
-                Ok(status) => format!("bzbd holds {:?}", status.leases),
-                Err(err) => format!("bzbd is unreachable: {err}"),
-            };
-            assert!(Instant::now() < deadline, "waited for {what}; {why}");
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-}
-
-impl Drop for Busybee {
-    fn drop(&mut self) {
-        // The daemon the client auto-started is in its own session; the pid
-        // file is what is left to find it by. A test that never started one
-        // has no file and nothing to kill.
-        let Ok(pid) = std::fs::read_to_string(self.state_dir().join("bzbd.pid")) else {
-            return;
-        };
-        if let Ok(pid) = pid.trim().parse::<i32>() {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-        }
-    }
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
 
 #[test]
 #[serial_test::serial]

@@ -3,6 +3,8 @@
 //! Everything here spawns its own daemon in a temporary directory: a test must
 //! never reach the developer's own `pueued` or its `busybee` group.
 
+pub mod counter;
+
 use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
