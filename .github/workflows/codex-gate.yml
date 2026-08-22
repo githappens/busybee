@@ -224,6 +224,15 @@ jobs:
             UNSURE) echo "::warning::gate unsure for PR #$PR: $reason"; exit 0 ;;
             *) echo "::error::invalid verdict '$verdict'"; exit 1 ;;
           esac
+          # The head can move while the model is judging: the author pushes a fix
+          # seconds after the review that selected this run. Posting anyway pins a
+          # verdict to a commit nobody is on, and the review-set change costs the
+          # author another continuation turn. Re-read the head and drop the verdict.
+          live=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+          if [ "$live" != "$HEAD" ]; then
+            echo "::notice::head moved $HEAD -> $live while judging; dropping stale verdict"
+            exit 0
+          fi
           current=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
             --jq '[.[] | select(.user.login==env.GATE and .commit_id==env.HEAD)] | sort_by(.submitted_at) | last | .state // empty')
           state="CHANGES_REQUESTED"; [ "$verdict" = APPROVE ] && state="APPROVED"
