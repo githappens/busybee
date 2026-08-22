@@ -111,7 +111,12 @@ The board (Projects → "busybee · bzbd", Kanban view) mirrors these labels thr
   turn with your comments (`reactions.review_comments`). Your approval counts
   like the gate's.
 - **Stop everything**: Ctrl-C `run.sh`. Sessions already running finish their
-  turn; on the next start sortie reconciles against tracker state.
+  turn; on the next start sortie reconciles against tracker state. Signal the
+  `sortie` process, not the `run.sh` wrapper — the wrapper is the parent, so a
+  signal sent to it alone does not reach the daemon. Prefer stopping when
+  `sortie_sessions_running` is 0: killing an agent mid-rebase leaves its
+  workspace with an unfinished rebase, which makes `before_run` fail on every
+  later dispatch for that issue (see the stall table).
 - **Change concurrency, polling, model**: edit `WORKFLOW.md`; most `agent.*`
   and `polling.*` keys hot-reload, reactions need a restart (`sortie validate`
   tells you if the file is malformed).
@@ -128,6 +133,7 @@ The board (Projects → "busybee · bzbd", Kanban view) mirrors these labels thr
 | approved PR, `mergeStateStatus UNSTABLE`, `auto_merge` idle | a check failed on the head (typically Linux-only behaviour; agents develop on macOS) | `reactions.ci_failure` hands the log excerpt to the agent; if it is missing from `WORKFLOW.md`, add it and restart |
 | a PR keeps getting new findings on code added for earlier findings | review scope creep on a large PR | `AGENTS.md` → *Stay within the issue's scope*; only branches containing that rule are reviewed under it |
 | PR blocked at `CHANGES_REQUESTED`, head unchanged for 10+ min, every finding carries an agent reply and no push | a declined P0/P1: a reply alone never clears that, only a Codex re-review does. (Declined P2/P3 findings approve on the reply; if the verdict still says it is waiting, the reply gave no reason — a bare acknowledgement does not count) | the prompt has the agent post `@codex review` on the same head after a P0/P1 decline; if the branch predates that, post the comment yourself, and if Codex re-raises a declined finding decide it by hand (the gate will not) |
+| retry attempt climbing for one issue with no agent activity, error `worker exited: workspace preparation: hook run: exit_code=1` | the issue's workspace is mid-rebase, so `before_run`'s `git checkout sortie/<n>` cannot run; every dispatch dies before the agent starts. Stopping `run.sh` while an agent is rebasing leaves it this way | `cd build/sortie-workspaces/<n> && git status` shows a detached HEAD, `.git/rebase-merge` and `UU` paths; `git rebase --abort` restores the branch and the next dispatch succeeds. Check the reflog before assuming commits are lost — an agent that resets onto a new main and recommits has squashed them, not dropped them. Deleting the workspace also works; `after_create` re-clones |
 
 Restart `run.sh` when `sortie_sessions_running` is 0 (`/metrics`): a restart cancels in-flight turns, and they resume as retries. Reactions (`reactions.*`) load only at startup; `agent.*`, `polling.*` and the prompt body hot-reload. GitHub's reviews and comments endpoints page at 30 and agent replies count as reviews, so always `--paginate` when inspecting a long-lived PR.
 
