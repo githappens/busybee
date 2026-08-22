@@ -104,9 +104,11 @@ nix develop -c cargo test -p bzb --test smoke
   be loud — logged and visible in the result — never the quiet default. The
   design document applies this to the daemon too: if it cannot create its fifo
   or socket it refuses to start rather than running the command ungoverned.
-  One known exception predates the rule: `group::enforce_parallel` drops the
-  daemon's reply, so a hand-raised `parallel_tasks` is silently not restored.
-  Do not copy that pattern; new code propagates.
+  Two paths predate the rule and are not patterns to copy:
+  `group::enforce_parallel` drops the daemon's reply, so a hand-raised
+  `parallel_tasks` is silently not restored; and `monitor/app.rs` turns a
+  failed connect or status poll into `None`, redrawing the last snapshot
+  instead of surfacing that the daemon is gone. New code propagates.
 - **Pure state machines, IO at the edges.** `wait.rs` is the model: it takes a
   status snapshot and returns events, with no sockets or clocks inside, so it
   is testable without a daemon. New scheduling and classification logic follows
