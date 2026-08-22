@@ -37,13 +37,17 @@ pub fn state_dir() -> Result<PathBuf, BusybeeError> {
     if let Some(dir) = env::var_os("XDG_STATE_HOME").filter(|d| Path::new(d).is_absolute()) {
         return Ok(PathBuf::from(dir).join("busybee"));
     }
-    let home = env::var_os("HOME").ok_or_else(|| {
-        BusybeeError::Other(
-            "cannot locate the busybee state directory: none of BUSYBEE_STATE_DIR, \
-             XDG_STATE_HOME or HOME is set"
-                .into(),
-        )
-    })?;
+    // HOME has to be absolute for the same reason: a relative one would put
+    // `.local/state/busybee` under whatever directory the caller ran from.
+    let home = env::var_os("HOME")
+        .filter(|d| Path::new(d).is_absolute())
+        .ok_or_else(|| {
+            BusybeeError::Other(
+                "cannot locate the busybee state directory: BUSYBEE_STATE_DIR is unset and \
+                 neither XDG_STATE_HOME nor HOME holds an absolute path"
+                    .into(),
+            )
+        })?;
     Ok(PathBuf::from(home).join(".local/state/busybee"))
 }
 
@@ -353,6 +357,22 @@ mod tests {
                         PathBuf::from("/tmp/home/.local/state/busybee"),
                         "XDG_STATE_HOME={value:?}"
                     );
+                },
+            );
+        }
+
+        // The home-relative default needs an absolute HOME for the same
+        // reason: `.local/state/busybee` would resolve per working directory.
+        for home in [None, Some(""), Some("relative/home")] {
+            temp_env(
+                &[
+                    ("BUSYBEE_STATE_DIR", None),
+                    ("XDG_STATE_HOME", None),
+                    ("HOME", home),
+                ],
+                || {
+                    let err = state_dir().unwrap_err().to_string();
+                    assert!(err.contains("HOME"), "HOME={home:?} message was {err:?}");
                 },
             );
         }
