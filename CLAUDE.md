@@ -42,7 +42,8 @@ them to `flake.nix` in that change, not ahead of it.
 ```
 crates/bzb-core/   library: pueue-lib wrapper plus pure helpers
 crates/bzb/        binaries `busybee` and `bzb` (same entry point), monitor TUI
-crates/bzbd/       planned: the broker daemon; module layout fixed by the spec
+crates/bzbd/       the broker daemon; module layout fixed by the spec
+crates/bzb-test-support/  fixtures shared by the crates' integration tests
 ```
 
 `crates/bzb-core/src/`:
@@ -50,8 +51,9 @@ crates/bzbd/       planned: the broker daemon; module layout fixed by the spec
 | module          | purpose |
 |-----------------|---------|
 | `client.rs`     | connect to `pueued`, spawning it if the socket is unreachable |
-| `group.rs`      | create/re-enforce the `busybee` group at `parallel_tasks = 1` |
-| `enqueue.rs`    | `TaskSpec` → pueue `AddRequest`; returns the new task id |
+| `group.rs`      | create/re-enforce the `busybee` group at `parallel_tasks = 0` |
+| `enqueue.rs`    | `TaskSpec` → pueue `AddRequest`; returns the new task id; shell-escaping join |
+| `kill.rs`       | one signal to a running task; the caller owns the escalation |
 | `wait.rs`       | pure state machine turning task-status polls into `WaitEvent`s |
 | `classify.rs`   | pure argv → `Plan`: admission class plus the env/argv edits |
 | `status.rs`     | `QueueSnapshot` — running/queued view of the group, plus `count_ahead` |
@@ -65,15 +67,20 @@ stream, relay exit code), `detach.rs` (`--detach`), `signals.rs` (SIGINT
 escalation), `monitor/` (ratatui TUI plus per-OS CPU sampling),
 `version_parse.rs` (shared with `build.rs`).
 
+`crates/bzbd/src/`: `lib.rs` (state directory, socket server, lifecycle),
+`leases.rs` (the actor owning the scheduler, the live leases and the poll of
+pueue), `submit.rs` (the connection to pueued, reconnected on demand).
+
 ## Integration tests
 
-`crates/bzb/tests/common/pueued.rs` spawns an isolated `pueued`: its own temp
+`bzb-test-support`'s `PueuedFixture` spawns an isolated `pueued`: its own temp
 config dir, its own unix socket, killed on `Drop`. Reuse it — tests must never
-touch a developer's real pueue instance or its `busybee` group.
+touch a developer's real pueue instance or its `busybee` group. bzbd's own
+tests add `crates/bzbd/tests/common/mod.rs`, which does the same for a daemon
+in a temporary `BUSYBEE_STATE_DIR`.
 
 ```rust
-mod common;
-use common::pueued::PueuedFixture;
+use bzb_test_support::PueuedFixture;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
@@ -102,11 +109,9 @@ nix develop -c cargo test -p bzb --test smoke
   be loud — logged and visible in the result — never the quiet default. The
   design document applies this to the daemon too: if it cannot create its fifo
   or socket it refuses to start rather than running the command ungoverned.
-  Pre-broker code does not all obey it: `group::enforce_parallel` drops the
-  daemon's reply, so a hand-raised `parallel_tasks` is silently not restored;
-  `monitor/app.rs` turns a failed poll into `None` and redraws the stale
-  snapshot; `bzb/src/enqueue.rs`'s `soft_cancel`/`hard_kill` discard the kill
-  response yet still report cancelling. Those are examples, not an audit —
+  Pre-broker code does not all obey it: `monitor/app.rs` turns a failed poll
+  into `None` and redraws the stale snapshot; `monitor/app.rs` also drops the
+  reply to its own `ensure_busybee_group`. Those are examples, not an audit —
   assume more exist. New code propagates.
 - **Pure state machines, IO at the edges.** `wait.rs` is the model: it takes a
   status snapshot and returns events, with no sockets or clocks inside, so it
@@ -141,10 +146,9 @@ gitignored). Deliberately non-hermetic; do not change it in unrelated work.
 - Do not introduce new external daemons or require system-level configuration.
   The broker described in the design document is the only planned daemon.
 - Do not commit `build/`.
-- Do not widen the `busybee` pueue group's semantics beyond the design. Today
-  that means one group at `parallel_tasks = 1`, re-enforced on every
-  invocation. The broker changes it — the design document has bzbd set
-  `parallel_tasks = 0` and admit tasks itself — so change this when
-  implementing that part of the spec, not before.
+- Do not widen the `busybee` pueue group's semantics beyond the design. That
+  means one group at `parallel_tasks = 0`, re-enforced on every invocation:
+  pueue's dispatcher is bypassed and bzbd decides what runs, submitting
+  admitted tasks with `start_immediately`.
 - Do not install over an existing `busybee`/`bzb`/`pueued` to test a change;
   use the cargo-built binaries under `build/`.

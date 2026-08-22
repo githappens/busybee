@@ -2,19 +2,20 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use bzb_core::{
-    client, enqueue as core_enqueue,
+    client,
+    enqueue::{self as core_enqueue, shell_escape_join},
     exit_code::task_result_to_exit_code,
     group,
+    kill::kill,
     log::fetch_log_chunk,
     wait::{WaitEvent, WaitState},
 };
-use pueue_lib::message::{KillRequest, Request, Response, Signal, TaskSelection};
+use pueue_lib::message::{Request, Response, Signal};
 use pueue_lib::state::State;
 use pueue_lib::task::TaskStatus;
 use pueue_lib::Client;
 use tokio::{io::AsyncWriteExt, time::sleep};
 
-use crate::detach::shell_escape_join;
 use crate::signals::{self, SignalEvent};
 
 pub async fn run(cmd: Vec<String>, name: Option<String>) -> Result<()> {
@@ -132,24 +133,18 @@ fn final_exit_code(state: &State, task_id: usize) -> i32 {
 }
 
 async fn soft_cancel(client: &mut Client, task_id: usize) {
-    let _ = client
-        .send_request(Request::Kill(KillRequest {
-            tasks: TaskSelection::TaskIds(vec![task_id]),
-            signal: Some(Signal::SigTerm),
-        }))
-        .await;
-    let _ = client.receive_response().await;
-    eprintln!("busybee: cancelling task {task_id}…");
+    match kill(client, task_id, Signal::SigTerm).await {
+        Ok(()) => eprintln!("busybee: cancelling task {task_id}…"),
+        // Saying "cancelling" over a signal that never landed would leave the
+        // user waiting for an exit that is not coming.
+        Err(err) => eprintln!("busybee: cannot cancel task {task_id}: {err}"),
+    }
 }
 
 async fn hard_kill(client: &mut Client, task_id: usize) {
-    let _ = client
-        .send_request(Request::Kill(KillRequest {
-            tasks: TaskSelection::TaskIds(vec![task_id]),
-            signal: Some(Signal::SigKill),
-        }))
-        .await;
-    let _ = client.receive_response().await;
+    if let Err(err) = kill(client, task_id, Signal::SigKill).await {
+        eprintln!("busybee: cannot kill task {task_id}: {err}");
+    }
 }
 #[cfg(test)]
 mod tests {

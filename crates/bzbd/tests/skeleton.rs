@@ -3,11 +3,13 @@
 //! Every test runs its own `bzbd` in a temp state directory; the user's
 //! instance is never touched.
 
+mod common;
+
 use std::{
     fs,
     os::{fd::AsRawFd, unix::fs::PermissionsExt},
-    path::{Path, PathBuf},
-    process::{Child, Command},
+    path::Path,
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -15,82 +17,9 @@ use bzb_core::{
     daemon::Connection,
     protocol::{Request, Response, MAX_LINE_BYTES},
 };
+use common::{sigterm, wait_for, Fixture, BZBD};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-
-const BZBD: &str = env!("CARGO_BIN_EXE_bzbd");
-
-/// A foreground `bzbd` with its own state directory, killed on drop.
-struct Fixture {
-    child: Child,
-    state: PathBuf,
-    /// Kept for its drop: it takes the state directory with it.
-    _tmp: TempDir,
-}
-
-impl Fixture {
-    fn start() -> Self {
-        let tmp = TempDir::new().expect("create tempdir");
-        // A directory bzbd has to create itself, so its mode is the daemon's
-        // doing rather than tempfile's.
-        let state = tmp.path().join("state");
-        let child = Command::new(BZBD)
-            .arg("--foreground")
-            .env("BUSYBEE_STATE_DIR", &state)
-            .spawn()
-            .expect("spawn bzbd");
-        let fixture = Self {
-            child,
-            state,
-            _tmp: tmp,
-        };
-        wait_for(&fixture.socket_path(), true);
-        fixture
-    }
-
-    fn state_dir(&self) -> &Path {
-        &self.state
-    }
-
-    fn socket_path(&self) -> PathBuf {
-        self.state.join("bzbd.sock")
-    }
-
-    fn pid_path(&self) -> PathBuf {
-        self.state.join("bzbd.pid")
-    }
-}
-
-impl Drop for Fixture {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// Waits up to 3 s for `path` to exist (or to be gone, when `present` is false).
-fn wait_for(path: &Path, present: bool) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if path.exists() == present {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    panic!(
-        "{} was still {} after 3s",
-        path.display(),
-        if present { "missing" } else { "present" }
-    );
-}
-
-fn sigterm(pid: u32) {
-    assert_eq!(
-        unsafe { libc::kill(pid as i32, libc::SIGTERM) },
-        0,
-        "kill failed"
-    );
-}
 
 #[tokio::test]
 async fn ping_reports_the_crate_version_and_the_daemon_pid() {
@@ -143,8 +72,10 @@ fn mode(path: &Path) -> u32 {
         & 0o777
 }
 
+/// An idle daemon still has a pool to report: every token is free and no lease
+/// holds one.
 #[tokio::test]
-async fn status_is_refused_while_there_is_no_pool_to_report() {
+async fn status_reports_an_untouched_pool_while_no_lease_exists() {
     let daemon = Fixture::start();
     let mut conn = Connection::connect(&daemon.socket_path())
         .await
@@ -153,11 +84,13 @@ async fn status_is_refused_while_there_is_no_pool_to_report() {
     conn.send(Request::Status).await.expect("send status");
 
     match conn.recv().await.expect("recv status reply") {
-        Response::Error { message } => assert!(
-            message.contains("not implemented"),
-            "expected a not-implemented error, got {message:?}"
-        ),
-        other => panic!("expected an Error, got {other:?}"),
+        Response::Status(status) => {
+            assert!(status.pool_size > 0, "pool was {}", status.pool_size);
+            assert_eq!(status.free, status.pool_size);
+            assert_eq!(status.held, 0);
+            assert!(status.leases.is_empty(), "leases were {:?}", status.leases);
+        }
+        other => panic!("expected a Status reply, got {other:?}"),
     }
 }
 

@@ -1,8 +1,11 @@
 //! `bzbd`, busybee's broker daemon.
 //!
-//! This is the skeleton: it owns the state directory, the unix socket and the
-//! single-instance lock, and it answers `Ping` and `Status`. Leases,
-//! admission and pueue submission arrive with the scheduler.
+//! It owns the state directory, the unix socket and the single-instance lock,
+//! and it is the only thing that submits tasks to pueued. A connection is a
+//! lease: `Submit` hands the request to the [`leases`] actor and streams that
+//! lease's events back until it finishes or the client hangs up.
+pub mod leases;
+pub mod submit;
 
 use std::{
     fs::{File, OpenOptions, Permissions},
@@ -22,7 +25,8 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use bzb_core::{
     daemon::{log_path, pid_path, socket_path, state_dir},
-    protocol::{read_line, Hello, Line, Request, Response, PROTOCOL_VERSION},
+    protocol::{read_line, Hello, LeaseEvent, Line, Request, Response, PROTOCOL_VERSION},
+    scheduler::Params,
 };
 use tokio::{
     io::{AsyncWriteExt, BufReader},
@@ -31,8 +35,11 @@ use tokio::{
         UnixListener, UnixStream,
     },
     signal::unix::{signal, SignalKind},
+    sync::mpsc::unbounded_channel,
 };
 use tracing::Level;
+
+use crate::leases::{Handle, Leases};
 
 pub fn run() -> Result<()> {
     let foreground = parse_args(std::env::args().skip(1))?;
@@ -158,6 +165,9 @@ async fn serve(socket: &Path, ready: &mut Ready) -> Result<()> {
     let mut terminate = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
     let mut interrupt = signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?;
 
+    let (actor, leases, commands) = Leases::new(params()?, bzb_core::daemon::leases_path()?);
+    tokio::spawn(actor.run(commands));
+
     // Nothing else can be listening: this process holds the pid-file lock.
     if socket.exists() {
         std::fs::remove_file(socket)
@@ -176,8 +186,9 @@ async fn serve(socket: &Path, ready: &mut Ready) -> Result<()> {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted.context("cannot accept a connection")?;
+                let leases = leases.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = handle(stream).await {
+                    if let Err(err) = handle(stream, leases).await {
                         tracing::warn!("connection failed: {err:#}");
                     }
                 });
@@ -194,7 +205,20 @@ async fn serve(socket: &Path, ready: &mut Ready) -> Result<()> {
     Ok(())
 }
 
-async fn handle(stream: UnixStream) -> Result<()> {
+/// Admission parameters until the config file lands: one token per logical
+/// core, and `docs/design/bzbd.md` §Admission policy's default of four
+/// concurrent leases.
+fn params() -> Result<Params> {
+    let pool_size = std::thread::available_parallelism()
+        .context("cannot count the machine's logical cores")?
+        .get();
+    Ok(Params {
+        pool_size: pool_size as u32,
+        max_concurrent: 4,
+    })
+}
+
+async fn handle(stream: UnixStream, leases: Handle) -> Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut incoming = BufReader::new(reader);
 
@@ -236,12 +260,15 @@ async fn handle(stream: UnixStream) -> Result<()> {
         };
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(Request::Ping) => pong(),
-            // The token pool arrives with the scheduler. An all-zero StatusReply
-            // would be indistinguishable from a real idle pool, so refuse
-            // instead of inventing one.
-            Ok(Request::Status | Request::Submit(_) | Request::Cancel { .. }) => {
-                Response::error("not implemented")
+            Ok(Request::Status) => Response::Status(leases.status().await?),
+            // The connection is the lease from here on: it streams that
+            // lease's events and answers nothing else.
+            Ok(Request::Submit(request)) => {
+                return stream_lease(&mut incoming, &mut writer, &leases, request).await
             }
+            // Cancelling someone else's lease arrives with the client work;
+            // one's own lease is cancelled by hanging up.
+            Ok(Request::Cancel { .. }) => Response::error("not implemented"),
             // Not echoing the request: escaping it and then JSON-encoding the
             // message quadruples it, so a line that fit within MAX_LINE_BYTES
             // would be answered with one that does not. The decoder still
@@ -251,6 +278,64 @@ async fn handle(stream: UnixStream) -> Result<()> {
             Err(err) => Response::error(format!("cannot decode the request: {err}")),
         };
         reply(&mut writer, response).await?;
+    }
+}
+
+/// Takes a lease and streams its events until it finishes or the client goes
+/// away. Connection = lease (`docs/design/bzbd.md` §Lease model): however this
+/// returns, the actor is told the connection is over, so a lease can never
+/// outlive the client that asked for it.
+async fn stream_lease(
+    incoming: &mut BufReader<OwnedReadHalf>,
+    writer: &mut OwnedWriteHalf,
+    leases: &Handle,
+    request: bzb_core::protocol::LeaseRequest,
+) -> Result<()> {
+    let (events, mut incoming_events) = unbounded_channel();
+    let lease = leases.submit(request, events).await?;
+    let streamed = stream_events(incoming, writer, &mut incoming_events).await;
+    leases.hangup(lease).await?;
+    streamed
+}
+
+async fn stream_events(
+    incoming: &mut BufReader<OwnedReadHalf>,
+    writer: &mut OwnedWriteHalf,
+    events: &mut tokio::sync::mpsc::UnboundedReceiver<LeaseEvent>,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            event = events.recv() => {
+                // The sender is dropped with the lease, which only happens
+                // after its last event.
+                let Some(event) = event else { return Ok(()) };
+                let finished = matches!(event, LeaseEvent::Finished { .. });
+                reply(writer, Response::Event(event)).await?;
+                if finished {
+                    return Ok(());
+                }
+            }
+            // A read cancelled by an event loses whatever it had buffered of
+            // a half-written line, which the next read then sees as a framing
+            // error and closes on. That only reaches a client sending
+            // requests it is already told this connection does not take.
+            line = next_line(incoming) => match line? {
+                // The client hung up: its lease goes with it.
+                Line::Closed => return Ok(()),
+                Line::Malformed(reason) => return reply(writer, Response::error(reason)).await,
+                // The framing still holds, so the connection can carry on
+                // streaming; the request itself has nowhere to go.
+                Line::Text(_) => {
+                    reply(
+                        writer,
+                        Response::error(
+                            "this connection is streaming a lease and takes no further requests",
+                        ),
+                    )
+                    .await?;
+                }
+            },
+        }
     }
 }
 

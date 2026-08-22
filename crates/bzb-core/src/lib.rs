@@ -14,6 +14,7 @@ pub mod errors;
 pub mod exit_code;
 pub mod group;
 pub mod jobserver;
+pub mod kill;
 pub mod log;
 pub mod protocol;
 pub mod scheduler;

@@ -22,7 +22,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+bzb-test-support = { path = "../bzb-test-support" }
 chrono = "0.4"
+serial_test = "3"
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 toml = "0.8"

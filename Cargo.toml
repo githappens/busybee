@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bzb", "crates/bzb-core", "crates/bzbd"]
+members = ["crates/bzb", "crates/bzb-core", "crates/bzb-test-support", "crates/bzbd"]
 
 [workspace.package]
 edition = "2021"
