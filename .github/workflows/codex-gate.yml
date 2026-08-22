@@ -155,6 +155,8 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}   # skip the Claude GitHub App / OIDC exchange
+          # Runs are triggered by Codex's own reviews/comments and by the schedule.
+          allowed_bots: "chatgpt-codex-connector,github-actions"
           claude_args: |
             --model claude-haiku-4-5
             --max-turns 6
