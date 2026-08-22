@@ -507,10 +507,12 @@ async fn a_restarted_daemon_finishes_the_teardown_it_was_killed_in() {
         record["class"] = Value::from("static");
         record["cores_held"] = Value::from(2);
     });
-    // The successor is the one that has to escalate, so it gets the ordinary
-    // grace back: the patient one above exists only so this test cannot lose
-    // the race to kill the first daemon inside it.
-    daemon.write_config(POOL);
+    // The successor has to escalate — that is what this half checks — but not
+    // so fast that the seeding assertion below races it: once it SIGKILLs the
+    // survivor those tokens come back, and the pool reads whole. Long enough
+    // to observe the seed, short enough that the rest of the test still sees
+    // the escalation.
+    daemon.write_config("pool_size = 4\nkill_grace_ms = 5000\n");
     daemon.restart();
 
     assert_eq!(
@@ -558,6 +560,7 @@ async fn a_restarted_daemon_resends_sigterm_for_a_teardown_it_booked_but_never_s
         marker.display()
     );
     let (conn, _, task) = run(&daemon, request(&["sh", "-c", &script])).await;
+    wait_for_task_to_run(&pueued.config_path, task, Duration::from_secs(5)).await;
 
     daemon.kill();
     // What `leases.json` says when the daemon dies between `book_teardown`
@@ -708,13 +711,7 @@ async fn a_client_killed_with_sigkill_takes_its_task_with_it() {
         .find_map(|line| line.strip_prefix("admitted ").map(|id| id.parse::<usize>()))
         .expect("the client was never admitted")
         .expect("a task id");
-    assert!(
-        matches!(
-            task_status(&pueued.config_path, task).await,
-            Some(TaskStatus::Running { .. })
-        ),
-        "the task was not running"
-    );
+    wait_for_task_to_run(&pueued.config_path, task, Duration::from_secs(5)).await;
 
     client.kill().expect("SIGKILL the client");
     client.wait().expect("reap the client");
@@ -762,7 +759,8 @@ async fn sigterm_leaves_the_running_task_its_record_and_the_fifo_alone() {
         return;
     };
     let mut daemon = pool_of_four(&pueued.config_path);
-    let (_conn, id, task) = run(&daemon, request(&["sh", "-c", "sleep 5"])).await;
+    let (_conn, id, task) = run(&daemon, request(&["sh", "-c", "sleep 300"])).await;
+    wait_for_task_to_run(&pueued.config_path, task, Duration::from_secs(5)).await;
     let fifo = daemon.fifo_path();
 
     sigterm(daemon.child.id());
