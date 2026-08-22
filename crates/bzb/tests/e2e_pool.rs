@@ -279,19 +279,8 @@ fn a_static_task_drains_the_pool_and_hands_it_back() {
     );
 
     // Everything is back: the drained cores were released and the build's
-    // tokens went back to the fifo. Waiting on the leases alone, so that the
-    // free count below is the command's answer and not the wait's condition.
-    busybee.wait_for("an idle pool", |status| status.leases.is_empty());
-    let status = busybee.run(&["status", "--json"]);
-    assert!(status.status.success(), "stderr: {}", stderr(&status));
-    let reply: serde_json::Value =
-        serde_json::from_str(stdout(&status).trim()).expect("status --json prints one JSON line");
-    assert_eq!(
-        reply["free"].as_u64(),
-        Some(u64::from(POOL)),
-        "status was {}",
-        stdout(&status)
-    );
+    // tokens went back to the fifo.
+    assert_pool_idle(&busybee);
 }
 
 /// An unrecognised command is `none`: exclusive, and admitted only once
@@ -436,6 +425,11 @@ fn interrupting_a_queued_client_leaves_the_running_build_alone() {
         "peak concurrency {peak} after the interruption, expected 5..={CEILING}: \
          the build kept the whole pool across it"
     );
+
+    // The peak is a lower bound on what the build could reach, so a single
+    // token lost with the interrupted lease can hide inside it. The count the
+    // daemon keeps cannot: every token is back in the fifo or it is not.
+    assert_pool_idle(&busybee);
 }
 
 /// The lines busybee is allowed to write about itself, quoted from
@@ -498,6 +492,23 @@ fn assert_preamble(out: &Output, running: &str) {
             .expect("a valid shape")
             .is_match(lines[lines.len() - 1]),
         "the last line is not the exit code; stderr was {text:?}"
+    );
+}
+
+/// Asserts the pool is whole again: no lease holds anything and all [`POOL`]
+/// tokens are back in the fifo. Waits on the leases alone, so that the free
+/// count is the command's answer and not the wait's condition.
+fn assert_pool_idle(busybee: &Busybee) {
+    busybee.wait_for("an idle pool", |status| status.leases.is_empty());
+    let status = busybee.run(&["status", "--json"]);
+    assert!(status.status.success(), "stderr: {}", stderr(&status));
+    let reply: serde_json::Value =
+        serde_json::from_str(stdout(&status).trim()).expect("status --json prints one JSON line");
+    assert_eq!(
+        reply["free"].as_u64(),
+        Some(u64::from(POOL)),
+        "status was {}",
+        stdout(&status)
     );
 }
 
