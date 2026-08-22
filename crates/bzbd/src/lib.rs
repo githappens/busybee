@@ -236,7 +236,9 @@ type SharedConfig = Arc<Mutex<Config>>;
 /// scheduler. A file that will not parse or validate leaves the daemon on the
 /// configuration it already had — no half-applied reload, and the scheduler is
 /// never told about a file that was refused — with the line to fix in the
-/// reason.
+/// reason. The scheduler taking the parameters is what finishes a reload: the
+/// stored [`Config`] and the log line follow it, so nothing the daemon reports
+/// describes a pool it is not running on yet.
 ///
 /// `drain_deadline_ms` is read per drain rather than pushed anywhere, so the
 /// stored [`Config`] is the whole of its application. The pool-size delta on
@@ -246,20 +248,28 @@ type SharedConfig = Arc<Mutex<Config>>;
 async fn reload(config: &SharedConfig, leases: &Handle) -> Result<(), String> {
     match Config::load() {
         Ok(reloaded) => {
+            // The scheduler goes first, and only what it took is stored and
+            // logged: on a signal the log is the whole reply, so a line saying
+            // the pool moved must not be readable before it has. A scheduler
+            // that cannot be reached is not a refused file either — the daemon
+            // is on its way down, and saying the config was rejected would name
+            // the wrong cause.
+            leases.set_params(reloaded.params()).await.map_err(|err| {
+                format!("config reloaded but the scheduler did not take it: {err:#}")
+            })?;
+            let (pool_size, max_concurrent, drain_deadline_ms) = (
+                reloaded.pool_size,
+                reloaded.max_concurrent,
+                reloaded.drain_deadline_ms,
+            );
+            *lock(config) = reloaded;
             tracing::info!(
-                pool_size = reloaded.pool_size,
-                max_concurrent = reloaded.max_concurrent,
-                drain_deadline_ms = reloaded.drain_deadline_ms,
+                pool_size,
+                max_concurrent,
+                drain_deadline_ms,
                 "config reloaded"
             );
-            let params = reloaded.params();
-            *lock(config) = reloaded;
-            // A scheduler that cannot be reached is not a refused file: the
-            // daemon is on its way down, and saying the config was rejected
-            // would name the wrong cause.
-            leases.set_params(params).await.map_err(|err| {
-                format!("config reloaded but the scheduler did not take it: {err:#}")
-            })
+            Ok(())
         }
         Err(err) => Err(format!(
             "config reload refused, keeping the running configuration \
@@ -766,5 +776,35 @@ mod tests {
             !tripped.load(Ordering::SeqCst),
             "a daemon that reported it is serving was killed anyway"
         );
+    }
+
+    /// A reload is finished by the scheduler, not by the parse: until the new
+    /// admission parameters are in, the daemon is still running on the old
+    /// ones, and anything it stores or logs saying otherwise is ahead of what
+    /// governs admission. `BUSYBEE_CONFIG` is process-wide, hence the serial.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_reload_the_scheduler_never_took_leaves_the_running_config_alone() {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "pool_size = 4\n").expect("write the config");
+        std::env::set_var("BUSYBEE_CONFIG", &path);
+        let running: SharedConfig = Arc::new(Mutex::new(Config::load().expect("load the config")));
+
+        // The actor is never spawned and its receiver is dropped, so every
+        // command the handle sends fails the way it would on a daemon that is
+        // already on its way down.
+        let params = lock(&running).params();
+        let (_actor, leases, commands) = Leases::new(params, tmp.path().join("leases.json"));
+        drop(commands);
+        std::fs::write(&path, "pool_size = 6\n").expect("rewrite the config");
+
+        let refusal = reload(&running, &leases)
+            .await
+            .expect_err("a scheduler that never took the parameters reported success");
+
+        std::env::remove_var("BUSYBEE_CONFIG");
+        assert!(refusal.contains("scheduler"), "message was {refusal:?}");
+        assert_eq!(lock(&running).pool_size, 4);
     }
 }
