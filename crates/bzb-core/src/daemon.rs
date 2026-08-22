@@ -2,7 +2,7 @@
 //! reach it, and how to auto-start it.
 
 use std::{
-    env,
+    env, io,
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
@@ -19,7 +19,9 @@ use tokio::{
 };
 
 use crate::errors::BusybeeError;
-use crate::protocol::{read_line, Hello, LeaseEvent, Line, Request, Response, PROTOCOL_VERSION};
+use crate::protocol::{
+    read_line, Hello, LeaseEvent, Line, Request, Response, MAX_LINE_BYTES, PROTOCOL_VERSION,
+};
 
 /// Directory holding `bzbd.sock`, `bzbd.pid` and `bzbd.log`.
 pub fn state_dir() -> Result<PathBuf, BusybeeError> {
@@ -123,6 +125,15 @@ impl Connection {
     async fn write_json(&mut self, value: &impl serde::Serialize) -> Result<(), BusybeeError> {
         let mut line = serde_json::to_string(value)
             .map_err(|e| BusybeeError::Protocol(format!("cannot encode a message: {e}")))?;
+        // The limit binds both directions. The daemon stops reading at it and
+        // closes, so writing past it would race our own `EPIPE` against its
+        // framing error and blame an unreachable daemon for our message.
+        if line.len() > MAX_LINE_BYTES {
+            return Err(BusybeeError::Protocol(format!(
+                "a message of {} bytes does not fit the {MAX_LINE_BYTES}-byte line limit",
+                line.len()
+            )));
+        }
         line.push('\n');
         // Not `?`: the shared `Network` variant reads "pueue-lib I/O error",
         // and this socket has nothing to do with pueued.
@@ -136,12 +147,20 @@ impl Connection {
     }
 
     async fn recv_opt(&mut self) -> Result<Option<Response>, BusybeeError> {
-        let read =
-            read_line(&mut self.incoming)
-                .await
-                .map_err(|e| BusybeeError::DaemonUnreachable {
+        let read = read_line(&mut self.incoming).await.map_err(|e| {
+            // Bytes that are not UTF-8 came from a daemon that answered: that
+            // is a broken protocol, not an absent daemon. Reporting it as
+            // unreachable would send `connect_or_spawn_bzbd` off to spawn a
+            // replacement, which exits as "already running", and the caller
+            // would hear about a startup timeout instead of the real reason.
+            if e.kind() == io::ErrorKind::InvalidData {
+                BusybeeError::Protocol(format!("bzbd sent a line that is not valid utf-8: {e}"))
+            } else {
+                BusybeeError::DaemonUnreachable {
                     context: format!("cannot read from bzbd: {e}"),
-                })?;
+                }
+            }
+        })?;
         let line = match read {
             Line::Text(line) => line,
             Line::Closed => return Ok(None),
@@ -298,8 +317,9 @@ async fn spawn_bzbd(program: &Path, deadline: Instant) -> Result<(), BusybeeErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{Hello, MAX_LINE_BYTES, PROTOCOL_VERSION};
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use crate::protocol::{Hello, LeaseRequest};
+    use std::collections::BTreeMap;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
     /// A stand-in daemon that answers the handshake with `handshake`, then
     /// writes `lines` verbatim and closes.
@@ -564,6 +584,72 @@ mod tests {
             error.unwrap_err().to_string().contains("bzbd"),
             "the rejection has to name the daemon that refused"
         );
+    }
+
+    /// The limit binds what we write as well as what we read. The daemon stops
+    /// reading at [`MAX_LINE_BYTES`] and closes the connection, so a client
+    /// that writes past it races its own `EPIPE` against the daemon's framing
+    /// error and reports an unreachable daemon instead of the oversized
+    /// message.
+    #[tokio::test]
+    async fn an_oversized_request_is_refused_before_it_reaches_the_socket() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let (reader, outgoing) = ours.into_split();
+        let mut conn = Connection {
+            incoming: BufReader::new(reader),
+            outgoing,
+        };
+
+        let error = conn
+            .send(Request::Submit(LeaseRequest {
+                argv: vec!["x".repeat(MAX_LINE_BYTES)],
+                cwd: PathBuf::from("/somewhere"),
+                env: BTreeMap::new(),
+                label: None,
+                class_override: None,
+                cores_wanted: None,
+            }))
+            .await;
+        let Err(BusybeeError::Protocol(message)) = error else {
+            panic!("expected an oversized request to be a protocol error, got {error:?}");
+        };
+        assert!(
+            message.contains(&MAX_LINE_BYTES.to_string()),
+            "message was {message:?}"
+        );
+
+        // Dropping our end closes the pair, so this read ends at whatever the
+        // refused send managed to put on the wire: nothing.
+        drop(conn);
+        let mut written = Vec::new();
+        BufReader::new(theirs)
+            .read_to_end(&mut written)
+            .await
+            .unwrap();
+        assert!(written.is_empty(), "the refused request was still written");
+    }
+
+    /// A daemon that answers with bytes that are not UTF-8 is reachable and
+    /// breaking the protocol. Calling that unreachable would send
+    /// `connect_or_spawn_bzbd` off to spawn a replacement, which exits as
+    /// "already running", and the real reason would never be reported.
+    #[tokio::test]
+    async fn an_invalid_utf8_reply_is_a_protocol_error_not_an_unreachable_daemon() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let socket = dir.path().join("garbled.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (_reader, mut writer) = stream.into_split();
+            writer.write_all(b"\xff\xfe not utf-8\n").await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let refusal = Connection::connect(&socket).await.err();
+        let Some(BusybeeError::Protocol(message)) = refusal else {
+            panic!("expected a garbled handshake reply to be a protocol error, got {refusal:?}");
+        };
+        assert!(message.contains("utf-8"), "message was {message:?}");
     }
 
     /// A daemon that accepts connections but never answers must not hang the
