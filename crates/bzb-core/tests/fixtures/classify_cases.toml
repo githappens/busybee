@@ -1,0 +1,372 @@
+# Synthetic classification cases for `bzb_core::classify`.
+#
+# Every row is hand-written and generic: no real project names, no machine
+# paths. Fields:
+#
+#   argv                  command line as busybee received it
+#   override_class        value of `--class` (optional)
+#   override_cores        value of `--cores` (optional)
+#   class                 expected Plan.class
+#   tool                  expected Plan.tool
+#   cores_wanted          expected Plan.cores_wanted (optional)
+#   env_set_contains      "NAME=value" entries that must be in env_set
+#   env_set_absent        names that must NOT be in env_set
+#   env_unset_contains    names that must be in env_unset
+#   env_unset_absent      names that must NOT be in env_unset
+#   env_append_contains   "NAME=suffix" entries that must be in env_append
+#   env_append_absent     names that must NOT be in env_append
+#   expect_argv           full expected Plan.argv (optional)
+#   notices_contain       substrings that must appear in some notice
+#   no_notices            true if the plan must carry no notices at all
+
+# --- jobserver tools --------------------------------------------------------
+
+[[case]]
+name = "cmake --build joins the pool"
+argv = ["cmake", "--build", "build", "--target", "all"]
+class = "jobserver"
+tool = "cmake"
+env_set_contains = [
+    "MAKEFLAGS=--jobserver-auth=fifo:{fifo}",
+    "BUSYBEE_CLASS=jobserver",
+    "BUSYBEE_CORES={cores}",
+]
+env_unset_contains = ["CMAKE_BUILD_PARALLEL_LEVEL"]
+no_notices = true
+
+[[case]]
+name = "cmake configure is not a build"
+argv = ["cmake", "-B", "build", "-S", "."]
+class = "none"
+tool = "cmake"
+env_set_absent = ["MAKEFLAGS"]
+no_notices = true
+
+[[case]]
+name = "plain make"
+argv = ["make", "-C", "out"]
+class = "jobserver"
+tool = "make"
+env_set_contains = ["MAKEFLAGS=--jobserver-auth=fifo:{fifo}"]
+no_notices = true
+
+[[case]]
+name = "gmake is make"
+argv = ["gmake", "all"]
+class = "jobserver"
+tool = "gmake"
+env_set_contains = ["MAKEFLAGS=--jobserver-auth=fifo:{fifo}"]
+
+[[case]]
+name = "cargo gets both makeflags plus test threads"
+argv = ["cargo", "test", "--workspace"]
+class = "jobserver"
+tool = "cargo"
+env_set_contains = [
+    "MAKEFLAGS=--jobserver-auth=fifo:{fifo}",
+    "CARGO_MAKEFLAGS=--jobserver-auth=fifo:{fifo}",
+    "RUST_TEST_THREADS={cores}",
+]
+no_notices = true
+
+[[case]]
+name = "cargo with an explicit -j still joins but is flagged"
+argv = ["cargo", "build", "-j", "4"]
+class = "jobserver"
+tool = "cargo"
+env_set_contains = ["MAKEFLAGS=--jobserver-auth=fifo:{fifo}"]
+notices_contain = ["-j"]
+
+[[case]]
+name = "ninja ignores the pool when -j is explicit"
+argv = ["ninja", "-j8", "-C", "out"]
+class = "jobserver"
+tool = "ninja"
+env_set_contains = ["MAKEFLAGS=--jobserver-auth=fifo:{fifo}"]
+notices_contain = ["ninja ignores the pool when -j is explicit"]
+
+# --- wrappers ---------------------------------------------------------------
+
+[[case]]
+name = "nix develop -c unwraps to the inner tool"
+argv = ["nix", "develop", "-c", "cmake", "--build", "build"]
+class = "jobserver"
+tool = "cmake"
+env_set_contains = ["MAKEFLAGS=--jobserver-auth=fifo:{fifo}"]
+expect_argv = ["nix", "develop", "-c", "cmake", "--build", "build"]
+no_notices = true
+
+[[case]]
+name = "nix develop with flags before --command"
+argv = ["nix", "develop", "--impure", ".#dev", "--command", "cargo", "build"]
+class = "jobserver"
+tool = "cargo"
+env_set_contains = ["CARGO_MAKEFLAGS=--jobserver-auth=fifo:{fifo}"]
+
+[[case]]
+name = "nix shell with a flake ref and an explicit --parallel"
+argv = ["nix", "shell", "nixpkgs#cmake", "-c", "cmake", "--build", "build", "--parallel", "4"]
+class = "jobserver"
+tool = "cmake"
+env_unset_contains = ["CMAKE_BUILD_PARALLEL_LEVEL"]
+notices_contain = ["--parallel"]
+
+[[case]]
+name = "nix develop without -c is not a wrapper"
+argv = ["nix", "develop"]
+class = "none"
+tool = "nix"
+
+[[case]]
+name = "env assignments are skipped"
+argv = ["env", "FOO=1", "BAR=2", "ninja", "-C", "out"]
+class = "jobserver"
+tool = "ninja"
+env_set_contains = ["MAKEFLAGS=--jobserver-auth=fifo:{fifo}"]
+no_notices = true
+
+[[case]]
+name = "env assignment shadows an injected variable"
+argv = ["env", "MAKEFLAGS=-j100", "make", "all"]
+class = "jobserver"
+tool = "make"
+env_set_absent = ["MAKEFLAGS"]
+notices_contain = ["MAKEFLAGS"]
+
+[[case]]
+name = "env assignment shadows an unset, leaving the rest of the recipe"
+argv = ["env", "CMAKE_BUILD_PARALLEL_LEVEL=64", "cmake", "--build", "build"]
+class = "jobserver"
+tool = "cmake"
+env_set_contains = ["MAKEFLAGS=--jobserver-auth=fifo:{fifo}"]
+env_unset_absent = ["CMAKE_BUILD_PARALLEL_LEVEL"]
+notices_contain = ["CMAKE_BUILD_PARALLEL_LEVEL"]
+
+[[case]]
+name = "env assignment shadows an appended variable"
+argv = ["env", "PYTEST_ADDOPTS=-x", "pytest", "tests/"]
+class = "static"
+tool = "pytest"
+env_append_absent = ["PYTEST_ADDOPTS"]
+notices_contain = ["PYTEST_ADDOPTS"]
+
+[[case]]
+name = "env with flags is opaque"
+argv = ["env", "-i", "ninja", "-C", "out"]
+class = "none"
+tool = "env"
+env_set_absent = ["MAKEFLAGS"]
+
+[[case]]
+name = "caffeinate flags are skipped"
+argv = ["caffeinate", "-i", "make", "-j8"]
+class = "jobserver"
+tool = "make"
+notices_contain = ["-j8"]
+
+[[case]]
+name = "caffeinate -t takes an argument"
+argv = ["caffeinate", "-t", "3600", "ctest"]
+class = "static"
+tool = "ctest"
+env_set_contains = ["CTEST_PARALLEL_LEVEL={cores}"]
+
+[[case]]
+name = "nice -n takes an argument"
+argv = ["nice", "-n", "10", "make", "all"]
+class = "jobserver"
+tool = "make"
+no_notices = true
+
+[[case]]
+name = "stacked wrappers"
+argv = ["caffeinate", "-i", "nice", "-n", "5", "env", "FOO=1", "cargo", "build"]
+class = "jobserver"
+tool = "cargo"
+env_set_contains = ["RUST_TEST_THREADS={cores}"]
+
+# --- opaque shell strings ---------------------------------------------------
+
+[[case]]
+name = "sh -c is opaque"
+argv = ["sh", "-c", "ninja && ./tests"]
+class = "none"
+tool = "<shell>"
+env_set_absent = ["MAKEFLAGS"]
+
+[[case]]
+name = "bash -lc is opaque"
+argv = ["bash", "-lc", "make all && ctest"]
+class = "none"
+tool = "<shell>"
+
+[[case]]
+name = "env assignments in front of a shell string"
+argv = ["env", "FOO=1", "zsh", "-c", "cargo build"]
+class = "none"
+tool = "<shell>"
+
+# --- static tools -----------------------------------------------------------
+
+[[case]]
+name = "xcodebuild gets -jobs appended"
+argv = ["xcodebuild", "-project", "Example.xcodeproj", "-scheme", "Example", "build"]
+class = "static"
+tool = "xcodebuild"
+expect_argv = [
+    "xcodebuild",
+    "-project",
+    "Example.xcodeproj",
+    "-scheme",
+    "Example",
+    "build",
+    "-jobs",
+    "{cores-1}",
+]
+no_notices = true
+
+[[case]]
+name = "xcodebuild with -jobs is left alone"
+argv = ["xcodebuild", "-scheme", "Example", "build", "-jobs", "4"]
+class = "static"
+tool = "xcodebuild"
+expect_argv = ["xcodebuild", "-scheme", "Example", "build", "-jobs", "4"]
+notices_contain = ["-jobs"]
+
+[[case]]
+name = "go gets GOMAXPROCS"
+argv = ["go", "test", "./..."]
+class = "static"
+tool = "go"
+env_set_contains = ["GOMAXPROCS={cores}", "BUSYBEE_CLASS=static"]
+no_notices = true
+
+[[case]]
+name = "go -p is flagged but -pkgdir is not"
+argv = ["go", "build", "-p", "4", "./..."]
+class = "static"
+tool = "go"
+notices_contain = ["-p"]
+
+[[case]]
+name = "go -pkgdir is not a parallelism flag"
+argv = ["go", "build", "-pkgdir", "out", "./..."]
+class = "static"
+tool = "go"
+no_notices = true
+
+[[case]]
+name = "ctest gets CTEST_PARALLEL_LEVEL"
+argv = ["ctest", "--output-on-failure"]
+class = "static"
+tool = "ctest"
+env_set_contains = ["CTEST_PARALLEL_LEVEL={cores}"]
+no_notices = true
+
+[[case]]
+name = "ctest -j4 is flagged"
+argv = ["ctest", "-j4"]
+class = "static"
+tool = "ctest"
+notices_contain = ["-j4"]
+
+[[case]]
+name = "pytest appends to PYTEST_ADDOPTS"
+argv = ["pytest", "tests/"]
+class = "static"
+tool = "pytest"
+env_append_contains = ["PYTEST_ADDOPTS=-n {cores}"]
+no_notices = true
+
+[[case]]
+name = "pytest -n is flagged"
+argv = ["pytest", "-n", "4", "tests/"]
+class = "static"
+tool = "pytest"
+notices_contain = ["-n"]
+
+# --- unknown / none ---------------------------------------------------------
+
+[[case]]
+name = "docker build is exclusive"
+argv = ["docker", "build", "."]
+class = "none"
+tool = "docker"
+env_set_contains = ["BUSYBEE_CLASS=none", "BUSYBEE_CORES={cores}"]
+
+[[case]]
+name = "relative script"
+argv = ["./scripts/build.sh"]
+class = "none"
+tool = "build.sh"
+
+[[case]]
+name = "absolute path binary"
+argv = ["/abs/path/to/bench", "--flags"]
+class = "none"
+tool = "bench"
+
+[[case]]
+name = "interpreter invocation"
+argv = ["python3", "run.py"]
+class = "none"
+tool = "python3"
+
+[[case]]
+name = "empty argv"
+argv = []
+class = "none"
+tool = "<unknown>"
+env_set_contains = ["BUSYBEE_CLASS=none"]
+
+# --- overrides --------------------------------------------------------------
+
+[[case]]
+name = "--class jobserver on an opaque script hands it the fifo"
+argv = ["./build.sh"]
+override_class = "jobserver"
+class = "jobserver"
+tool = "build.sh"
+env_set_contains = ["MAKEFLAGS=--jobserver-auth=fifo:{fifo}", "BUSYBEE_CLASS=jobserver"]
+
+[[case]]
+name = "--class none on make drops the jobserver injection"
+argv = ["make", "all"]
+override_class = "none"
+class = "none"
+tool = "make"
+env_set_absent = ["MAKEFLAGS"]
+
+[[case]]
+name = "--class none on go keeps the compatible static injection"
+argv = ["go", "test", "./..."]
+override_class = "none"
+class = "none"
+tool = "go"
+env_set_contains = ["GOMAXPROCS={cores}", "BUSYBEE_CLASS=none"]
+
+[[case]]
+name = "--cores on a static tool is recorded"
+argv = ["go", "test", "./..."]
+override_cores = 4
+class = "static"
+tool = "go"
+cores_wanted = 4
+no_notices = true
+
+[[case]]
+name = "--cores on a jobserver tool is ignored with a notice"
+argv = ["cargo", "build"]
+override_cores = 4
+class = "jobserver"
+tool = "cargo"
+notices_contain = ["--cores"]
+
+[[case]]
+name = "--class static on cmake --build drops the fifo"
+argv = ["cmake", "--build", "build"]
+override_class = "static"
+class = "static"
+tool = "cmake"
+env_set_absent = ["MAKEFLAGS"]
+env_set_contains = ["BUSYBEE_CLASS=static"]
