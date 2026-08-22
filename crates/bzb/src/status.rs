@@ -8,7 +8,6 @@
 use anyhow::{bail, Result};
 use bzb_core::{
     daemon::{socket_path, Connection},
-    errors::BusybeeError,
     protocol::{LeaseView, Request, Response, StatusReply},
 };
 
@@ -16,22 +15,20 @@ use bzb_core::{
 ///
 /// Deliberately does not auto-start bzbd the way a lease request does: asking
 /// what the pool is doing should not create the pool, and a daemon that failed
-/// to *start* is a failure to report, not an idle machine. So an unreachable
-/// socket is reported as what it is, and everything else propagates.
+/// to *start* is a failure to report, not an idle machine. So a socket nothing
+/// is listening on is reported as what it is, and everything else propagates.
 pub async fn run(json: bool) -> Result<()> {
     let socket = socket_path()?;
-    let mut conn = match Connection::connect(&socket).await {
-        Ok(conn) => conn,
-        // Not a degraded path to report around: no daemon means no pool, no
-        // leases and nothing being gated, which is what this says. It goes to
-        // stderr like every other busybee message, so a `--json` consumer sees
-        // an empty stdout rather than an invented reply — an all-zero
-        // `StatusReply` is indistinguishable from a real idle pool.
-        Err(BusybeeError::DaemonUnreachable { .. }) => {
-            eprintln!("busybee: daemon not running; pool idle");
-            return Ok(());
-        }
-        Err(other) => return Err(other.into()),
+    // Nothing listening is not a degraded path to report around: no daemon
+    // means no pool, no leases and nothing being gated, which is what this
+    // says. It goes to stderr like every other busybee message, so a `--json`
+    // consumer sees an empty stdout rather than an invented reply — an all-zero
+    // `StatusReply` is indistinguishable from a real idle pool. A daemon that
+    // answered and then failed the handshake is running, so that propagates
+    // rather than being reported as an idle machine.
+    let Some(mut conn) = Connection::connect_if_listening(&socket).await? else {
+        eprintln!("busybee: daemon not running; pool idle");
+        return Ok(());
     };
 
     conn.send(Request::Status).await?;

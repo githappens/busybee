@@ -3,6 +3,7 @@
 
 use std::{
     env,
+    io::ErrorKind,
     path::{Path, PathBuf},
     process::Stdio,
     time::{Duration, Instant},
@@ -76,6 +77,18 @@ pub fn leases_path() -> Result<PathBuf, BusybeeError> {
     Ok(state_dir()?.join("leases.json"))
 }
 
+async fn open(socket: &Path) -> Result<UnixStream, BusybeeError> {
+    UnixStream::connect(socket)
+        .await
+        .map_err(|e| unreachable_at(socket, e))
+}
+
+fn unreachable_at(socket: &Path, error: std::io::Error) -> BusybeeError {
+    BusybeeError::DaemonUnreachable {
+        context: format!("cannot connect to bzbd at {}: {error}", socket.display()),
+    }
+}
+
 /// An open, handshaken connection to `bzbd`.
 pub struct Connection {
     incoming: BufReader<OwnedReadHalf>,
@@ -85,12 +98,26 @@ pub struct Connection {
 impl Connection {
     /// Connects to an already-running daemon and completes the handshake.
     pub async fn connect(socket: &Path) -> Result<Self, BusybeeError> {
-        let stream =
-            UnixStream::connect(socket)
-                .await
-                .map_err(|e| BusybeeError::DaemonUnreachable {
-                    context: format!("cannot connect to bzbd at {}: {e}", socket.display()),
-                })?;
+        Self::handshake(open(socket).await?).await
+    }
+
+    /// Connects only to a daemon that is already listening. `Ok(None)` means
+    /// nothing is: the socket is absent, or stale from a daemon that died. That
+    /// is the one failure a caller may read as "there is no daemon". Anything
+    /// after the connection was accepted — a dropped connection, a refused
+    /// protocol version, a handshake that never arrives — is a daemon that *is*
+    /// running and not answering, so it propagates.
+    pub async fn connect_if_listening(socket: &Path) -> Result<Option<Self>, BusybeeError> {
+        match UnixStream::connect(socket).await {
+            Ok(stream) => Self::handshake(stream).await.map(Some),
+            Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused) => {
+                Ok(None)
+            }
+            Err(e) => Err(unreachable_at(socket, e)),
+        }
+    }
+
+    async fn handshake(stream: UnixStream) -> Result<Self, BusybeeError> {
         let (reader, outgoing) = stream.into_split();
         let mut conn = Self {
             incoming: BufReader::new(reader),
@@ -494,6 +521,37 @@ mod tests {
             panic!("expected a truncated stream to be an error");
         };
         assert!(context.contains("finish"), "{context}");
+    }
+
+    /// Only a socket nothing is listening on means "no daemon". A daemon that
+    /// accepted the connection and then failed is running and broken, and a
+    /// caller that reads every failure as absence — `busybee status` reporting
+    /// an idle pool — would hide it.
+    #[tokio::test]
+    async fn connect_if_listening_separates_an_absent_daemon_from_a_broken_one() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let missing = dir.path().join("missing.sock");
+        assert!(Connection::connect_if_listening(&missing)
+            .await
+            .unwrap()
+            .is_none());
+
+        // The socket a killed daemon leaves behind refuses connections the same
+        // way, which `crates/bzb/tests/status.rs` covers against a real one:
+        // closing a listener in this process leaves the socket accepting until
+        // the kernel frees it, so it cannot be staged here.
+        let broken = dir.path().join("broken.sock");
+        let listener = tokio::net::UnixListener::bind(&broken).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+        let refusal = Connection::connect_if_listening(&broken).await;
+        let Err(err) = refusal else {
+            panic!("a daemon that hung up mid-handshake was reported as absent");
+        };
+        assert!(err.to_string().contains("bzbd"), "{err}");
     }
 
     /// A daemon that answered and refused our version is reachable: reporting

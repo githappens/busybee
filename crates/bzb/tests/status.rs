@@ -1,17 +1,18 @@
-//! `busybee status` end to end, against a stand-in bzbd in a temp state
-//! directory. The user's daemon is never touched: every test binds its own
-//! socket and points the client at it with `BUSYBEE_STATE_DIR`.
+//! `busybee status` end to end, in a temp state directory. The user's daemon is
+//! never touched: every test binds its own socket, or runs its own `bzbd`, and
+//! points the client at it with `BUSYBEE_STATE_DIR`.
 //!
-//! The stand-in exists because the real daemon does not serve `Status` yet —
-//! `crates/bzbd/tests/skeleton.rs` pins it to "not implemented" until the
-//! scheduler is wired in. What is under test here is the client half: the
-//! request, the table, the JSON and the no-daemon case.
+//! One test runs the real daemon, which is what proves the command works
+//! against what it talks to in production. The rest use a stand-in, because a
+//! daemon with no scheduler admits nothing and so cannot produce the leases the
+//! table is made of.
 
 use std::{
     io::BufRead,
     os::fd::FromRawFd,
     path::Path,
-    process::{Output, Stdio},
+    process::{Child, Command, Output, Stdio},
+    time::{Duration, Instant},
 };
 
 use bzb_core::protocol::{LeaseView, Request, Response, StatusReply, PROTOCOL_VERSION};
@@ -65,6 +66,64 @@ fn reply() -> StatusReply {
                 pueue_task_id: None,
             },
         ],
+    }
+}
+
+/// The real `bzbd`, in a temp state directory, killed on drop.
+struct RealBzbd {
+    child: Child,
+    state: TempDir,
+}
+
+impl RealBzbd {
+    fn start() -> Self {
+        // Cargo exports the path of `busybee` only, so the daemon is found next
+        // to it — the same place `bzb-core` looks for it when auto-starting.
+        let bzbd = Path::new(BUSYBEE)
+            .parent()
+            .expect("busybee lives in a directory")
+            .join("bzbd");
+        assert!(
+            bzbd.is_file(),
+            "{} is not built; run the tests with `cargo test --workspace`",
+            bzbd.display()
+        );
+        let state = TempDir::new().expect("create tempdir");
+        let child = Command::new(&bzbd)
+            .arg("--foreground")
+            .env("BUSYBEE_STATE_DIR", state.path())
+            .spawn()
+            .expect("spawn bzbd");
+        let daemon = Self { child, state };
+        let socket = daemon.state.path().join("bzbd.sock");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !socket.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "bzbd did not bind {} within 3s",
+                socket.display()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        daemon
+    }
+
+    fn state_dir(&self) -> &Path {
+        self.state.path()
+    }
+
+    /// SIGKILL and reap, so the daemon is gone before the caller looks at what
+    /// it left in the state directory.
+    fn kill(&mut self) {
+        self.child.kill().expect("kill bzbd");
+        self.child.wait().expect("reap bzbd");
+    }
+}
+
+impl Drop for RealBzbd {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -175,6 +234,85 @@ async fn the_json_output_is_the_status_reply_the_daemon_sent() {
     );
     let object: serde_json::Value = serde_json::from_str(&stdout).expect("decode");
     assert_eq!(object["approx_in_use"], 3);
+}
+
+/// The stand-in above covers the rendering; this covers the wiring, against the
+/// daemon the command actually talks to. A daemon with no scheduler admits
+/// nothing, so it holds no leases and the pool it reports is whole and free.
+#[tokio::test]
+async fn the_real_daemon_answers_the_status_request() {
+    let daemon = RealBzbd::start();
+    let cores = std::thread::available_parallelism()
+        .expect("logical cores")
+        .get();
+
+    let json = stdout_of(&run_status(daemon.state_dir(), &["--json"]).await);
+    let reply: StatusReply = serde_json::from_str(&json).expect("decode a StatusReply");
+    assert_eq!(
+        (reply.pool_size as usize, reply.free as usize, reply.held),
+        (cores, cores, 0)
+    );
+    assert!(reply.leases.is_empty(), "leases were {:?}", reply.leases);
+
+    let table = stdout_of(&run_status(daemon.state_dir(), &[]).await);
+    assert_eq!(
+        table.lines().collect::<Vec<_>>(),
+        vec![format!(
+            "pool: {cores} tokens, {cores} free, 0 held by static leases   \
+             (approx. 0 in use by jobserver tasks)"
+        )]
+    );
+}
+
+/// A daemon killed outright cannot unlink its socket, so the file outlives it.
+/// Nothing is listening on it, which is the idle pool the message describes —
+/// the presence of the file is not what decides that.
+#[tokio::test]
+async fn a_killed_daemon_leaves_a_socket_that_still_reports_an_idle_pool() {
+    let mut daemon = RealBzbd::start();
+    let socket = daemon.state_dir().join("bzbd.sock");
+    daemon.kill();
+    assert!(socket.exists(), "the killed daemon unlinked its socket");
+
+    let output = run_status(daemon.state_dir(), &[]).await;
+
+    assert!(
+        output.status.success(),
+        "busybee status exited {}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("busybee: daemon not running; pool idle"),
+        "stderr was {stderr:?}"
+    );
+}
+
+/// A daemon that is listening and failing is not an idle machine. Reporting it
+/// as one would tell the caller the pool is free while bzbd is gating every
+/// command on it.
+#[tokio::test]
+async fn a_daemon_that_hangs_up_mid_handshake_is_reported_as_a_failure() {
+    let state = TempDir::new().expect("create tempdir");
+    let listener = UnixListener::bind(state.path().join("bzbd.sock")).expect("bind");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        drop(stream);
+    });
+
+    let output = run_status(state.path(), &[]).await;
+
+    assert!(
+        !output.status.success(),
+        "busybee status exited {}",
+        output.status
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("pool idle"),
+        "a listening daemon was reported as an idle pool: {stderr:?}"
+    );
+    assert!(stderr.contains("bzbd"), "stderr was {stderr:?}");
 }
 
 /// No daemon means no pool and nothing being gated, which is a true report and
