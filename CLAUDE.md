@@ -134,7 +134,10 @@ is deliberately non-hermetic. Do not change it as part of unrelated work.
 - Do not introduce new external daemons or require system-level configuration.
   The broker described in the design document is the only planned daemon.
 - Do not commit `build/`.
-- Do not widen the `busybee` pueue group's semantics beyond the design: one
-  group, `parallel_tasks = 1`, re-enforced on every invocation.
+- Do not widen the `busybee` pueue group's semantics beyond the design. Today
+  that means one group at `parallel_tasks = 1`, re-enforced on every
+  invocation. The broker changes it — the design document has bzbd set
+  `parallel_tasks = 0` and admit tasks itself — so change this when
+  implementing that part of the spec, not before.
 - Do not install over an existing `busybee`/`bzb`/`pueued` to test a change;
   use the cargo-built binaries under `build/`.
