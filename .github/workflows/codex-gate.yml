@@ -1,5 +1,17 @@
 # Merge gate: turn Codex's automated review into a review decision.
 #
+# Trigger provenance, verified against GitHub's Actions event documentation on
+# 2026-08-23: pull_request, pull_request_review and
+# pull_request_review_comment use refs/pull/<n>/merge, so a same-repository PR's
+# copy of this workflow can run for those events. They are deliberately not
+# subscribed below. pull_request_target, schedule and issue_comment run the
+# default-branch copy. workflow_dispatch runs the explicitly selected ref (the
+# repository launcher selects the default branch). A repository ruleset can
+# require an approval or status check, but cannot pin that check to the base
+# copy; organization-level required workflows are not available to this
+# user-owned repository. The select job therefore refuses every PR that changes
+# the gate or its sortie caller from a base-controlled run.
+#
 # Codex (chatgpt-codex-connector[bot]) reviews every push but never approves or
 # requests changes. With findings it posts a review pinned to the head commit;
 # with nothing to flag it reacts 👍 on the PR (automatic review) or posts a
@@ -31,12 +43,10 @@ name: codex-gate
 on:
   schedule:
     - cron: "*/5 * * * *"
-  pull_request:
+  # Base-controlled wake-up when a same-repository PR gets a new head. Codex
+  # review activity without an issue comment is picked up by the schedule.
+  pull_request_target:
     types: [synchronize]
-  pull_request_review:
-    types: [submitted]
-  pull_request_review_comment:
-    types: [created]
   issue_comment:
     types: [created]
   workflow_dispatch:
@@ -98,6 +108,23 @@ jobs:
           fi
           picked=()
           for PR in $prs; do
+            # A harness PR is never eligible for an automated verdict. Check both
+            # names so renaming a protected file is covered as well as editing,
+            # adding or deleting one.
+            protected=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '
+              .[]
+              | select(
+                  (.filename | startswith(".github/workflows/") or startswith("sortie/"))
+                  or ((.previous_filename // "") | startswith(".github/workflows/") or startswith("sortie/"))
+                )
+              | .filename')
+            if [ -n "$protected" ]; then
+              echo "PR #$PR: harness change requires human review; refusing automated judgement"
+              printf '%s\n' "$protected" | sed 's/^/  - /'
+              gh api -X POST "repos/$REPO/issues/$PR/labels" \
+                --input - <<<'{"labels":["needs-human"]}' >/dev/null
+              continue
+            fi
             status=$(sortie/review-status.sh "$PR")
             case "$status" in
               approvable) desired=APPROVED ;;
@@ -184,7 +211,8 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}   # skip the Claude GitHub App / OIDC exchange
-          # Runs are triggered by Codex's own reviews/comments and by the schedule.
+          # Runs are triggered by base-controlled PR updates, issue comments and
+          # the schedule; issue comments may be posted by Codex itself.
           allowed_bots: "chatgpt-codex-connector,github-actions"
           claude_args: |
             --model claude-haiku-4-5
