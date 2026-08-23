@@ -43,6 +43,12 @@ hooks:
     else
       git checkout -q -B "$b" origin/main
     fi
+    # Install the machine-safety hook into the otherwise disposable workspace.
+    # Keep the runtime copies out of `git add -A`; their sources live in sortie/.
+    grep -qxF '/.claude/' .git/info/exclude || printf '/.claude/\n' >> .git/info/exclude
+    mkdir -p .claude/hooks
+    install -m 0755 sortie/machine-safety-hook.sh .claude/hooks/machine-safety-hook.sh
+    install -m 0644 sortie/claude-settings.json .claude/settings.json
     # Per-issue model override: a `model:<name>` label (e.g. model:fable)
     # becomes .sortie/model, read by sortie/agent.sh. No label = default model.
     mkdir -p .sortie
@@ -178,12 +184,12 @@ Blocked-by issues (all must already be merged on `main`): {{ range $i, $b := .is
    loud. Do not add `unwrap_or_default`-style masking to make something pass.
 6. **Build and test through the dev shell and busybee:**
    `busybee -- cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
-   `cargo fmt --all`. Cargo output goes to `build/`; do not change `.cargo/config.toml`.
-   Never install or replace the machine's global `busybee`/`bzbd`/`pueued`; test via
-   cargo-built binaries only.
-7. **Isolation.** Integration tests must spawn their own `pueued`/`bzbd` in a
-   temporary state dir (see `crates/bzb/tests/common/pueued.rs`), never the user's
-   instance.
+   `cargo fmt --all`. Cargo output goes to `build/`; the workspace hook blocks
+   changes to `.cargo/config.toml` and global `busybee`/`bzbd`/`pueued` installs.
+   Test via cargo-built binaries only.
+7. **Isolation.** The workspace hook requires local state paths for direct daemon
+   launches; integration tests still use their temporary `pueued`/`bzbd` fixtures
+   (see `crates/bzb/tests/common/pueued.rs`), never the user's instance.
 8. **Public repo hygiene.** Everything you write — code, comments, tests,
    fixtures, commit messages, PR text — is public. Use generic examples only: no
    machine names, user names, local paths, or references to other projects.
