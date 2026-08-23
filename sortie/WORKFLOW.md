@@ -169,7 +169,9 @@ Blocked-by issues (all must already be merged on `main`): {{ range $i, $b := .is
 2. **Scope.** Implement exactly the issue's Scope and Acceptance criteria. No
    adjacent refactors, no speculative features. If something outside scope
    blocks you, write `blocked` to `.sortie/status` with one line explaining why,
-   and stop.
+   and stop. If the acceptance criteria cannot be made to pass and every
+   remaining move is low-confidence, write `blocked` with one line of reasoning
+   and stop; that is a successful escalation, not a failed attempt.
 3. **Use these skills when they are available (check the skill list):**
    - `ponytail:ponytail` before writing any code — simplest solution that
      works: standard library before dependencies, one function before an
@@ -201,6 +203,13 @@ Blocked-by issues (all must already be merged on `main`): {{ range $i, $b := .is
    fixtures, commit messages, PR text — is public. Use generic examples only: no
    machine names, user names, local paths, or references to other projects.
    No AI co-author trailers in commits.
+
+## Prohibitions
+
+- Do not edit issue labels or state.
+- Do not change files under `sortie/` or `.github/workflows/`.
+- Do not touch any other PR or branch.
+- Do not merge the PR.
 
 ## Keep the branch mergeable
 
@@ -253,10 +262,15 @@ Then:
 ## Continuation
 
 You are resuming this task. Do not start over: run `git status` and `git log
---oneline -5`, plus the test suite unless this is an automated-review turn, then
-continue from where the previous turn stopped. Automated-review turns run the
-review-status predicate below before tests. If a PR already exists, push to the
-same branch.
+--oneline -5`, then continue from where the previous turn stopped. If a PR
+already exists, push to the same branch.
+{{ if .bot_review_comments }}
+Before running tests, first run the review-status predicate in the
+Automated review section below. If it ends the turn, do not run the suite.
+Otherwise run the suite before changing files.
+{{ else }}
+Run the test suite before continuing.
+{{ end }}
 {{ if .review_comments }}
 
 ### Review feedback to address
