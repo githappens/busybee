@@ -64,6 +64,11 @@ jobs:
     outputs:
       prs: ${{ steps.pick.outputs.prs }}
     steps:
+      # The status predicate is infrastructure, so always load the base copy.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
       - name: Find PRs with unjudged Codex activity on their head commit
         id: pick
         env:
@@ -82,49 +87,35 @@ jobs:
           fi
           picked=()
           for PR in $prs; do
-            export HEAD=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
-            export HEAD_DATE=$(gh api "repos/$REPO/commits/$HEAD" --jq .commit.committer.date)
-            reviews=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate)
-            codex_at=$(jq -r '[.[] | select(.user.login==env.REVIEWER and .commit_id==env.HEAD) | .submitted_at] | max // empty' <<<"$reviews")
-            comment_at=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
-              --jq '[.[] | select(.user.login==env.REVIEWER and .created_at > env.HEAD_DATE) | .created_at] | max // empty')
-            # Reactions and comments are not pinned to a commit: a clean verdict for
-            # the previous push can arrive after the next push. Count them only once
-            # the head is old enough for any in-flight review to have finished and
-            # Codex shows no 👀 (it keeps 👀 while reviewing). Findings-reviews are
-            # pinned to the head and count immediately.
-            reactions=$(gh api "repos/$REPO/issues/$PR/reactions" --paginate)
-            eyes=$(jq '[.[] | select(.user.login==env.REVIEWER and .content=="eyes")] | length' <<<"$reactions")
-            age=$(( $(date +%s) - $(date -d "$HEAD_DATE" +%s) ))
-            reaction_at=""
-            if [ "$eyes" -eq 0 ] && [ "$age" -ge 480 ]; then
-              reaction_at=$(jq -r '[.[] | select(.user.login==env.REVIEWER and .content != "eyes" and .created_at > env.HEAD_DATE) | .created_at] | max // empty' <<<"$reactions")
+            status=$(sortie/review-status.sh "$PR")
+            case "$status" in
+              approvable) desired=APPROVED ;;
+              waiting:*|blocked:*) desired=CHANGES_REQUESTED ;;
+              unknown:classify-comment-*)
+                echo "PR #$PR: $status -> judge Codex's wording"
+                picked+=("$PR")
+                continue
+                ;;
+              unknown:*)
+                echo "PR #$PR: $status -> wait"
+                continue
+                ;;
+              *)
+                echo "::error::review-status returned invalid state '$status' for PR #$PR"
+                exit 1
+                ;;
+            esac
+
+            HEAD=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+            export HEAD
+            current=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate | jq -s 'add // []' | jq -r '
+              [.[] | select(.user.login==env.GATE and .commit_id==env.HEAD)]
+              | sort_by(.submitted_at) | last | .state // empty')
+            if [ "$current" = "$desired" ]; then
+              echo "PR #$PR: $status, already $desired"
             else
-              comment_at=""
-            fi
-            # An author reply on a finding's thread can resolve a P2/P3 finding,
-            # so it re-opens the judgement — but only once Codex has reviewed this
-            # head; before that there is nothing to judge the reply against.
-            reply_at=""
-            if [ -n "$codex_at" ]; then
-              export AUTHOR=$(gh api "repos/$REPO/pulls/$PR" --jq .user.login)
-              reply_at=$(gh api "repos/$REPO/pulls/$PR/comments" --paginate \
-                --jq '[.[] | select(.user.login==env.AUTHOR and .in_reply_to_id != null and .created_at > env.HEAD_DATE) | .created_at] | max // empty')
-            fi
-            latest=$(printf '%s\n%s\n%s\n%s\n' "$codex_at" "$comment_at" "$reaction_at" "$reply_at" | sort | tail -1)
-            gate_at=$(jq -r '[.[] | select(.user.login==env.GATE and .commit_id==env.HEAD) | .submitted_at] | max // empty' <<<"$reviews")
-            if [ -n "$latest" ] && { [ -z "$gate_at" ] || [[ "$latest" > "$gate_at" ]]; }; then
-              echo "PR #$PR: Codex activity at $latest, last verdict ${gate_at:-none} -> judge"
+              echo "PR #$PR: $status, current ${current:-none} -> judge"
               picked+=("$PR")
-            elif [ -z "$latest" ]; then
-              # No Codex signal for this head; wait for one. The gate cannot ask
-              # for a review itself: Codex only answers a mention from an account
-              # linked to it, and refuses one from github-actions[bot] with "create
-              # a Codex account and connect to github". The author's own agent asks
-              # when it needs to (sortie/WORKFLOW.md), posting as a linked user.
-              echo "PR #$PR: waiting for Codex (head ${age}s old)"
-            else
-              echo "PR #$PR: nothing new (codex $latest, verdict ${gate_at:-none})"
             fi
           done
           printf 'prs=%s\n' "$(printf '%s\n' "${picked[@]:-}" | grep -v '^$' | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
@@ -144,60 +135,26 @@ jobs:
       PR: ${{ matrix.pr }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Collect the review material for the head commit
         run: |
           set -euo pipefail
           mkdir -p gate
-          export HEAD=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
-          export HEAD_DATE=$(gh api "repos/$REPO/commits/$HEAD" --jq .commit.committer.date)
+          HEAD=$(gh api "repos/$REPO/pulls/$PR" --jq .head.sha)
+          status=$(sortie/review-status.sh -v "$PR" 2>gate/evidence.txt)
+          printf '%s\n' "$status" > gate/status.txt
           {
-            echo "# PR #$PR — review material for head $HEAD (committed $HEAD_DATE)"
+            echo "# PR #$PR — review material for head $HEAD"
             echo
             gh api "repos/$REPO/pulls/$PR" --jq '"Title: \(.title)\nAuthor: \(.user.login)\nBranch: \(.head.ref) -> \(.base.ref)\n\n## PR description\n\(.body // "(none)")"'
             echo
-            echo "## Codex reviews pinned to this head (newest last)"
-            gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-              --jq '[.[] | select(.user.login==env.REVIEWER and .commit_id==env.HEAD)] | sort_by(.submitted_at) | .[] | "\n### review \(.id) at \(.submitted_at) state=\(.state)\n\(.body)"'
+            echo "## Mechanical review status"
+            cat gate/status.txt
             echo
-            # A finding belongs to this head when its review is pinned here; the
-            # comment's own commit_id drifts to the newest commit its line survives
-            # in, so it cannot be used. The priority is the badge in the body.
-            echo "## Codex findings on this head, with priority and the author's replies"
-            export AUTHOR=$(gh api "repos/$REPO/pulls/$PR" --jq .user.login)
-            export REVIEW_IDS=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-              --jq '[.[] | select(.user.login==env.REVIEWER and .commit_id==env.HEAD) | .id]' | jq -sc add)
-            gh api "repos/$REPO/pulls/$PR/comments" --paginate | jq -s add | jq -r '
-              (env.REVIEW_IDS | fromjson) as $reviews
-              | . as $all
-              | [ .[] | select(.user.login==env.REVIEWER and .in_reply_to_id==null and (.pull_request_review_id as $r | $reviews | index($r) != null)) ]
-              | sort_by(.created_at)
-              | if length == 0 then "- (none: no findings-review is pinned to this head)" else
-                .[] | . as $f
-                | (($f.body | capture("badge/(?<p>P[0-9])") | .p) // "unbadged") as $p
-                | ($f.body | split("\n") | map(select(length > 0)) | .[0] | gsub("<[^>]*>|!\\[[^\\]]*\\]\\([^)]*\\)|\\*\\*"; "") | gsub("^ +| +$"; "")) as $title
-                | "- id=\($f.id) priority=\($p) \($f.path):\($f.line // $f.original_line // "?") — \($title)"
-                , ( [ $all[] | select(.in_reply_to_id == $f.id and .user.login == env.AUTHOR) ] | sort_by(.created_at)
-                    | if length == 0 then "    author reply: none" else .[] | "    author reply [\(.created_at)]: \(.body | gsub("\n"; " ") | .[0:400])" end )
-                end'
-            echo
-            echo "## Inline review comments on this PR created after the head commit (all authors; replies included)"
-            gh api "repos/$REPO/pulls/$PR/comments" --paginate \
-              --jq '[.[] | select(.created_at > env.HEAD_DATE)] | sort_by(.created_at) | .[] | "\n- [\(.created_at)] \(.user.login) on \(.path):\(.line // .original_line // "?")\(if .in_reply_to_id then " (reply to \(.in_reply_to_id))" else "" end) id=\(.id)\n  \(.body | gsub("\n"; "\n  "))"'
-            echo
-            echo "## Issue comments on this PR created after the head commit (all authors)"
-            gh api "repos/$REPO/issues/$PR/comments" --paginate \
-              --jq '[.[] | select(.created_at > env.HEAD_DATE)] | sort_by(.created_at) | .[] | "\n- [\(.created_at)] \(.user.login):\n  \(.body | gsub("\n"; "\n  "))"'
-            echo
-            echo "## Head age: $(( ( $(date +%s) - $(date -d "$HEAD_DATE" +%s) ) / 60 )) minutes since the head commit"
-            echo
-            echo "## Reactions on the PR (👍 from Codex after the head commit = automatic clean verdict; 👀 = a review is still running)"
-            gh api "repos/$REPO/issues/$PR/reactions" --paginate \
-              --jq '.[] | "- [\(.created_at)] \(.user.login): \(.content)\(if .created_at > env.HEAD_DATE then "  (after head commit)" else "  (BEFORE head commit — stale)" end)"'
-            echo
-            echo "## Previous gate verdicts on this head"
-            gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-              --jq '[.[] | select(.user.login==env.GATE and .commit_id==env.HEAD)] | .[] | "- \(.submitted_at) \(.state): \(.body)"'
+            echo "## Evidence from sortie/review-status.sh"
+            cat gate/evidence.txt
           } > gate/context.md
           echo "HEAD=$HEAD" >> "$GITHUB_ENV"
           wc -c gate/context.md
@@ -211,7 +168,7 @@ jobs:
           allowed_bots: "chatgpt-codex-connector,github-actions"
           claude_args: |
             --model claude-haiku-4-5
-            --max-turns 6
+            --max-turns 3
             --allowedTools "Read,Write,Glob,Grep,Bash(gh pr diff:*)"
           prompt: |
             You are the merge gate for pull request #${{ matrix.pr }} in ${{ github.repository }}.
@@ -221,53 +178,23 @@ jobs:
             `{"verdict": "APPROVE" | "REQUEST_CHANGES" | "UNSURE", "reason": "<one or two sentences>"}`
             and stop. Do not post comments, do not edit other files.
 
-            How the automated reviewer (Codex, login chatgpt-codex-connector[bot]) behaves:
-            it reviews every push. When it has findings it submits a review pinned to
-            the head commit with inline comments, each usually carrying a priority
-            badge (P0/P1/P2). When it has nothing to flag it submits no review; an
-            automatic review then leaves a 👍 reaction on the PR, and a manually
-            requested review posts an issue comment saying, in some wording, that it
-            found no major issues. Only signals dated after the head commit count.
-            Wording and formatting may vary between versions; judge the meaning.
+            `sortie/review-status.sh` is authoritative for commit pinning,
+            priorities, reply presence, signal age and once-per-head bookkeeping.
+            Do not recompute those facts. Map `blocked:<ids>` and `waiting:<ids>` to
+            REQUEST_CHANGES, and map `approvable` to APPROVE.
 
-            Severity policy: a finding's priority is the badge Codex put on it (P0, P1,
-            P2, P3); the section "Codex findings on this head" lists each finding with
-            its priority and the PR author's replies on its thread. P0 and P1 block.
-            P2 and P3 do not block: they are follow-ups, and the author answers each
-            one on its thread — declined as out of scope, not applicable, or already
-            covered, or deferred to a follow-up issue — or fixes it, which produces a
-            new head. A finding with no badge counts as blocking.
+            Two wording judgements remain yours:
+            - For `unknown:classify-comment-<ids>`, APPROVE only when the listed
+              Codex comment says, despite variable wording, that its review found no
+              major issues. A task-started message, acknowledgement or ambiguous
+              comment is UNSURE.
+            - Before approving answered P2/P3 findings, require each author reply to
+              state a reason for not changing this PR (scope, spec, not applicable,
+              or a linked follow-up). A bare acknowledgement, or a promise that a fix
+              is coming, is REQUEST_CHANGES.
 
-            Decision rules:
-            - UNSURE first: if a Codex 👀 reaction is present, or the head commit is
-              less than 8 minutes old and the only clean signal is a reaction or
-              comment, a review may still be running for this head and an earlier
-              clean signal may belong to a previous push. Also UNSURE when you cannot
-              tell what Codex concluded about this head (only a "task started" or
-              acknowledgement comment, a review whose commit differs from the head,
-              contradictory material). Say why.
-            - REQUEST_CHANGES when the latest Codex review on this head has at least
-              one P0/P1 (or unbadged) finding. Replies or rebuttals by the author do
-              NOT lift that block: only a later clean Codex signal for this head does
-              — a re-review the author requested on the same head, or Codex's review
-              of a new head. Name the blocking findings in the reason.
-            - REQUEST_CHANGES also when every finding on this head is P2/P3 but at
-              least one has no author reply yet, or the author's reply on one says or
-              implies a fix is coming ("fixed in …", "will address", "on it"): a push
-              is expected, so this head is not the one to approve. Say which threads
-              are waiting in the reason; this verdict is replaced when the author
-              answers.
-            - APPROVE when Codex's latest signal for THIS head is clean — a 👍
-              reaction or a "no major issues" comment dated after the head commit, or
-              a review on this head with zero inline findings — and no later Codex
-              review on this head carries findings.
-            - APPROVE also when the latest Codex review on this head has findings,
-              none is P0/P1 or unbadged, and every P2/P3 finding carries an author
-              reply that states a reason for not changing the code on this PR (scope,
-              spec, not applicable, follow-up issue). A bare acknowledgement or
-              reaction is not an answer. Quote the threads and the reasons in one
-              line each.
-            Never approve because the material is empty or ambiguous.
+            Any other `unknown:*` state is UNSURE. Never approve empty or ambiguous
+            material.
 
       - name: Post the verdict as github-actions[bot]
         run: |
@@ -290,8 +217,9 @@ jobs:
             echo "::notice::head moved $HEAD -> $live while judging; dropping stale verdict"
             exit 0
           fi
-          current=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate \
-            --jq '[.[] | select(.user.login==env.GATE and .commit_id==env.HEAD)] | sort_by(.submitted_at) | last | .state // empty')
+          current=$(gh api "repos/$REPO/pulls/$PR/reviews" --paginate | jq -s 'add // []' | jq -r '
+            [.[] | select(.user.login==env.GATE and .commit_id==env.HEAD)]
+            | sort_by(.submitted_at) | last | .state // empty')
           state="CHANGES_REQUESTED"; [ "$verdict" = APPROVE ] && state="APPROVED"
           if [ "$current" = "$state" ]; then echo "already $state for $HEAD"; exit 0; fi
           gh api -X POST "repos/$REPO/pulls/$PR/reviews" -f event="$verdict" -f commit_id="$HEAD" \
