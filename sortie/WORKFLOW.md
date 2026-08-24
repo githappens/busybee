@@ -239,9 +239,11 @@ Then:
 
 ## Continuation
 
-You are resuming this task. Do not start over: run `git status`, `git log
---oneline -5`, and the test suite, then continue from where the previous turn
-stopped. If a PR already exists, push to the same branch.
+You are resuming this task. Do not start over: run `git status` and `git log
+--oneline -5`, plus the test suite unless this is an automated-review turn, then
+continue from where the previous turn stopped. Automated-review turns run the
+review-status predicate below before tests. If a PR already exists, push to the
+same branch.
 {{ if .review_comments }}
 
 ### Review feedback to address
@@ -272,63 +274,35 @@ squash merge. Keep the PR's scope unchanged.
 
 {{ range .bot_review_comments }}- (comment id {{ .id }}) {{ if .file }}`{{ .file }}`{{ if .start_line }}:{{ .start_line }}{{ end }}: {{ end }}{{ .body }}
 {{ end }}
-First, acknowledge every finding so humans can see you are on it: for each comment
-id above run
+Before tests, acknowledgements or replies, run
+`sortie/review-status.sh -v <pr>`. Its one-line verdict is authoritative:
+
+- `approvable`: end the turn now. A new `@codex review` would replace the clean
+  signal with 👀 and throw away an approval that is about to land.
+- `waiting:<ids>`: answer only those P2/P3 threads.
+- `blocked:<ids>`: fix or decline only those P0/P1 or unbadged findings.
+- `unknown:<reason>`: do not change files. A review or re-review is in flight, the gate
+  still needs to classify Codex's freeform wording, or answered P2/P3 threads still
+  await the gate's reply-quality judgement (`unknown:judge-replies`).
+
+Acknowledge each `waiting` or `blocked` id with 👀:
 `gh api -X POST repos/githappens/busybee/pulls/comments/<id>/reactions -f content=eyes`.
-Each finding carries a priority badge (P0/P1/P2, occasionally P3). They are not
-all the same kind of work:
+P0/P1 findings block until the reviewer clears the head. P2/P3 findings clear
+when their threads carry an author reply; fix one only when the fix is small and
+inside the acceptance criteria, otherwise defer it to a follow-up issue. A bare
+acknowledgement is not an answer: state the fix, or why it does not apply here.
 
-- **P0/P1 block the merge.** Fix it, or — when it is wrong, out of the issue's
-  scope, or about a path the spec assigns to another issue — decline it on its
-  thread with the reason and ask for a re-review (below). A P1 block lifts only
-  when the reviewer itself clears the head.
-- **P2/P3 do not block.** The gate approves the head once every such thread
-  carries your answer. Fix one only when the fix is small, clearly inside the
-  issue's acceptance criteria, and does not add new state, new persistence, or a
-  new code path for the reviewer to read next round. Otherwise answer on the
-  thread: why it does not apply, or that it is deferred — file a follow-up issue
-  (`gh issue create`) with the finding's text and link it in the reply. A finding
-  about code that exists only to satisfy an earlier finding, whose consequence
-  needs two independent faults, is a deferral, not a fix. A bare acknowledgement
-  is not an answer; the gate waits for a reason.
+Reply with
+`gh api -X POST repos/githappens/busybee/pulls/<pr>/comments -F in_reply_to=<id> -f body='…'`.
+Write enough that a reader with only that thread understands the decision.
 
-Reply on each thread
-(`gh api -X POST repos/githappens/busybee/pulls/<pr>/comments -F in_reply_to=<id> -f body='…'`):
-a one-line summary of the fix, or the reason it does not apply / the follow-up
-issue. The gate reads these replies; write them so a reader who has only the
-thread understands the decision.
+**The scope of this turn is exactly the ids reported by the script — nothing
+else.** Do not hunt for defects or harden adjacent code. Push only when fixing a
+reported finding changed files; replies and declines alone get no commit, amend,
+rebase or push.
 
-A finding listed here may already have been handled in an earlier turn: the list
-is regenerated whenever the set of open comments changes, so threads that already
-carry your reply come back. Check each thread first; if the code already reflects
-the reply, there is nothing to do for it.
-
-**The scope of this turn is exactly the findings listed above that have no reply
-yet — nothing else.** Do not hunt for further defects, harden adjacent code, or
-polish: every push discards the review in flight and restarts the cycle, and a
-PR that keeps moving never merges. Anything you notice beyond the listed findings
-goes into a follow-up issue, not this PR. **Push only if you changed files for a
-listed finding.**
-
-If you changed no files — every listed finding already carries your reply, or you
-are declining all of them as wrong or out of scope — do not commit, amend, rebase
-or push.
-
-**First check whether the current head is already approvable.** It is when
-either holds:
-
-- the reviewer has left a 👍 reaction on the PR, or a "no major issues" comment
-  dated after the head commit — nothing is outstanding against this head; or
-- every finding on this head is P2/P3 and every one of those threads already
-  carries a reply with a reason — the gate approves on the replies alone.
-
-In both cases end the turn now. Asking for another review replaces the 👍 (or the
-answered findings) with 👀, and the gate answers UNSURE while a review is in
-flight, so the request throws away an approval that was about to land.
-
-Only when the head carries a P0/P1 finding you declined and no clean signal, ask
-the reviewer to look at it again, so it reconsiders with your replies visible in
-the threads:
+After declining a blocking finding, rerun the script. If it remains `blocked`
+and the evidence shows no re-review request for this head, ask once:
 
 ```sh
 gh api -X POST repos/githappens/busybee/issues/<pr>/comments -f body='@codex review
@@ -336,20 +310,13 @@ gh api -X POST repos/githappens/busybee/issues/<pr>/comments -f body='@codex rev
 <one line per declined finding: which thread it is, and why it does not apply>'
 ```
 
-Ask at most once per head: read the PR's issue comments first and skip this if you
-already asked for the current head. A re-review that finds nothing posts a "no
-major issues" comment, and that is the signal the merge gate approves on. For a
-declined P0/P1 a reply on its own never lifts the block, so a turn that ends with
-such a decline, no clean signal and no re-review request leaves the PR blocked
-for good.
+The script owns the once-per-head bookkeeping. If its evidence shows that the
+same finding was re-raised after that request, write `blocked` to `.sortie/status`
+with one line naming it and stop; a human settles it. A clean re-review appears as
+`approvable`.
 
-If a P0/P1 finding you already declined on an earlier head comes back after a
-re-review, do not argue it a second time: write `blocked` to `.sortie/status`
-with one line naming the finding, and stop. A human settles it from there.
-
-A new push triggers a fresh automated review; the PR merges automatically once CI
-is green and the head carries no P0/P1 finding and every P2/P3 finding has your
-answer.
+A new push triggers a fresh automated review. The PR merges automatically once
+CI is green and the review-status predicate is approvable.
 {{ end }}
 {{ if .ci_failure }}
 
