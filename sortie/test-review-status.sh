@@ -98,7 +98,17 @@ expect_status 'unanswered P2 waits' 'waiting:100'
 jq '. + [{id:101,pull_request_review_id:10,in_reply_to_id:100,user:{login:"author"},created_at:"2020-01-01T00:03:00Z",body:"Deferred with a reason."}]' \
   "$fixture/review-comments.json" >"$fixture/review-comments.next"
 mv "$fixture/review-comments.next" "$fixture/review-comments.json"
-expect_status 'answered P2 is mechanically approvable' 'approvable'
+expect_status 'answered P2 needs reply wording judge' 'unknown:judge-replies'
+
+reset_fixture
+review
+finding P2
+jq '. + [{id:101,pull_request_review_id:10,in_reply_to_id:100,user:{login:"author"},created_at:"2020-01-01T00:03:00Z",body:"Deferred with a reason."}]' \
+  "$fixture/review-comments.json" >"$fixture/review-comments.next"
+mv "$fixture/review-comments.next" "$fixture/review-comments.json"
+jq -nc '[{id:20,user:{login:"github-actions[bot]"},commit_id:"head",submitted_at:"2020-01-01T00:04:00Z",state:"APPROVED",body:"codex-gate"}]' \
+  >"$fixture/reviews.json"
+expect_status 'answered P2 after gate judged replies is approvable' 'approvable'
 
 reset_fixture
 jq -nc '[{id:200,user:{login:"chatgpt-codex-connector[bot]"},content:"+1",created_at:"2020-01-01T00:05:00Z"}]' \
@@ -135,3 +145,30 @@ test "$stdout" = 'waiting:100'
 grep -q 'finding: id=100 priority=P2' "$tmp/evidence"
 grep -q 'verdict: waiting:100' "$tmp/evidence"
 printf 'ok - verbose evidence\n'
+
+reset_fixture
+jq -nc '[{id:20,user:{login:"github-actions[bot]"},commit_id:"head",submitted_at:"2020-01-01T00:01:00Z",state:"APPROVED",body:"codex-gate"}]' \
+  >"$fixture/reviews.json"
+jq -nc '[{id:10,user:{login:"chatgpt-codex-connector[bot]"},commit_id:"head",submitted_at:"2020-01-01T00:02:00Z",state:"COMMENTED",body:"findings"}]' \
+  >"$fixture/reviews.next"
+jq -s 'add' "$fixture/reviews.json" "$fixture/reviews.next" >"$fixture/reviews.json"
+finding P2
+jq '. + [{id:101,pull_request_review_id:10,in_reply_to_id:100,user:{login:"author"},created_at:"2020-01-01T00:03:00Z",body:"will fix"}]' \
+  "$fixture/review-comments.json" >"$fixture/review-comments.next"
+mv "$fixture/review-comments.next" "$fixture/review-comments.json"
+expect_status 'stale gate approval after new findings needs judge' 'unknown:judge-replies'
+
+reset_fixture
+jq -nc '[{id:10,user:{login:"chatgpt-codex-connector[bot]"},commit_id:"head",submitted_at:"2020-01-01T00:01:00Z",state:"COMMENTED",body:"P1 review"}]' \
+  >"$fixture/reviews.json"
+jq -nc '[{id:100,pull_request_review_id:10,in_reply_to_id:null,user:{login:"chatgpt-codex-connector[bot]"},created_at:"2020-01-01T00:01:00Z",body:"https://img.shields.io/badge/P1-orange finding",path:"src/lib.rs",line:7}]' \
+  >"$fixture/review-comments.json"
+jq -nc '[{id:200,user:{login:"chatgpt-codex-connector[bot]"},content:"+1",created_at:"2020-01-01T00:02:00Z"}]' \
+  >"$fixture/reactions.json"
+jq -nc '[{id:11,user:{login:"chatgpt-codex-connector[bot]"},commit_id:"head",submitted_at:"2020-01-01T00:03:00Z",state:"COMMENTED",body:"P2 review"}]' \
+  >"$fixture/reviews.next"
+jq -s 'add' "$fixture/reviews.json" "$fixture/reviews.next" >"$fixture/reviews.json"
+jq '. + [{id:101,pull_request_review_id:11,in_reply_to_id:null,user:{login:"chatgpt-codex-connector[bot]"},created_at:"2020-01-01T00:03:00Z",body:"https://img.shields.io/badge/P2-orange finding",path:"src/lib.rs",line:8}]' \
+  "$fixture/review-comments.json" >"$fixture/review-comments.next"
+mv "$fixture/review-comments.next" "$fixture/review-comments.json"
+expect_status 'superseded P1 does not resurrect after clean signal' 'waiting:101'

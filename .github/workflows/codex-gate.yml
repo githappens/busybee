@@ -91,7 +91,7 @@ jobs:
             case "$status" in
               approvable) desired=APPROVED ;;
               waiting:*|blocked:*) desired=CHANGES_REQUESTED ;;
-              unknown:classify-comment-*)
+              unknown:classify-comment-*|unknown:judge-replies)
                 echo "PR #$PR: $status -> judge Codex's wording"
                 picked+=("$PR")
                 continue
@@ -191,7 +191,8 @@ jobs:
             - Before approving answered P2/P3 findings, require each author reply to
               state a reason for not changing this PR (scope, spec, not applicable,
               or a linked follow-up). A bare acknowledgement, or a promise that a fix
-              is coming, is REQUEST_CHANGES.
+              is coming, is REQUEST_CHANGES. For `unknown:judge-replies`, apply this
+              check to every active P2/P3 finding listed in the evidence.
 
             Any other `unknown:*` state is UNSURE. Never approve empty or ambiguous
             material.

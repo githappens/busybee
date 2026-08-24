@@ -63,15 +63,14 @@ jq -n \
             ]
           }
       ] | sort_by(.created_at, .id)
-  ' >"$tmp/findings.json"
+  ' >"$tmp/all-findings.json"
 
-latest_finding_at=$(jq -r '[.[].review_at] | max // empty' "$tmp/findings.json")
 latest_codex_review_at=$(jq -r --arg reviewer "$reviewer" --arg head "$head" '
   [.[] | select(.user.login == $reviewer and .commit_id == $head) | .submitted_at] | max // empty
 ' "$tmp/reviews.json")
 latest_zero_review_at=$(jq -r \
   --arg reviewer "$reviewer" --arg head "$head" \
-  --slurpfile findings "$tmp/findings.json" '
+  --slurpfile findings "$tmp/all-findings.json" '
     ($findings[0] | map(.pull_request_review_id) | unique) as $with_findings
     | [.[]
        | select(.user.login == $reviewer and .commit_id == $head)
@@ -107,6 +106,18 @@ latest_reaction_at=$(jq -r --arg reviewer "$reviewer" --arg head_date "$head_dat
 ' "$tmp/reactions.json")
 latest_comment_at=$(jq -r '[.[].created_at] | max // empty' "$tmp/codex-issue-comments.json")
 latest_rereview_at=$(jq -r '[.[].created_at] | max // empty' "$tmp/rereview-requests.json")
+
+# A clean Codex signal clears findings from earlier reviews on the same head.
+latest_clean_at=$(printf '%s\n%s\n' "$latest_reaction_at" "$latest_zero_review_at" | sort | tail -1)
+if [ -n "$latest_clean_at" ]; then
+  jq --arg clean "$latest_clean_at" '[.[] | select(.review_at > $clean)]' \
+    "$tmp/all-findings.json" >"$tmp/findings.json"
+else
+  cp "$tmp/all-findings.json" "$tmp/findings.json"
+fi
+
+latest_finding_at=$(jq -r '[.[].review_at] | max // empty' "$tmp/findings.json")
+latest_reply_at=$(jq -r '[.[] | .author_replies[]?.created_at] | max // empty' "$tmp/findings.json")
 
 iso_epoch() {
   date -u -d "$1" +%s 2>/dev/null \
@@ -159,6 +170,12 @@ elif [ -s "$tmp/findings.json" ] && [ "$(jq length "$tmp/findings.json")" -gt 0 
     status="blocked:$blocked"
   elif [ -n "$waiting" ]; then
     status="waiting:$waiting"
+  elif [ -z "$latest_gate_at" ] || [ "$latest_gate_state" != APPROVED ] \
+    || newer_than "$latest_finding_at" "$latest_gate_at" \
+    || newer_than "$latest_reply_at" "$latest_gate_at"; then
+    # Answered P2/P3 still need the gate's wording judge before the head is
+    # approvable; a stale APPROVED must not skip that step.
+    status=unknown:judge-replies
   else
     status=approvable
   fi
