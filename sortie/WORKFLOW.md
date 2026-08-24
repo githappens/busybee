@@ -45,6 +45,9 @@ hooks:
     fi
     # Install the machine-safety hook into the otherwise disposable workspace.
     # Keep the runtime copies out of `git add -A`; their sources live in sortie/.
+    # The hook is a guard for cooperative agents (direct Edit/Write/Bash
+    # mutations of these runtime files are denied); it is not a same-UID
+    # adversarial sandbox.
     grep -qxF '/.claude/' .git/info/exclude || printf '/.claude/\n' >> .git/info/exclude
     mkdir -p .claude/hooks
     install -m 0755 sortie/machine-safety-hook.sh .claude/hooks/machine-safety-hook.sh
