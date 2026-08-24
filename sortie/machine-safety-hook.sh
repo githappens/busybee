@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # PreToolUse guard for the disposable sortie workspaces.
 set -euo pipefail
+shopt -s extglob
 
 input=$(cat)
 project_dir=${CLAUDE_PROJECT_DIR:-$PWD}
@@ -24,6 +25,164 @@ if ! tool=$(jq -er '.tool_name' <<<"$input"); then
   deny "invalid hook input; refusing the tool call"
 fi
 
+# True when $1 is a workspace-local path (relative, under $PWD / project_dir).
+is_local_path() {
+  local value=$1
+  value=${value#\"}; value=${value%\"}
+  value=${value#\'}; value=${value%\'}
+  case "$value" in
+    "$project_dir"/*|\$PWD/*|\$\{PWD\}/*)
+      return 0
+      ;;
+    /*|~*|\$HOME*|\$\{HOME\}*|*../*|..)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+# Split a flattened Bash string into shell segments on ; && || | & while
+# respecting single/double quotes. Each segment is checked on its own so an
+# assignment on an earlier command cannot satisfy a later daemon launch.
+split_segments() {
+  local text=$1
+  local -n _out=$2
+  local i=0 len=${#text} ch quote= segment=
+  _out=()
+  while (( i < len )); do
+    ch=${text:i:1}
+    if [ -n "$quote" ]; then
+      segment+=$ch
+      if [ "$ch" = "$quote" ]; then
+        quote=
+      elif [ "$ch" = '\' ] && [ "$quote" = '"' ] && (( i + 1 < len )); then
+        segment+=${text:i+1:1}
+        (( i++ )) || true
+      fi
+      (( i++ )) || true
+      continue
+    fi
+    case "$ch" in
+      \'|\")
+        quote=$ch
+        segment+=$ch
+        ;;
+      ';')
+        _out+=("$segment")
+        segment=
+        ;;
+      '&'|'|')
+        if [ "$ch" = '&' ] && [ "${text:i:2}" = '&&' ]; then
+          _out+=("$segment")
+          segment=
+          (( i++ )) || true
+        elif [ "$ch" = '|' ] && [ "${text:i:2}" = '||' ]; then
+          _out+=("$segment")
+          segment=
+          (( i++ )) || true
+        else
+          _out+=("$segment")
+          segment=
+        fi
+        ;;
+      *)
+        segment+=$ch
+        ;;
+    esac
+    (( i++ )) || true
+  done
+  _out+=("$segment")
+}
+
+# Peel leading VAR=val assignments and unwrap supported wrappers from one
+# segment. Sets: peeled_env (name=value lines), argv0, rest_args.
+peel_segment() {
+  local seg=$1
+  local rest=${seg##+([[:space:]])}
+  rest=${rest%%+([[:space:]])}
+  peeled_env=
+  argv0=
+  rest_args=
+
+  # Keep unwrapping env / nix develop -c / busybee -- / command until the
+  # argv0 is the real program.
+  local assign_re env_re command_re busybee_re nix_re nix_c_re argv_re
+  # Keep the regex in a variable so quotes inside the pattern are literal.
+  assign_re='^([A-Za-z_][A-Za-z0-9_]*)=("([^"]*)"|'\''([^'\'']*)'\''|[^[:space:]&;|]+)[[:space:]]+(.*)$'
+  env_re='^env([[:space:]]+(.*))?$'
+  command_re='^command([[:space:]]+-v)?[[:space:]]+(.*)$'
+  busybee_re='^busybee([[:space:]]+--+)?[[:space:]]+(.*)$'
+  nix_re='^nix[[:space:]]+develop[[:space:]]+(.*)$'
+  nix_c_re='^(.*[[:space:]])?-c[[:space:]]+(.*)$'
+  argv_re='^([^[:space:]&;|]+)([[:space:]]+(.*))?$'
+
+  while :; do
+    rest=${rest##+([[:space:]])}
+    # Leading environment assignments belong only to this segment.
+    while [[ $rest =~ $assign_re ]]; do
+      peeled_env+="${BASH_REMATCH[1]}=${BASH_REMATCH[3]:-${BASH_REMATCH[4]:-${BASH_REMATCH[2]}}}"$'\n'
+      rest=${BASH_REMATCH[5]}
+    done
+    rest=${rest##+([[:space:]])}
+    if [[ $rest =~ $env_re ]]; then
+      rest=${BASH_REMATCH[2]-}
+      continue
+    fi
+    if [[ $rest =~ $command_re ]]; then
+      # `command -v` is a lookup, not a launch wrapper.
+      if [ -n "${BASH_REMATCH[1]-}" ]; then
+        break
+      fi
+      rest=${BASH_REMATCH[2]}
+      continue
+    fi
+    # busybee [--] <cmd>
+    if [[ $rest =~ $busybee_re ]]; then
+      rest=${BASH_REMATCH[2]}
+      continue
+    fi
+    # nix develop [flake-args…] -c <cmd>
+    if [[ $rest =~ $nix_re ]]; then
+      local nix_rest=${BASH_REMATCH[1]}
+      if [[ $nix_rest =~ $nix_c_re ]]; then
+        rest=${BASH_REMATCH[2]}
+        continue
+      fi
+    fi
+    break
+  done
+
+  rest=${rest##+([[:space:]])}
+  if [[ $rest =~ $argv_re ]]; then
+    argv0=${BASH_REMATCH[1]}
+    rest_args=${BASH_REMATCH[3]-}
+  else
+    argv0=
+    rest_args=
+  fi
+}
+
+env_value_for() {
+  local name=$1 line
+  while IFS= read -r line; do
+    case "$line" in
+      "$name"=*)
+        printf '%s\n' "${line#*=}"
+        return 0
+        ;;
+    esac
+  done <<<"$peeled_env"
+  return 1
+}
+
+daemon_basename() {
+  local name=${1##*/}
+  name=${name#./}
+  printf '%s\n' "$name"
+}
+
 case "$tool" in
   Edit|MultiEdit|Write)
     if ! path=$(jq -er '.tool_input.file_path' <<<"$input"); then
@@ -42,7 +201,7 @@ case "$tool" in
     fi
     # Newlines separate shell commands too; flatten them so the checks below
     # cover a multi-line Bash tool call.
-    command=${command//$'\n'/ }
+    command=${command//$'\n'/ ; }
 
     if [[ $command =~ (^|[[:space:]\&;\|])nix[[:space:]]+profile[[:space:]]+install([[:space:]]|$) ]]; then
       deny "do not run nix profile install from an agent workspace"
@@ -69,58 +228,49 @@ case "$tool" in
       deny "do not install or replace the global busybee/bzbd/pueued binaries"
     fi
 
-    # Edit/Write calls are checked above. Cover the ordinary shell spellings
-    # that can mutate the same file without blocking read-only inspection.
-    config_redirect_re='>+[[:space:]]*[^[:space:]&;|]*\.cargo/config\.toml'
-    if [[ $command == *".cargo/config.toml"* ]] && {
-      [[ $command =~ (^|[[:space:]\&;\|])(rm|unlink|touch|truncate|tee|sed[[:space:]]+-i|perl[[:space:]]+-pi|git[[:space:]]+(checkout|restore))[[:space:]].*\.cargo/config\.toml ]] \
-        || [[ $command =~ (^|[[:space:]\&;\|])(cp|mv|install)[[:space:]].*[[:space:]]\.cargo/config\.toml([[:space:]\&;\|]|$) ]] \
-        || [[ $command =~ $config_redirect_re ]];
-    }; then
-      deny "do not edit .cargo/config.toml"
-    fi
-
-    # Recognise a daemon in command position: at the beginning of a shell
-    # segment, after environment assignments and an optional `env` wrapper.
-    assignment='[A-Za-z_][A-Za-z0-9_]*=[^[:space:]\&;\|]+[[:space:]]+'
-    segment='(^|[\&;\|][\&;\|]?[[:space:]]*)'
-    launches_pueued=false
-    launches_bzbd=false
-    if [[ $command =~ $segment($assignment)*(env[[:space:]]+($assignment)*)?([^[:space:]\&;\|]*/)?pueued([[:space:]\&;\|]|$) ]]; then
-      launches_pueued=true
-    fi
-    if [[ $command =~ $segment($assignment)*(env[[:space:]]+($assignment)*)?([^[:space:]\&;\|]*/)?bzbd([[:space:]\&;\|]|$) ]]; then
-      launches_bzbd=true
-    fi
-
-    local_path_assignment() {
-      local name=$1 value assignment_re
-      assignment_re="(^|[[:space:]&;|])${name}=([^[:space:]&;|]+)"
-      if [[ $command =~ $assignment_re ]]; then
-        value=${BASH_REMATCH[2]}
-        value=${value#\"}; value=${value%\"}
-        value=${value#\'}; value=${value%\'}
-        case "$value" in
-          "$project_dir"/*|\$PWD/*|\$\{PWD\}/*)
-            return 0
-            ;;
-          /*|~*|\$HOME*|\$\{HOME\}*|*../*|..)
-            return 1
+    # .cargo/config.toml: allow only known read-only readers. Enumerating every
+    # writer (python -c, ruby, node, …) is open-ended; a narrow allowlist fails
+    # closed for anything else that mentions the path.
+    if [[ $command == *".cargo/config.toml"* ]]; then
+      config_redirect_re='>+[[:space:]]*[^[:space:]&;|]*\.cargo/config\.toml'
+      if [[ $command =~ $config_redirect_re ]]; then
+        deny "do not edit .cargo/config.toml"
+      fi
+      segments=()
+      split_segments "$command" segments
+      for seg in "${segments[@]}"; do
+        [[ $seg == *".cargo/config.toml"* ]] || continue
+        peel_segment "$seg"
+        base=$(daemon_basename "$argv0")
+        case "$base" in
+          cat|less|more|head|tail|wc|stat|file|ls|grep|egrep|fgrep|rg|bat|nl|od|hexdump|sha256sum|md5sum|cksum|diff|jq)
             ;;
           *)
-            return 0
+            deny "do not edit .cargo/config.toml"
             ;;
         esac
-      fi
-      return 1
-    }
+      done
+    fi
 
-    if $launches_pueued && ! local_path_assignment PUEUE_CONFIG_PATH; then
-      deny "launch pueued only with a workspace-local PUEUE_CONFIG_PATH"
-    fi
-    if $launches_bzbd && ! local_path_assignment BUSYBEE_STATE_DIR; then
-      deny "launch bzbd only with a workspace-local BUSYBEE_STATE_DIR"
-    fi
+    segments=()
+    split_segments "$command" segments
+    for seg in "${segments[@]}"; do
+      peel_segment "$seg"
+      [ -n "$argv0" ] || continue
+      base=$(daemon_basename "$argv0")
+      case "$base" in
+        pueued)
+          if ! value=$(env_value_for PUEUE_CONFIG_PATH) || ! is_local_path "$value"; then
+            deny "launch pueued only with a workspace-local PUEUE_CONFIG_PATH"
+          fi
+          ;;
+        bzbd)
+          if ! value=$(env_value_for BUSYBEE_STATE_DIR) || ! is_local_path "$value"; then
+            deny "launch bzbd only with a workspace-local BUSYBEE_STATE_DIR"
+          fi
+          ;;
+      esac
+    done
     ;;
 
   *)

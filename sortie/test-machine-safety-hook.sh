@@ -65,6 +65,15 @@ expect_deny 'Edit of cargo config' 'do not edit .cargo/config.toml' Edit \
 expect_deny 'Bash write to cargo config' 'do not edit .cargo/config.toml' Bash \
   'printf "x" > .cargo/config.toml'
 
+# Codex findings: wrappers, wrong-segment assignments, interpreter writes.
+expect_deny 'nix develop -c unisolated pueued' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'nix develop -c pueued --daemonize'
+expect_deny 'assignment on earlier segment does not isolate pueued' \
+  'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'PUEUE_CONFIG_PATH=build/test true; pueued --daemonize'
+expect_deny 'interpreter write to cargo config' 'do not edit .cargo/config.toml' Bash \
+  'python -c '"'"'open(".cargo/config.toml", "w").write("x")'"'"''
+
 expect_allow 'workspace test command' Bash 'busybee -- cargo test --workspace'
 expect_allow 'clippy command' Bash 'cargo clippy --workspace --all-targets -- -D warnings'
 expect_allow 'format command' Bash 'cargo fmt --all'
@@ -75,6 +84,8 @@ expect_allow 'isolated pueued' Bash \
 # shellcheck disable=SC2016
 expect_allow 'isolated bzbd' Bash \
   'BUSYBEE_STATE_DIR=$PWD/build/test/state ./build/debug/bzbd'
+expect_allow 'isolated pueued under nix develop -c' Bash \
+  'nix develop -c env PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
 expect_allow 'read cargo config' Bash 'cat .cargo/config.toml'
 expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"
 
