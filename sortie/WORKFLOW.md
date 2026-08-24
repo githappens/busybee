@@ -281,8 +281,9 @@ Before tests, acknowledgements or replies, run
   signal with 👀 and throw away an approval that is about to land.
 - `waiting:<ids>`: answer only those P2/P3 threads.
 - `blocked:<ids>`: fix or decline only those P0/P1 or unbadged findings.
-- `unknown:<reason>`: do not change files. A review or re-review is in flight, or
-  the gate still needs to classify Codex's freeform wording.
+- `unknown:<reason>`: do not change files. A review or re-review is in flight, the gate
+  still needs to classify Codex's freeform wording, or answered P2/P3 threads still
+  await the gate's reply-quality judgement (`unknown:judge-replies`).
 
 Acknowledge each `waiting` or `blocked` id with 👀:
 `gh api -X POST repos/githappens/busybee/pulls/comments/<id>/reactions -f content=eyes`.
