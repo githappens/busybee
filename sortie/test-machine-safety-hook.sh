@@ -74,6 +74,18 @@ expect_deny 'assignment on earlier segment does not isolate pueued' \
 expect_deny 'interpreter write to cargo config' 'do not edit .cargo/config.toml' Bash \
   'python -c '"'"'open(".cargo/config.toml", "w").write("x")'"'"''
 
+# env options must be consumed so argv0 is the real command, not -i / -u.
+expect_deny 'env -i unisolated pueued' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'env -i pueued --daemonize'
+expect_deny 'env -u clears isolation' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'env -u PUEUE_CONFIG_PATH pueued --daemonize'
+expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
+  "$root/.claude/hooks/machine-safety-hook.sh"
+expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \
+  "$root/.claude/settings.json"
+expect_deny 'Bash overwrite of runtime hook' 'do not modify the machine-safety hook' Bash \
+  'printf "exit 0\n" > .claude/hooks/machine-safety-hook.sh'
+
 expect_allow 'workspace test command' Bash 'busybee -- cargo test --workspace'
 expect_allow 'clippy command' Bash 'cargo clippy --workspace --all-targets -- -D warnings'
 expect_allow 'format command' Bash 'cargo fmt --all'
@@ -86,7 +98,12 @@ expect_allow 'isolated bzbd' Bash \
   'BUSYBEE_STATE_DIR=$PWD/build/test/state ./build/debug/bzbd'
 expect_allow 'isolated pueued under nix develop -c' Bash \
   'nix develop -c env PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
+expect_allow 'env -- with isolated pueued' Bash \
+  'env -- PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
+expect_allow 'env -i with isolated pueued' Bash \
+  'env -i PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
 expect_allow 'read cargo config' Bash 'cat .cargo/config.toml'
+expect_allow 'read runtime hook' Bash 'cat .claude/hooks/machine-safety-hook.sh'
 expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"
 
 # Exercise the same two copies made by WORKFLOW.md's before_run hook.

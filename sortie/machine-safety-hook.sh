@@ -97,7 +97,8 @@ split_segments() {
 }
 
 # Peel leading VAR=val assignments and unwrap supported wrappers from one
-# segment. Sets: peeled_env (name=value lines), argv0, rest_args.
+# segment. Sets: peeled_env (name=value lines), argv0, rest_args,
+# peel_uncertain (1 when an env option could not be parsed confidently).
 peel_segment() {
   local seg=$1
   local rest=${seg##+([[:space:]])}
@@ -105,29 +106,98 @@ peel_segment() {
   peeled_env=
   argv0=
   rest_args=
+  peel_uncertain=0
 
   # Keep unwrapping env / nix develop -c / busybee -- / command until the
   # argv0 is the real program.
-  local assign_re env_re command_re busybee_re nix_re nix_c_re argv_re
+  local assign_re command_re busybee_re nix_re nix_c_re argv_re token_re
   # Keep the regex in a variable so quotes inside the pattern are literal.
   assign_re='^([A-Za-z_][A-Za-z0-9_]*)=("([^"]*)"|'\''([^'\'']*)'\''|[^[:space:]&;|]+)[[:space:]]+(.*)$'
-  env_re='^env([[:space:]]+(.*))?$'
   command_re='^command([[:space:]]+-v)?[[:space:]]+(.*)$'
   busybee_re='^busybee([[:space:]]+--+)?[[:space:]]+(.*)$'
   nix_re='^nix[[:space:]]+develop[[:space:]]+(.*)$'
   nix_c_re='^(.*[[:space:]])?-c[[:space:]]+(.*)$'
   argv_re='^([^[:space:]&;|]+)([[:space:]]+(.*))?$'
+  token_re='^([^[:space:]]+)([[:space:]]+(.*))?$'
 
-  while :; do
-    rest=${rest##+([[:space:]])}
-    # Leading environment assignments belong only to this segment.
+  peel_assignments() {
     while [[ $rest =~ $assign_re ]]; do
       peeled_env+="${BASH_REMATCH[1]}=${BASH_REMATCH[3]:-${BASH_REMATCH[4]:-${BASH_REMATCH[2]}}}"$'\n'
       rest=${BASH_REMATCH[5]}
     done
+  }
+
+  # Consume env(1) options (-i, -u NAME, --unset=NAME, --, …) until the
+  # operand command. Unknown dash-options leave peel_uncertain set so the
+  # caller can fail closed when the segment still mentions a daemon.
+  peel_env_options() {
+    local tok optarg
+    while :; do
+      rest=${rest##+([[:space:]])}
+      [ -n "$rest" ] || return 0
+      if [[ $rest == -- ]]; then
+        rest=
+        return 0
+      fi
+      if [[ $rest =~ ^--[[:space:]]+(.*)$ ]]; then
+        rest=${BASH_REMATCH[1]}
+        return 0
+      fi
+      if [[ $rest =~ $assign_re ]]; then
+        return 0
+      fi
+      if ! [[ $rest =~ $token_re ]]; then
+        return 0
+      fi
+      tok=${BASH_REMATCH[1]}
+      optarg=${BASH_REMATCH[3]-}
+      case "$tok" in
+        -i|--ignore-environment|-0|--null|-v|--version|-h|--help)
+          rest=$optarg
+          ;;
+        -u|--unset)
+          rest=${optarg##+([[:space:]])}
+          if ! [[ $rest =~ $token_re ]]; then
+            peel_uncertain=1
+            return 0
+          fi
+          rest=${BASH_REMATCH[3]-}
+          ;;
+        --unset=*)
+          rest=$optarg
+          ;;
+        -C|--chdir)
+          rest=${optarg##+([[:space:]])}
+          if ! [[ $rest =~ $token_re ]]; then
+            peel_uncertain=1
+            return 0
+          fi
+          rest=${BASH_REMATCH[3]-}
+          ;;
+        --chdir=*)
+          rest=$optarg
+          ;;
+        -*)
+          peel_uncertain=1
+          return 0
+          ;;
+        *)
+          return 0
+          ;;
+      esac
+    done
+  }
+
+  while :; do
     rest=${rest##+([[:space:]])}
-    if [[ $rest =~ $env_re ]]; then
+    peel_assignments
+    rest=${rest##+([[:space:]])}
+    if [[ $rest =~ ^env([[:space:]]+(.*))?$ ]]; then
       rest=${BASH_REMATCH[2]-}
+      peel_env_options
+      if [ "$peel_uncertain" -eq 1 ]; then
+        break
+      fi
       continue
     fi
     if [[ $rest =~ $command_re ]]; then
@@ -154,6 +224,8 @@ peel_segment() {
     break
   done
 
+  rest=${rest##+([[:space:]])}
+  peel_assignments
   rest=${rest##+([[:space:]])}
   if [[ $rest =~ $argv_re ]]; then
     argv0=${BASH_REMATCH[1]}
@@ -183,6 +255,42 @@ daemon_basename() {
   printf '%s\n' "$name"
 }
 
+is_runtime_hook_path() {
+  case "$1" in
+    .claude/settings.json|*/.claude/settings.json|.claude/hooks/machine-safety-hook.sh|*/.claude/hooks/machine-safety-hook.sh)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Deny writes to a named path unless every mentioning segment is a known reader.
+deny_unless_readonly_mention() {
+  local needle=$1 reason=$2
+  local redirect_re segments seg base
+  [[ $command == *"$needle"* ]] || return 0
+  redirect_re=">+[[:space:]]*[^[:space:]&;|]*${needle//./\\.}"
+  if [[ $command =~ $redirect_re ]]; then
+    deny "$reason"
+  fi
+  segments=()
+  split_segments "$command" segments
+  for seg in "${segments[@]}"; do
+    [[ $seg == *"$needle"* ]] || continue
+    peel_segment "$seg"
+    base=$(daemon_basename "$argv0")
+    case "$base" in
+      cat|less|more|head|tail|wc|stat|file|ls|grep|egrep|fgrep|rg|bat|nl|od|hexdump|sha256sum|md5sum|cksum|diff|jq)
+        ;;
+      *)
+        deny "$reason"
+        ;;
+    esac
+  done
+}
+
 case "$tool" in
   Edit|MultiEdit|Write)
     if ! path=$(jq -er '.tool_input.file_path' <<<"$input"); then
@@ -193,6 +301,9 @@ case "$tool" in
         deny "do not edit .cargo/config.toml"
         ;;
     esac
+    if is_runtime_hook_path "$path"; then
+      deny "do not modify the machine-safety hook or its settings"
+    fi
     ;;
 
   Bash)
@@ -228,34 +339,20 @@ case "$tool" in
       deny "do not install or replace the global busybee/bzbd/pueued binaries"
     fi
 
-    # .cargo/config.toml: allow only known read-only readers. Enumerating every
-    # writer (python -c, ruby, node, …) is open-ended; a narrow allowlist fails
-    # closed for anything else that mentions the path.
-    if [[ $command == *".cargo/config.toml"* ]]; then
-      config_redirect_re='>+[[:space:]]*[^[:space:]&;|]*\.cargo/config\.toml'
-      if [[ $command =~ $config_redirect_re ]]; then
-        deny "do not edit .cargo/config.toml"
-      fi
-      segments=()
-      split_segments "$command" segments
-      for seg in "${segments[@]}"; do
-        [[ $seg == *".cargo/config.toml"* ]] || continue
-        peel_segment "$seg"
-        base=$(daemon_basename "$argv0")
-        case "$base" in
-          cat|less|more|head|tail|wc|stat|file|ls|grep|egrep|fgrep|rg|bat|nl|od|hexdump|sha256sum|md5sum|cksum|diff|jq)
-            ;;
-          *)
-            deny "do not edit .cargo/config.toml"
-            ;;
-        esac
-      done
-    fi
+    # Narrow read-only allowlists: enumerating every writer is open-ended.
+    deny_unless_readonly_mention '.cargo/config.toml' 'do not edit .cargo/config.toml'
+    deny_unless_readonly_mention '.claude/settings.json' \
+      'do not modify the machine-safety hook or its settings'
+    deny_unless_readonly_mention '.claude/hooks/machine-safety-hook.sh' \
+      'do not modify the machine-safety hook or its settings'
 
     segments=()
     split_segments "$command" segments
     for seg in "${segments[@]}"; do
       peel_segment "$seg"
+      if [ "$peel_uncertain" -eq 1 ] && [[ $seg =~ (^|[^[:alnum:]_])(pueued|bzbd)([^[:alnum:]_]|$) ]]; then
+        deny "could not parse env options around a pueued/bzbd launch; refusing"
+      fi
       [ -n "$argv0" ] || continue
       base=$(daemon_basename "$argv0")
       case "$base" in
