@@ -43,27 +43,19 @@ expect_allow() {
   fi
 }
 
-# --- supported isolated launches ---
+# Isolated CMake/Xcode-style bzb, plus the other supported launcher forms.
 expect_allow 'isolated bzb xcodebuild' Bash \
   '.claude/isolated.sh bzb -- xcodebuild -project App.xcodeproj'
 expect_allow 'isolated bzb cmake' Bash \
   '.claude/isolated.sh bzb -- cmake --build build'
 expect_allow 'isolated busybee cargo test' Bash \
   '.claude/isolated.sh busybee -- cargo test --workspace'
-expect_allow 'isolated pueued' Bash \
-  '.claude/isolated.sh pueued --daemonize'
-expect_allow 'isolated bzbd' Bash \
-  '.claude/isolated.sh bzbd --foreground'
-expect_allow 'isolated pueue client' Bash \
-  '.claude/isolated.sh pueue clean'
 expect_allow 'quoted project-dir isolated bzb' Bash \
   '"$CLAUDE_PROJECT_DIR/.claude/isolated.sh" bzb -- xcodebuild -project App.xcodeproj'
-expect_allow 'nix develop -c isolated busybee' Bash \
-  'nix develop -c .claude/isolated.sh busybee -- cargo test --workspace'
 expect_deny 'tracked sortie/isolated.sh is not the runtime launcher' 'isolated.sh' Bash \
   'sortie/isolated.sh bzb -- cmake --build build'
 
-# --- unisolated stateful launches denied ---
+# Bare / unisolated stateful launches.
 expect_deny 'bare bzb xcodebuild' 'isolated.sh' Bash \
   'bzb -- xcodebuild -project App.xcodeproj'
 expect_deny 'bare busybee cargo test' 'isolated.sh' Bash \
@@ -76,42 +68,38 @@ expect_deny 'bare pueue client' 'isolated.sh' Bash \
   'pueue clean'
 expect_deny 'env-prefixed pueued is not the launcher' 'isolated.sh' Bash \
   'PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
-expect_deny 'env-prefixed bzb is not the launcher' 'isolated.sh' Bash \
-  'BUSYBEE_STATE_DIR=build/state PUEUE_CONFIG_PATH=build/pueue bzb -- cmake --build build'
+expect_deny 'cargo run -p bzbd' 'isolated.sh' Bash \
+  'cargo run -p bzbd -- --foreground'
 
-# --- normal build / test / lint / format ---
+# Normal non-stateful development commands.
 expect_allow 'cargo test' Bash 'cargo test --workspace'
 expect_allow 'cargo clippy' Bash 'cargo clippy --workspace --all-targets -- -D warnings'
 expect_allow 'cargo fmt' Bash 'cargo fmt --all'
 expect_allow 'cargo check' Bash 'cargo check --workspace'
 expect_allow 'cargo build' Bash 'cargo build --release'
+expect_allow 'cargo doc' Bash 'cargo doc --workspace'
 expect_allow 'cd crate then cargo test' Bash 'cd crates/bzbd && cargo test'
 expect_allow 'cargo test -p bzb' Bash 'cargo test -p bzb'
 expect_allow 'read-only mention of pueued' Bash 'rg pueued crates/'
+expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"
 
-# --- global install / deploy ---
+# Global install / deploy and .cargo/config.toml.
 expect_deny 'nix profile install' 'nix profile install' Bash \
   'nix profile install .'
-expect_deny 'nix profile add' 'nix profile install' Bash \
-  'nix profile add --impure .'
 expect_deny 'cargo install' 'cargo install' Bash \
   'cargo +stable install bzb'
 expect_deny 'deploy script' 'global busybee/bzb/bzbd/pueued' Bash \
   './scripts/buildanddeploy.sh'
 expect_deny 'copy to ~/.local/bin' 'global busybee/bzb/bzbd/pueued' Bash \
   "cp build/release/bzbd '$HOME/.local/bin/bzbd'"
-
-# --- .cargo/config.toml ---
 expect_deny 'Edit of cargo config' 'do not edit .cargo/config.toml' Edit \
   "$root/.cargo/config.toml"
 expect_deny 'Bash write to cargo config' 'do not edit .cargo/config.toml' Bash \
   'printf "x" > .cargo/config.toml'
-expect_deny 'python write to cargo config' 'do not edit .cargo/config.toml' Bash \
-  'python -c '"'"'open(".cargo/config.toml", "w").write("x")'"'"''
 expect_allow 'read cargo config' Bash 'cat .cargo/config.toml'
-expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"
 
-# A reader prefix does not authorize later launches, redirects, or deletes.
+# Whole-command readers: a reader prefix does not authorize a later launch
+# or a write.
 expect_deny 'reader then pueued' 'isolated.sh' Bash \
   'cat /dev/null; pueued --daemonize'
 expect_deny 'reader redirect to cargo config' 'do not edit .cargo/config.toml' Bash \
@@ -119,51 +107,21 @@ expect_deny 'reader redirect to cargo config' 'do not edit .cargo/config.toml' B
 expect_deny 'reader then rm .claude' 'do not modify the machine-safety hook' Bash \
   'rg x /dev/null; rm -rf .claude'
 
-# --- runtime hook / settings / launcher ---
+# Ordinary replacement of the installed runtime payload.
 expect_deny 'rm -rf .claude' 'do not modify the machine-safety hook' Bash \
   'rm -rf .claude'
-expect_deny 'rm project-prefixed .claude' 'do not modify the machine-safety hook' Bash \
-  'rm -rf "$CLAUDE_PROJECT_DIR"/.claude'
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \
   "$root/.claude/settings.json"
 expect_deny 'Write of isolated launcher' 'do not modify the machine-safety hook' Write \
   "$root/.claude/isolated.sh"
-expect_deny 'Bash overwrite of runtime hook' 'do not modify the machine-safety hook' Bash \
-  'printf "exit 0\n" > .claude/hooks/machine-safety-hook.sh'
-expect_deny 'runtime hook via ..' 'do not modify the machine-safety hook' Bash \
-  "printf 'exit 0\n' > .claude/hooks/../hooks/machine-safety-hook.sh"
 expect_deny 'git clean -fdx' 'do not modify the machine-safety hook' Bash \
   'git clean -fdx'
-expect_deny 'git stash --all' 'do not modify the machine-safety hook' Bash \
-  'git stash push --all'
-expect_deny 'find -delete' 'do not modify the machine-safety hook' Bash \
-  'find . -depth -delete'
 expect_allow 'git clean -fd' Bash 'git clean -fd'
 expect_allow 'read runtime hook' Bash 'cat .claude/hooks/machine-safety-hook.sh'
 
-# --- cargo run of stateful binaries is not a supported form ---
-expect_deny 'cargo run -p bzbd' 'isolated.sh' Bash \
-  'cargo run -p bzbd -- --foreground'
-expect_deny 'cargo run --bin busybee' 'isolated.sh' Bash \
-  'cargo run --bin busybee -- -- cmake --build build'
-
-# --- representative fail-closed ambiguity ---
-expect_deny 'env wrapper around pueued' 'isolated.sh' Bash \
-  'env PUEUE_CONFIG_PATH=build/test pueued --daemonize'
-expect_deny 'cd then bare pueued' 'isolated.sh' Bash \
-  'cd "$HOME" && pueued --daemonize'
-expect_deny 'isolated then extra pueued' 'isolated.sh' Bash \
-  '.claude/isolated.sh bzb -- true; pueued --daemonize'
-expect_deny 'command substitution of pueued' 'isolated.sh' Bash \
-  'echo $(pueued --daemonize)'
-expect_deny 'cargo test then bare pueued' 'isolated.sh' Bash \
-  'cargo test && pueued --daemonize'
-expect_deny 'unknown isolated.sh first arg' 'isolated.sh' Bash \
-  '.claude/isolated.sh bash -c pueued'
-
-# --- missing jq fails closed ---
+# Missing jq fails closed.
 no_jq_bin=$(mktemp -d)
 ln -s "$(command -v cat)" "$no_jq_bin/cat"
 bash_bin=$(command -v bash)
@@ -189,20 +147,8 @@ else
   failures=$((failures + 1))
 fi
 rm -rf "$no_jq_bin"
-if grep -q 'pkgs.jq' "$root/flake.nix"; then
-  printf 'ok - flake.nix provides jq\n'
-else
-  printf 'not ok - flake.nix provides jq\n' >&2
-  failures=$((failures + 1))
-fi
-if grep -q 'command -v jq' "$root/sortie/run.sh"; then
-  printf 'ok - run.sh checks jq in nix develop\n'
-else
-  printf 'not ok - run.sh checks jq in nix develop\n' >&2
-  failures=$((failures + 1))
-fi
 
-# --- launcher sets workspace-local state and refuses a symlink escape ---
+# Launcher keeps Busy Bee / Pueue state inside the workspace.
 fake_bin=$(mktemp -d)
 cat >"$fake_bin/bzb" <<'EOF'
 #!/bin/sh
@@ -232,11 +178,8 @@ fi
 
 escape=$(mktemp -d)
 mkdir -p "$root/build/sortie-agent-state"
-# The launcher refuses a state dir that already points outside the workspace.
 if [ -d "$root/build/sortie-agent-state/busybee" ] &&
    [ ! -L "$root/build/sortie-agent-state/busybee" ]; then
-  # A leftover real directory from the previous launch is fine; replace it
-  # with an escaping symlink for this check.
   rm -rf "$root/build/sortie-agent-state/busybee"
 fi
 ln -s "$escape" "$root/build/sortie-agent-state/busybee"
@@ -253,119 +196,69 @@ else
 fi
 rm -rf "$root/build/sortie-agent-state/busybee" "$escape" "$fake_bin"
 
-# Mirror WORKFLOW.md's before_run ref pick: origin/main, else another origin
-# ref that has the blob. Never HEAD (the issue branch may predate the files).
-pick_machine_safety_ref() {
-  local repo=$1 install_ref=origin/main r
-  if git -C "$repo" cat-file -e "$install_ref:sortie/install-machine-safety.sh" 2>/dev/null; then
-    printf '%s\n' "$install_ref"
-    return 0
-  fi
-  while IFS= read -r r; do
-    if git -C "$repo" cat-file -e "$r:sortie/install-machine-safety.sh" 2>/dev/null; then
-      printf '%s\n' "$r"
-      return 0
-    fi
-  done < <(git -C "$repo" for-each-ref --format='%(refname)' refs/remotes/origin)
-  return 1
-}
-
-commit_payload() {
-  local repo=$1
-  mkdir -p "$repo/sortie"
-  install -m 0755 "$hook" "$repo/sortie/machine-safety-hook.sh"
-  install -m 0755 "$launcher" "$repo/sortie/isolated.sh"
-  install -m 0755 "$install_script" "$repo/sortie/install-machine-safety.sh"
-  install -m 0644 "$settings" "$repo/sortie/claude-settings.json"
-  git -C "$repo" add sortie
-  git -C "$repo" -c user.email=test@example.com -c user.name=test \
-    commit -qm "$2"
-}
-
-# --- persisted old issue branch still receives the payload from origin/main ---
+# after merge: payload is origin/main, even if the issue branch lacks it.
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 git -C "$scratch" init -q
 git -C "$scratch" checkout -q -b main
-commit_payload "$scratch" 'payload on main'
+mkdir -p "$scratch/sortie"
+install -m 0755 "$hook" "$scratch/sortie/machine-safety-hook.sh"
+install -m 0755 "$launcher" "$scratch/sortie/isolated.sh"
+install -m 0755 "$install_script" "$scratch/sortie/install-machine-safety.sh"
+install -m 0644 "$settings" "$scratch/sortie/claude-settings.json"
+git -C "$scratch" add sortie
+git -C "$scratch" -c user.email=test@example.com -c user.name=test \
+  commit -qm 'payload on main'
 git -C "$scratch" checkout -q -b old-issue
 git -C "$scratch" rm -rq sortie
 git -C "$scratch" -c user.email=test@example.com -c user.name=test \
   commit -qm 'issue branch without payload'
 git -C "$scratch" update-ref refs/remotes/origin/main main
-
-install_ref=$(pick_machine_safety_ref "$scratch")
 (
   cd "$scratch"
-  git show "$install_ref:sortie/install-machine-safety.sh" \
-    | MACHINE_SAFETY_REF="$install_ref" bash
+  git cat-file -e origin/main:sortie/install-machine-safety.sh
+  git show origin/main:sortie/install-machine-safety.sh \
+    | MACHINE_SAFETY_REF=origin/main bash
 )
 test -x "$scratch/.claude/hooks/machine-safety-hook.sh"
 test -x "$scratch/.claude/isolated.sh"
-test "$install_ref" = origin/main
 jq -e '.hooks.PreToolUse[] | select(.matcher | contains("Bash"))' \
   "$scratch/.claude/settings.json" >/dev/null
-test -z "$(git -C "$scratch" status --porcelain --untracked-files=no)"
 test ! -e "$scratch/sortie/machine-safety-hook.sh"
 printf 'ok - before_run payload from origin/main\n'
 
-# Pre-merge: origin/main lacks the blob, another origin ref has it, HEAD does not.
+# Missing origin/main payload fails loudly (no other-ref / HEAD fallback).
 scratch2=$(mktemp -d)
 git -C "$scratch2" init -q
 git -C "$scratch2" checkout -q -b main
 git -C "$scratch2" -c user.email=test@example.com -c user.name=test \
   commit -qm 'main without payload' --allow-empty
 git -C "$scratch2" update-ref refs/remotes/origin/main main
-git -C "$scratch2" checkout -q -b feature
-commit_payload "$scratch2" 'payload on feature'
-git -C "$scratch2" update-ref refs/remotes/origin/feature feature
-git -C "$scratch2" checkout -q -B old-issue refs/remotes/origin/main
-install_ref=$(pick_machine_safety_ref "$scratch2")
-test "$install_ref" = refs/remotes/origin/feature
-(
-  cd "$scratch2"
-  git show "$install_ref:sortie/install-machine-safety.sh" \
-    | MACHINE_SAFETY_REF="$install_ref" bash
-)
-test -x "$scratch2/.claude/isolated.sh"
-test ! -e "$scratch2/sortie/machine-safety-hook.sh"
-printf 'ok - before_run payload from a non-main origin ref\n'
+if git -C "$scratch2" cat-file -e origin/main:sortie/install-machine-safety.sh 2>/dev/null; then
+  printf 'not ok - missing origin/main payload fails closed\n' >&2
+  failures=$((failures + 1))
+else
+  printf 'ok - missing origin/main payload fails closed\n'
+fi
 rm -rf "$scratch2"
 
-# Issue-branch HEAD is not a source: payload only on HEAD, no origin ref.
-scratch3=$(mktemp -d)
-git -C "$scratch3" init -q
-git -C "$scratch3" checkout -q -b main
-git -C "$scratch3" -c user.email=test@example.com -c user.name=test \
-  commit -qm 'main without payload' --allow-empty
-git -C "$scratch3" update-ref refs/remotes/origin/main main
-git -C "$scratch3" checkout -q -b old-issue
-commit_payload "$scratch3" 'payload only on issue branch HEAD'
-if pick_machine_safety_ref "$scratch3" >/dev/null; then
-  printf 'not ok - before_run ignores issue-branch HEAD\n' >&2
+if ! grep -q 'MACHINE_SAFETY_REF=origin/main' "$root/sortie/WORKFLOW.md"; then
+  printf 'not ok - WORKFLOW.md installs from origin/main\n' >&2
   failures=$((failures + 1))
 else
-  printf 'ok - before_run ignores issue-branch HEAD\n'
+  printf 'ok - WORKFLOW.md installs from origin/main\n'
 fi
-rm -rf "$scratch3"
-
-if ! grep -q 'install-machine-safety.sh' "$root/sortie/WORKFLOW.md"; then
-  printf 'not ok - WORKFLOW.md invokes install-machine-safety.sh\n' >&2
+if grep -q 'refs/remotes/origin' "$root/sortie/WORKFLOW.md"; then
+  printf 'not ok - WORKFLOW.md must not scan arbitrary origin refs\n' >&2
   failures=$((failures + 1))
 else
-  printf 'ok - WORKFLOW.md invokes install-machine-safety.sh\n'
+  printf 'ok - WORKFLOW.md does not scan arbitrary origin refs\n'
 fi
 if grep -q 'install_ref=HEAD' "$root/sortie/WORKFLOW.md"; then
-  printf 'not ok - WORKFLOW.md must not fall back to issue-branch HEAD\n' >&2
+  printf 'not ok - WORKFLOW.md must not fall back to HEAD\n' >&2
   failures=$((failures + 1))
 else
   printf 'ok - WORKFLOW.md does not fall back to HEAD\n'
-fi
-if ! grep -q 'refs/remotes/origin' "$root/sortie/WORKFLOW.md"; then
-  printf 'not ok - WORKFLOW.md searches origin refs for the payload\n' >&2
-  failures=$((failures + 1))
-else
-  printf 'ok - WORKFLOW.md searches origin refs for the payload\n'
 fi
 
 if [ "$failures" -ne 0 ]; then

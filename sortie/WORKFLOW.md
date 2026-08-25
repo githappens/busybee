@@ -45,28 +45,14 @@ hooks:
     fi
     # Install the machine-safety payload into the otherwise disposable
     # workspace. Runtime copies stay out of `git add -A`; sources live in
-    # sortie/. Payload comes from origin/main so a persisted issue branch
-    # that predates these files still receives them. If main does not have
-    # the blob yet (pre-merge), use another origin ref that does — never
-    # the already-checked-out issue branch HEAD.
-    install_ref=origin/main
-    if ! git cat-file -e "$install_ref:sortie/install-machine-safety.sh" 2>/dev/null; then
-      git fetch -q origin '+refs/heads/*:refs/remotes/origin/*'
-      install_ref=
-      while IFS= read -r r; do
-        if git cat-file -e "$r:sortie/install-machine-safety.sh" 2>/dev/null; then
-          install_ref=$r
-          break
-        fi
-      done < <(git for-each-ref --format='%(refname)' refs/remotes/origin)
-      if [ -z "$install_ref" ]; then
-        echo "sortie: machine-safety payload not found on any origin ref" >&2
-        exit 1
-      fi
-      printf 'sortie: machine-safety payload missing on origin/main; using %s\n' "$install_ref" >&2
+    # sortie/. After merge the trusted blob is origin/main; if it is missing,
+    # fail rather than searching other refs or the issue-branch HEAD.
+    if ! git cat-file -e origin/main:sortie/install-machine-safety.sh 2>/dev/null; then
+      echo "sortie: machine-safety payload missing on origin/main" >&2
+      exit 1
     fi
-    git show "$install_ref:sortie/install-machine-safety.sh" \
-      | MACHINE_SAFETY_REF="$install_ref" bash
+    git show origin/main:sortie/install-machine-safety.sh \
+      | MACHINE_SAFETY_REF=origin/main bash
     # Per-issue model override: a `model:<name>` label (e.g. model:fable)
     # becomes .sortie/model, read by sortie/agent.sh. No label = default model.
     mkdir -p .sortie
