@@ -174,6 +174,14 @@ expect_deny 'cd bzbd crate then targetless cargo r' \
 expect_deny 'targetless cargo run' \
   'could not classify a pueued/bzbd launch' Bash \
   'cargo run -- --foreground'
+# Nested launches in readers: do not interpret substitutions; fail closed.
+# shellcheck disable=SC2016
+expect_deny 'command substitution nested pueued' \
+  'could not classify a pueued/bzbd launch' Bash \
+  'echo "$(pueued --daemonize)"'
+expect_deny 'process substitution nested pueued' \
+  'could not classify a pueued/bzbd launch' Bash \
+  'cat <(pueued --daemonize)'
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \

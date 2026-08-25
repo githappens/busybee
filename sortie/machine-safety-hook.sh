@@ -423,6 +423,12 @@ segment_mentions_daemon() {
   [[ $1 =~ (^|[^[:alnum:]_])(pueued|bzbd)([^[:alnum:]_]|$) ]]
 }
 
+# Command / process / backtick substitution can launch a nested daemon.
+# Do not parse the nested shell; fail closed when a daemon is mentioned.
+segment_has_substitution() {
+  [[ $1 == *'$('* || $1 == *'<('* || $1 == *'>('* || $1 == *'`'* ]]
+}
+
 # argv0 is a command that can mention pueued/bzbd without launching it
 # (test names, log grep). cargo is handled separately: cargo run can launch.
 known_non_launch() {
@@ -656,6 +662,9 @@ case "$tool" in
           fi
           ;;
       esac
+      if segment_mentions_daemon "$seg" && segment_has_substitution "$seg"; then
+        deny "could not classify a pueued/bzbd launch; refusing"
+      fi
       if [ "$base" = cargo ]; then
         case "$(cargo_run_daemon_target "$rest_args")" in
           bzbd)
