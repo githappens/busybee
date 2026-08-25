@@ -190,6 +190,11 @@ expect_deny 'unisolated busybee client' 'workspace-local BUSYBEE_STATE_DIR' Bash
   'busybee -- cargo test --workspace'
 expect_deny 'cargo run -p bzb unisolated' 'workspace-local BUSYBEE_STATE_DIR' Bash \
   'cargo run -p bzb -- --help'
+expect_deny 'cargo run --bin busybee unisolated' 'workspace-local BUSYBEE_STATE_DIR' Bash \
+  'cargo run --bin busybee -- -- cmake --build build'
+expect_deny 'cd bzb crate then cargo run --bin busybee' \
+  'workspace-local BUSYBEE_STATE_DIR' Bash \
+  'cd crates/bzb && cargo run --bin busybee -- -- cmake --build build'
 expect_deny 'unisolated pueue clean' 'workspace-local PUEUE_CONFIG_PATH' Bash \
   'pueue clean'
 expect_deny 'unisolated pueue group remove' 'workspace-local PUEUE_CONFIG_PATH' Bash \
@@ -209,6 +214,12 @@ expect_allow 'cargo test without the busybee client' Bash 'cargo test --workspac
 # shellcheck disable=SC2016
 expect_allow 'cargo run of the CLI package isolated' Bash \
   'BUSYBEE_STATE_DIR=$PWD/build/test/state PUEUE_CONFIG_PATH=$PWD/build/test/pueue cargo run -p bzb -- --help'
+# shellcheck disable=SC2016
+expect_allow 'cargo run --bin busybee isolated' Bash \
+  'BUSYBEE_STATE_DIR=$PWD/build/test/state PUEUE_CONFIG_PATH=$PWD/build/test/pueue cargo run --bin busybee -- -- cmake --build build'
+# shellcheck disable=SC2016
+expect_allow 'cd bzb crate then cargo run --bin busybee isolated' Bash \
+  'cd crates/bzb && BUSYBEE_STATE_DIR=$CLAUDE_PROJECT_DIR/build/test/state PUEUE_CONFIG_PATH=$CLAUDE_PROJECT_DIR/build/test/pueue cargo run --bin busybee -- -- cmake --build build'
 expect_allow 'test-fixture name as an argument' Bash \
   'cargo test -p bzb-test-support pueued'
 # shellcheck disable=SC2016

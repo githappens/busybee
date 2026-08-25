@@ -487,6 +487,11 @@ cargo_run_daemon_target() {
     printf 'bzb'
     return 0
   fi
+  if [[ $args =~ (^|[[:space:]])(-p|--package|--bin)[[:space:]]+busybee([[:space:]]|$) ]] \
+    || [[ $args =~ --(package|bin)=busybee([[:space:]]|$) ]]; then
+    printf 'bzb'
+    return 0
+  fi
   if [[ $args =~ (^|[[:space:]])(-p|--package|--bin)[[:space:]]+pueued([[:space:]]|$) ]] \
     || [[ $args =~ --(package|bin)=pueued([[:space:]]|$) ]]; then
     printf 'pueued'
