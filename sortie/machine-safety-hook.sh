@@ -38,10 +38,6 @@ fi
 
 STATEFUL_MSG='run Busy Bee/Pueue through .claude/isolated.sh (sets workspace-local BUSYBEE_STATE_DIR and PUEUE_CONFIG_PATH). Example: .claude/isolated.sh bzb -- xcodebuild ...'
 
-is_reader() {
-  [[ $1 =~ ^[[:space:]]*(cat|head|tail|less|more|ls|grep|egrep|fgrep|rg|wc|file|stat)[[:space:]] ]]
-}
-
 # Longer names first so "pueued" is not classified as "pueue" plus a trailing d.
 mentions_stateful() {
   [[ $1 =~ (^|[^[:alnum:]_.-])(busybee|bzbd|pueued|pueue|bzb)([^[:alnum:]_.-]|$) ]]
@@ -57,6 +53,15 @@ has_shell_operator() {
   return 1
 }
 
+# The whole command must be a reader: no list/pipe operators and no redirects.
+# A prefix match would let `cat /dev/null; pueued` through.
+is_reader() {
+  local c=$1
+  has_shell_operator "$c" && return 1
+  [[ $c == *'>'* || $c == *'<'* ]] && return 1
+  [[ $c =~ ^[[:space:]]*(cat|head|tail|less|more|ls|grep|egrep|fgrep|rg|wc|file|stat)[[:space:]] ]]
+}
+
 is_workspace_isolated_script() {
   local p=$1
   p=${p#\"}
@@ -70,16 +75,10 @@ is_workspace_isolated_script() {
     .claude/isolated.sh|./.claude/isolated.sh)
       return 0
       ;;
-    sortie/isolated.sh|./sortie/isolated.sh)
-      return 0
-      ;;
     \$CLAUDE_PROJECT_DIR/.claude/isolated.sh|\$\{CLAUDE_PROJECT_DIR\}/.claude/isolated.sh)
       return 0
       ;;
-    \$CLAUDE_PROJECT_DIR/sortie/isolated.sh|\$\{CLAUDE_PROJECT_DIR\}/sortie/isolated.sh)
-      return 0
-      ;;
-    "$project_dir"/.claude/isolated.sh|"$project_dir"/sortie/isolated.sh)
+    "$project_dir"/.claude/isolated.sh)
       return 0
       ;;
     *)

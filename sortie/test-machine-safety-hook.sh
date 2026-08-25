@@ -60,7 +60,7 @@ expect_allow 'quoted project-dir isolated bzb' Bash \
   '"$CLAUDE_PROJECT_DIR/.claude/isolated.sh" bzb -- xcodebuild -project App.xcodeproj'
 expect_allow 'nix develop -c isolated busybee' Bash \
   'nix develop -c .claude/isolated.sh busybee -- cargo test --workspace'
-expect_allow 'sortie-tree isolated.sh' Bash \
+expect_deny 'tracked sortie/isolated.sh is not the runtime launcher' 'isolated.sh' Bash \
   'sortie/isolated.sh bzb -- cmake --build build'
 
 # --- unisolated stateful launches denied ---
@@ -110,6 +110,14 @@ expect_deny 'python write to cargo config' 'do not edit .cargo/config.toml' Bash
   'python -c '"'"'open(".cargo/config.toml", "w").write("x")'"'"''
 expect_allow 'read cargo config' Bash 'cat .cargo/config.toml'
 expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"
+
+# A reader prefix does not authorize later launches, redirects, or deletes.
+expect_deny 'reader then pueued' 'isolated.sh' Bash \
+  'cat /dev/null; pueued --daemonize'
+expect_deny 'reader redirect to cargo config' 'do not edit .cargo/config.toml' Bash \
+  'cat Cargo.toml > .cargo/config.toml'
+expect_deny 'reader then rm .claude' 'do not modify the machine-safety hook' Bash \
+  'rg x /dev/null; rm -rf .claude'
 
 # --- runtime hook / settings / launcher ---
 expect_deny 'rm -rf .claude' 'do not modify the machine-safety hook' Bash \
@@ -245,30 +253,48 @@ else
 fi
 rm -rf "$root/build/sortie-agent-state/busybee" "$escape" "$fake_bin"
 
-# --- persisted old issue branch still receives the payload ---
+# Mirror WORKFLOW.md's before_run ref pick: origin/main, else another origin
+# ref that has the blob. Never HEAD (the issue branch may predate the files).
+pick_machine_safety_ref() {
+  local repo=$1 install_ref=origin/main r
+  if git -C "$repo" cat-file -e "$install_ref:sortie/install-machine-safety.sh" 2>/dev/null; then
+    printf '%s\n' "$install_ref"
+    return 0
+  fi
+  while IFS= read -r r; do
+    if git -C "$repo" cat-file -e "$r:sortie/install-machine-safety.sh" 2>/dev/null; then
+      printf '%s\n' "$r"
+      return 0
+    fi
+  done < <(git -C "$repo" for-each-ref --format='%(refname)' refs/remotes/origin)
+  return 1
+}
+
+commit_payload() {
+  local repo=$1
+  mkdir -p "$repo/sortie"
+  install -m 0755 "$hook" "$repo/sortie/machine-safety-hook.sh"
+  install -m 0755 "$launcher" "$repo/sortie/isolated.sh"
+  install -m 0755 "$install_script" "$repo/sortie/install-machine-safety.sh"
+  install -m 0644 "$settings" "$repo/sortie/claude-settings.json"
+  git -C "$repo" add sortie
+  git -C "$repo" -c user.email=test@example.com -c user.name=test \
+    commit -qm "$2"
+}
+
+# --- persisted old issue branch still receives the payload from origin/main ---
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 git -C "$scratch" init -q
 git -C "$scratch" checkout -q -b main
-mkdir -p "$scratch/sortie"
-install -m 0755 "$hook" "$scratch/sortie/machine-safety-hook.sh"
-install -m 0755 "$launcher" "$scratch/sortie/isolated.sh"
-install -m 0755 "$install_script" "$scratch/sortie/install-machine-safety.sh"
-install -m 0644 "$settings" "$scratch/sortie/claude-settings.json"
-git -C "$scratch" add sortie
-git -C "$scratch" -c user.email=test@example.com -c user.name=test \
-  commit -qm 'payload on main'
+commit_payload "$scratch" 'payload on main'
 git -C "$scratch" checkout -q -b old-issue
 git -C "$scratch" rm -rq sortie
 git -C "$scratch" -c user.email=test@example.com -c user.name=test \
   commit -qm 'issue branch without payload'
 git -C "$scratch" update-ref refs/remotes/origin/main main
 
-# Mirror WORKFLOW.md's before_run: load the installer from origin/main.
-install_ref=origin/main
-if ! git -C "$scratch" cat-file -e "$install_ref:sortie/install-machine-safety.sh" 2>/dev/null; then
-  install_ref=HEAD
-fi
+install_ref=$(pick_machine_safety_ref "$scratch")
 (
   cd "$scratch"
   git show "$install_ref:sortie/install-machine-safety.sh" \
@@ -283,11 +309,63 @@ test -z "$(git -C "$scratch" status --porcelain --untracked-files=no)"
 test ! -e "$scratch/sortie/machine-safety-hook.sh"
 printf 'ok - before_run payload from origin/main\n'
 
+# Pre-merge: origin/main lacks the blob, another origin ref has it, HEAD does not.
+scratch2=$(mktemp -d)
+git -C "$scratch2" init -q
+git -C "$scratch2" checkout -q -b main
+git -C "$scratch2" -c user.email=test@example.com -c user.name=test \
+  commit -qm 'main without payload' --allow-empty
+git -C "$scratch2" update-ref refs/remotes/origin/main main
+git -C "$scratch2" checkout -q -b feature
+commit_payload "$scratch2" 'payload on feature'
+git -C "$scratch2" update-ref refs/remotes/origin/feature feature
+git -C "$scratch2" checkout -q -B old-issue refs/remotes/origin/main
+install_ref=$(pick_machine_safety_ref "$scratch2")
+test "$install_ref" = refs/remotes/origin/feature
+(
+  cd "$scratch2"
+  git show "$install_ref:sortie/install-machine-safety.sh" \
+    | MACHINE_SAFETY_REF="$install_ref" bash
+)
+test -x "$scratch2/.claude/isolated.sh"
+test ! -e "$scratch2/sortie/machine-safety-hook.sh"
+printf 'ok - before_run payload from a non-main origin ref\n'
+rm -rf "$scratch2"
+
+# Issue-branch HEAD is not a source: payload only on HEAD, no origin ref.
+scratch3=$(mktemp -d)
+git -C "$scratch3" init -q
+git -C "$scratch3" checkout -q -b main
+git -C "$scratch3" -c user.email=test@example.com -c user.name=test \
+  commit -qm 'main without payload' --allow-empty
+git -C "$scratch3" update-ref refs/remotes/origin/main main
+git -C "$scratch3" checkout -q -b old-issue
+commit_payload "$scratch3" 'payload only on issue branch HEAD'
+if pick_machine_safety_ref "$scratch3" >/dev/null; then
+  printf 'not ok - before_run ignores issue-branch HEAD\n' >&2
+  failures=$((failures + 1))
+else
+  printf 'ok - before_run ignores issue-branch HEAD\n'
+fi
+rm -rf "$scratch3"
+
 if ! grep -q 'install-machine-safety.sh' "$root/sortie/WORKFLOW.md"; then
   printf 'not ok - WORKFLOW.md invokes install-machine-safety.sh\n' >&2
   failures=$((failures + 1))
 else
   printf 'ok - WORKFLOW.md invokes install-machine-safety.sh\n'
+fi
+if grep -q 'install_ref=HEAD' "$root/sortie/WORKFLOW.md"; then
+  printf 'not ok - WORKFLOW.md must not fall back to issue-branch HEAD\n' >&2
+  failures=$((failures + 1))
+else
+  printf 'ok - WORKFLOW.md does not fall back to HEAD\n'
+fi
+if ! grep -q 'refs/remotes/origin' "$root/sortie/WORKFLOW.md"; then
+  printf 'not ok - WORKFLOW.md searches origin refs for the payload\n' >&2
+  failures=$((failures + 1))
+else
+  printf 'ok - WORKFLOW.md searches origin refs for the payload\n'
 fi
 
 if [ "$failures" -ne 0 ]; then
