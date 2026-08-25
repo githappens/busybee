@@ -118,6 +118,11 @@ path_resolves_inside_workspace() {
       fs=$project_dir/$value
       ;;
   esac
+  # An earlier ln in this tool call can create a symlink on a missing
+  # component after we return; do not treat missing paths as local.
+  if [ "${fs_uncertain:-0}" -eq 1 ] && [ ! -e "$fs" ]; then
+    return 1
+  fi
   path=$fs
   while [ ! -e "$path" ] && [ "$path" != / ]; do
     rest=$(dirname "$path")
@@ -695,6 +700,7 @@ case "$tool" in
     segments=()
     split_segments "$command" segments
     cwd_uncertain=0
+    fs_uncertain=0
     for seg in "${segments[@]}"; do
       peel_segment "$seg"
       base=$(daemon_basename "$argv0")
@@ -709,6 +715,9 @@ case "$tool" in
       case "$cwd_base" in
         cd|pushd|popd)
           cwd_uncertain=1
+          ;;
+        ln)
+          fs_uncertain=1
           ;;
         builtin)
           # Only cwd-changing builtins; do not unwrap builtin in general.
@@ -769,6 +778,9 @@ case "$tool" in
       case "$base" in
         cd|pushd|popd)
           cwd_uncertain=1
+          ;;
+        ln)
+          fs_uncertain=1
           ;;
         pueued|pueue)
           require_pueued_isolation

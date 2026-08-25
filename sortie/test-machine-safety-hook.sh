@@ -215,6 +215,9 @@ ln -sfn "$symlink_outside" "$root/build/hook-symlink-test/config"
 expect_deny 'symlink state path escapes workspace' 'workspace-local PUEUE_CONFIG_PATH' Bash \
   'PUEUE_CONFIG_PATH=build/hook-symlink-test/config/pueue pueue clean'
 rm -rf "$root/build/hook-symlink-test" "$symlink_outside"
+# shellcheck disable=SC2016
+expect_deny 'ln then relative state path' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'ln -s "$HOME/.config" build/hook-link; PUEUE_CONFIG_PATH=build/hook-link/pueue pueue clean'
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \
