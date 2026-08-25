@@ -79,6 +79,20 @@ expect_deny 'env -i unisolated pueued' 'workspace-local PUEUE_CONFIG_PATH' Bash 
   'env -i pueued --daemonize'
 expect_deny 'env -u clears isolation' 'workspace-local PUEUE_CONFIG_PATH' Bash \
   'env -u PUEUE_CONFIG_PATH pueued --daemonize'
+# Leading assignments must not survive env -u / -i / --unset / --ignore-environment.
+expect_deny 'assignment then env -u PUEUE_CONFIG_PATH' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'PUEUE_CONFIG_PATH=build/test env -u PUEUE_CONFIG_PATH pueued --daemonize'
+expect_deny 'assignment then env -i' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'PUEUE_CONFIG_PATH=build/test env -i pueued --daemonize'
+expect_deny 'assignment then env --unset=' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'PUEUE_CONFIG_PATH=build/test env --unset=PUEUE_CONFIG_PATH pueued --daemonize'
+expect_deny 'assignment then env --ignore-environment' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'PUEUE_CONFIG_PATH=build/test env --ignore-environment pueued --daemonize'
+# shellcheck disable=SC2016
+expect_deny 'PWD-prefixed path traversal' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'PUEUE_CONFIG_PATH=$PWD/../../user-config pueued --daemonize'
+expect_deny 'project-prefixed path traversal' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  "PUEUE_CONFIG_PATH=$root/../user-config pueued --daemonize"
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \
@@ -102,6 +116,8 @@ expect_allow 'env -- with isolated pueued' Bash \
   'env -- PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
 expect_allow 'env -i with isolated pueued' Bash \
   'env -i PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
+expect_allow 'env -u then reassign isolated pueued' Bash \
+  'PUEUE_CONFIG_PATH=build/test env -u PUEUE_CONFIG_PATH PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
 expect_allow 'read cargo config' Bash 'cat .cargo/config.toml'
 expect_allow 'read runtime hook' Bash 'cat .claude/hooks/machine-safety-hook.sh'
 expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"

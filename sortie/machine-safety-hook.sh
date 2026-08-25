@@ -26,15 +26,19 @@ if ! tool=$(jq -er '.tool_name' <<<"$input"); then
 fi
 
 # True when $1 is a workspace-local path (relative, under $PWD / project_dir).
+# Reject `..` first so a project/`$PWD` prefix cannot smuggle a traversal.
 is_local_path() {
   local value=$1
   value=${value#\"}; value=${value%\"}
   value=${value#\'}; value=${value%\'}
   case "$value" in
+    *../*|*/..|..)
+      return 1
+      ;;
     "$project_dir"/*|\$PWD/*|\$\{PWD\}/*)
       return 0
       ;;
-    /*|~*|\$HOME*|\$\{HOME\}*|*../*|..)
+    /*|~*|\$HOME*|\$\{HOME\}*)
       return 1
       ;;
     *)
@@ -127,11 +131,24 @@ peel_segment() {
     done
   }
 
+  # Drop NAME from peeled_env so later env -u / --unset actually unsets it.
+  strip_peeled_env() {
+    local name=$1 out='' line
+    [ -n "$peeled_env" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        ''|"$name"=*) continue ;;
+      esac
+      out+="$line"$'\n'
+    done <<<"$peeled_env"
+    peeled_env=$out
+  }
+
   # Consume env(1) options (-i, -u NAME, --unset=NAME, --, …) until the
   # operand command. Unknown dash-options leave peel_uncertain set so the
   # caller can fail closed when the segment still mentions a daemon.
   peel_env_options() {
-    local tok optarg
+    local tok optarg name
     while :; do
       rest=${rest##+([[:space:]])}
       [ -n "$rest" ] || return 0
@@ -152,7 +169,11 @@ peel_segment() {
       tok=${BASH_REMATCH[1]}
       optarg=${BASH_REMATCH[3]-}
       case "$tok" in
-        -i|--ignore-environment|-0|--null|-v|--version|-h|--help)
+        -i|--ignore-environment)
+          peeled_env=
+          rest=$optarg
+          ;;
+        -0|--null|-v|--version|-h|--help)
           rest=$optarg
           ;;
         -u|--unset)
@@ -161,9 +182,16 @@ peel_segment() {
             peel_uncertain=1
             return 0
           fi
+          strip_peeled_env "${BASH_REMATCH[1]}"
           rest=${BASH_REMATCH[3]-}
           ;;
         --unset=*)
+          name=${tok#--unset=}
+          if [ -z "$name" ]; then
+            peel_uncertain=1
+            return 0
+          fi
+          strip_peeled_env "$name"
           rest=$optarg
           ;;
         -C|--chdir)
