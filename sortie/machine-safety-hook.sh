@@ -597,6 +597,38 @@ find_has_delete() {
   [[ $1 =~ (^|[[:space:]\"\'])-delete([[:space:]\"\']|$) ]]
 }
 
+# Operand of cmake -E. Empty when -E is absent or has no command.
+cmake_e_command() {
+  local args=${1##+([[:space:]])} tok
+  while [ -n "$args" ]; do
+    tok=${args%%[[:space:]]*}
+    args=${args#"$tok"}
+    args=${args##+([[:space:]])}
+    if [ "$tok" = -E ]; then
+      tok=${args%%[[:space:]]*}
+      [ -n "$tok" ] || return 0
+      unquote_token "$tok"
+      return 0
+    fi
+  done
+}
+
+# cmake -E create_symlink/rm/copy mutate the tree. Fail closed on any -E
+# command that is not a known reader; do not evaluate cmake paths.
+cmake_e_mutates_fs() {
+  local cmd
+  [[ $1 =~ (^|[[:space:]])-E([[:space:]]|$) ]] || return 1
+  cmd=$(cmake_e_command "$1")
+  case "$cmd" in
+    echo|echo_append|cat|true|false|sleep|capabilities|compare_files|md5sum|sha1sum|sha224sum|sha256sum|sha384sum|sha512sum)
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
 require_pueued_isolation() {
   if ! state_path_is_local PUEUE_CONFIG_PATH; then
     deny "launch pueued only with a workspace-local PUEUE_CONFIG_PATH"
@@ -725,6 +757,11 @@ case "$tool" in
         ln|rm|mv|rmdir|unlink)
           fs_uncertain=1
           ;;
+        cmake)
+          if cmake_e_mutates_fs "$rest_args"; then
+            fs_uncertain=1
+          fi
+          ;;
         builtin)
           # Only cwd-changing builtins; do not unwrap builtin in general.
           case "$(daemon_basename "${rest_args%%[[:space:]]*}")" in
@@ -745,6 +782,11 @@ case "$tool" in
           ;;
         find)
           if claude_runtime_dir_in "$rest_args" || find_has_delete "$rest_args"; then
+            deny "do not modify the machine-safety hook or its settings"
+          fi
+          ;;
+        cmake)
+          if cmake_e_mutates_fs "$rest_args" && claude_runtime_dir_in "$rest_args"; then
             deny "do not modify the machine-safety hook or its settings"
           fi
           ;;
@@ -792,6 +834,11 @@ case "$tool" in
           ;;
         ln|rm|mv|rmdir|unlink)
           fs_uncertain=1
+          ;;
+        cmake)
+          if cmake_e_mutates_fs "$rest_args"; then
+            fs_uncertain=1
+          fi
           ;;
         pueued|pueue)
           require_pueued_isolation

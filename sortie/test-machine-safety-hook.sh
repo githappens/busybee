@@ -242,6 +242,16 @@ mkdir -p "$root/build/review-local-state/config/pueue"
 expect_deny 'rm ln then existing state path' 'workspace-local PUEUE_CONFIG_PATH' Bash \
   'rm -rf build/review-local-state/config; ln -s "$HOME/.config" build/review-local-state/config; PUEUE_CONFIG_PATH=build/review-local-state/config/pueue pueue clean'
 rm -rf "$root/build/review-local-state"
+# shellcheck disable=SC2016
+expect_deny 'cmake -E create_symlink then relative bzb state' \
+  'workspace-local BUSYBEE_STATE_DIR' Bash \
+  'cmake -E create_symlink "$HOME" build/home && BUSYBEE_STATE_DIR=build/home/.local/state/busybee PUEUE_CONFIG_PATH=build/home/.config/pueue bzb -- cmake --build build'
+expect_deny 'cmake -E remove_directory .claude' \
+  'do not modify the machine-safety hook' Bash \
+  'cmake -E remove_directory .claude'
+expect_deny 'cmake -E rm -rf .claude' \
+  'do not modify the machine-safety hook' Bash \
+  'cmake -E rm -rf .claude'
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \
