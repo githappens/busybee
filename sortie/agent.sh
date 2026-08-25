@@ -5,6 +5,10 @@
 # without it the default below applies.
 set -euo pipefail
 DEFAULT_MODEL=opus
+if ! command -v jq >/dev/null 2>&1; then
+  echo "sortie/agent.sh: jq is required by the machine-safety hook" >&2
+  exit 1
+fi
 model="$DEFAULT_MODEL"
 if [ -s .sortie/model ]; then
   model="$(tr -d '[:space:]' < .sortie/model)"

@@ -43,6 +43,16 @@ hooks:
     else
       git checkout -q -B "$b" origin/main
     fi
+    # Install the machine-safety payload into the otherwise disposable
+    # workspace. Runtime copies stay out of `git add -A`; sources live in
+    # sortie/. After merge the trusted blob is origin/main; if it is missing,
+    # fail rather than searching other refs or the issue-branch HEAD.
+    if ! git cat-file -e origin/main:sortie/install-machine-safety.sh 2>/dev/null; then
+      echo "sortie: machine-safety payload missing on origin/main" >&2
+      exit 1
+    fi
+    git show origin/main:sortie/install-machine-safety.sh \
+      | MACHINE_SAFETY_REF=origin/main bash
     # Per-issue model override: a `model:<name>` label (e.g. model:fable)
     # becomes .sortie/model, read by sortie/agent.sh. No label = default model.
     mkdir -p .sortie
@@ -176,14 +186,17 @@ Blocked-by issues (all must already be merged on `main`): {{ range $i, $b := .is
    with your change, assume the code is wrong until proven otherwise.
 5. **No silent fallbacks.** Errors propagate with context; degraded paths must be
    loud. Do not add `unwrap_or_default`-style masking to make something pass.
-6. **Build and test through the dev shell and busybee:**
-   `busybee -- cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
-   `cargo fmt --all`. Cargo output goes to `build/`; do not change `.cargo/config.toml`.
-   Never install or replace the machine's global `busybee`/`bzbd`/`pueued`; test via
-   cargo-built binaries only.
-7. **Isolation.** Integration tests must spawn their own `pueued`/`bzbd` in a
-   temporary state dir (see `crates/bzb/tests/common/pueued.rs`), never the user's
-   instance.
+6. **Build and test through the dev shell.** `cargo test --workspace`,
+   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all`
+   are allowed as-is. Wrap Busy Bee / Pueue in `.claude/isolated.sh` so they
+   cannot see the user's daemons: `.claude/isolated.sh busybee -- cargo test --workspace`,
+   `.claude/isolated.sh bzb -- xcodebuild ...`, `.claude/isolated.sh bzb -- cmake --build ...`.
+   Cargo output goes to `build/`; do not change `.cargo/config.toml`. Never
+   install or replace the machine's global `busybee`/`bzb`/`bzbd`/`pueued`.
+7. **Isolation.** Integration tests spawn their own `pueued`/`bzbd` in a temp
+   dir. Direct `bzb`/`busybee`/`bzbd`/`pueued`/`pueue` Bash is denied; use
+   `.claude/isolated.sh`. The PreToolUse hook is a guard for cooperative
+   agents, not a same-UID sandbox.
 8. **Public repo hygiene.** Everything you write — code, comments, tests,
    fixtures, commit messages, PR text — is public. Use generic examples only: no
    machine names, user names, local paths, or references to other projects.
