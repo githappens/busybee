@@ -300,7 +300,7 @@ peel_segment() {
   peel_assignments
   rest=${rest##+([[:space:]])}
   if [[ $rest =~ $argv_re ]]; then
-    argv0=${BASH_REMATCH[1]}
+    argv0=$(unquote_token "${BASH_REMATCH[1]}")
     rest_args=${BASH_REMATCH[3]-}
   else
     argv0=
@@ -368,10 +368,38 @@ state_path_is_local() {
   is_local_path "$value"
 }
 
+unquote_token() {
+  local s=$1
+  case "$s" in
+    \"*\") s=${s#\"}; s=${s%\"} ;;
+    \'*\') s=${s#\'}; s=${s%\'} ;;
+  esac
+  printf '%s\n' "$s"
+}
+
 daemon_basename() {
-  local name=${1##*/}
+  local name
+  name=$(unquote_token "$1")
+  name=${name##*/}
   name=${name#./}
+  name=$(unquote_token "$name")
   printf '%s\n' "$name"
+}
+
+segment_mentions_daemon() {
+  [[ $1 =~ (^|[^[:alnum:]_])(pueued|bzbd)([^[:alnum:]_]|$) ]]
+}
+
+# True when argv0 looks like a daemon name the parser failed to isolate
+# (leftover quotes, prefixes) rather than an exact pueued/bzbd basename.
+garbled_daemon_basename() {
+  local base=$1
+  case "$base" in
+    pueued|bzbd)
+      return 1
+      ;;
+  esac
+  [[ $base == *pueued* || $base == *bzbd* ]]
 }
 
 is_runtime_hook_path() {
@@ -470,11 +498,13 @@ case "$tool" in
     cwd_uncertain=0
     for seg in "${segments[@]}"; do
       peel_segment "$seg"
-      if [ "$peel_uncertain" -eq 1 ] && [[ $seg =~ (^|[^[:alnum:]_])(pueued|bzbd)([^[:alnum:]_]|$) ]]; then
-        deny "could not parse env options around a pueued/bzbd launch; refusing"
+      base=$(daemon_basename "$argv0")
+      if segment_mentions_daemon "$seg"; then
+        if [ "$peel_uncertain" -eq 1 ] || [ -z "$argv0" ] || garbled_daemon_basename "$base"; then
+          deny "could not classify a pueued/bzbd launch; refusing"
+        fi
       fi
       [ -n "$argv0" ] || continue
-      base=$(daemon_basename "$argv0")
       case "$base" in
         cd|pushd|popd)
           cwd_uncertain=1
@@ -487,6 +517,9 @@ case "$tool" in
         bzbd)
           if ! state_path_is_local BUSYBEE_STATE_DIR; then
             deny "launch bzbd only with a workspace-local BUSYBEE_STATE_DIR"
+          fi
+          if ! state_path_is_local PUEUE_CONFIG_PATH; then
+            deny "launch bzbd only with a workspace-local PUEUE_CONFIG_PATH"
           fi
           ;;
       esac

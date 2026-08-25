@@ -60,6 +60,12 @@ expect_deny 'similarly named pueued variable' 'workspace-local PUEUE_CONFIG_PATH
   'NOT_PUEUE_CONFIG_PATH=build/test pueued --daemonize'
 expect_deny 'unisolated bzbd' 'workspace-local BUSYBEE_STATE_DIR' Bash \
   './build/debug/bzbd'
+# shellcheck disable=SC2016
+expect_deny 'bzbd without PUEUE_CONFIG_PATH' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'BUSYBEE_STATE_DIR=$CLAUDE_PROJECT_DIR/build/test/state ./build/debug/bzbd'
+# shellcheck disable=SC2016
+expect_deny 'quoted unisolated bzbd' 'workspace-local BUSYBEE_STATE_DIR' Bash \
+  '"$CLAUDE_PROJECT_DIR/build/debug/bzbd" --foreground'
 expect_deny 'Edit of cargo config' 'do not edit .cargo/config.toml' Edit \
   "$root/.cargo/config.toml"
 expect_deny 'Bash write to cargo config' 'do not edit .cargo/config.toml' Bash \
@@ -136,7 +142,10 @@ expect_allow 'isolated pueued' Bash \
   'PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
 # shellcheck disable=SC2016
 expect_allow 'isolated bzbd' Bash \
-  'BUSYBEE_STATE_DIR=$PWD/build/test/state ./build/debug/bzbd'
+  'BUSYBEE_STATE_DIR=$PWD/build/test/state PUEUE_CONFIG_PATH=$PWD/build/test/pueue ./build/debug/bzbd'
+# shellcheck disable=SC2016
+expect_allow 'quoted isolated bzbd' Bash \
+  'BUSYBEE_STATE_DIR=$CLAUDE_PROJECT_DIR/build/test/state PUEUE_CONFIG_PATH=$CLAUDE_PROJECT_DIR/build/test/pueue "$CLAUDE_PROJECT_DIR/build/debug/bzbd" --foreground'
 expect_allow 'isolated pueued under nix develop -c' Bash \
   'nix develop -c env PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
 expect_allow 'env -- with isolated pueued' Bash \
