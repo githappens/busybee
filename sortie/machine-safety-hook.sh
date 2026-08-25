@@ -102,7 +102,8 @@ split_segments() {
 
 # Peel leading VAR=val assignments and unwrap supported wrappers from one
 # segment. Sets: peeled_env (name=value lines), argv0, rest_args,
-# peel_uncertain (1 when an env option could not be parsed confidently).
+# peeled_chdir (env -C/--chdir operand), peel_uncertain (1 when an env
+# option could not be parsed confidently).
 peel_segment() {
   local seg=$1
   local rest=${seg##+([[:space:]])}
@@ -111,6 +112,7 @@ peel_segment() {
   argv0=
   rest_args=
   peel_uncertain=0
+  peeled_chdir=
 
   # Keep unwrapping env / nix develop -c / busybee -- / command until the
   # argv0 is the real program.
@@ -125,9 +127,14 @@ peel_segment() {
   token_re='^([^[:space:]]+)([[:space:]]+(.*))?$'
 
   peel_assignments() {
+    local n v after
     while [[ $rest =~ $assign_re ]]; do
-      peeled_env+="${BASH_REMATCH[1]}=${BASH_REMATCH[3]:-${BASH_REMATCH[4]:-${BASH_REMATCH[2]}}}"$'\n'
-      rest=${BASH_REMATCH[5]}
+      n=${BASH_REMATCH[1]}
+      v=${BASH_REMATCH[3]:-${BASH_REMATCH[4]:-${BASH_REMATCH[2]}}}
+      after=${BASH_REMATCH[5]}
+      strip_peeled_env "$n"
+      peeled_env+="$n=$v"$'\n'
+      rest=$after
     done
   }
 
@@ -200,9 +207,15 @@ peel_segment() {
             peel_uncertain=1
             return 0
           fi
+          peeled_chdir=${BASH_REMATCH[1]}
           rest=${BASH_REMATCH[3]-}
           ;;
         --chdir=*)
+          peeled_chdir=${tok#--chdir=}
+          if [ -z "$peeled_chdir" ]; then
+            peel_uncertain=1
+            return 0
+          fi
           rest=$optarg
           ;;
         -*)
@@ -265,16 +278,51 @@ peel_segment() {
 }
 
 env_value_for() {
-  local name=$1 line
-  while IFS= read -r line; do
+  local name=$1 line value=
+  local found=0
+  while IFS= read -r line || [ -n "$line" ]; do
     case "$line" in
       "$name"=*)
-        printf '%s\n' "${line#*=}"
-        return 0
+        value=${line#*=}
+        found=1
         ;;
     esac
   done <<<"$peeled_env"
-  return 1
+  [ "$found" -eq 1 ] || return 1
+  printf '%s\n' "$value"
+}
+
+# Join a relative state path with env --chdir so is_local_path sees the
+# directory the daemon will actually use. Absolute / $PWD / $HOME values
+# are independent of cwd and are returned unchanged.
+resolve_against_chdir() {
+  local dir=$1 value=$2
+  dir=${dir#\"}; dir=${dir%\"}
+  dir=${dir#\'}; dir=${dir%\'}
+  value=${value#\"}; value=${value%\"}
+  value=${value#\'}; value=${value%\'}
+  [ -n "$dir" ] || { printf '%s\n' "$value"; return 0; }
+  case "$value" in
+    "$project_dir"/*|\$PWD/*|\$\{PWD\}/*|/*|~*|\$HOME*|\$\{HOME\}*)
+      printf '%s\n' "$value"
+      ;;
+    *)
+      printf '%s/%s\n' "${dir%/}" "$value"
+      ;;
+  esac
+}
+
+# True when the named isolation variable is set to a workspace-local path
+# in this segment, after env -u/-i and after resolving against env --chdir.
+state_path_is_local() {
+  local value
+  if ! value=$(env_value_for "$1"); then
+    return 1
+  fi
+  if [ -n "$peeled_chdir" ]; then
+    value=$(resolve_against_chdir "$peeled_chdir" "$value")
+  fi
+  is_local_path "$value"
 }
 
 daemon_basename() {
@@ -385,12 +433,12 @@ case "$tool" in
       base=$(daemon_basename "$argv0")
       case "$base" in
         pueued)
-          if ! value=$(env_value_for PUEUE_CONFIG_PATH) || ! is_local_path "$value"; then
+          if ! state_path_is_local PUEUE_CONFIG_PATH; then
             deny "launch pueued only with a workspace-local PUEUE_CONFIG_PATH"
           fi
           ;;
         bzbd)
-          if ! value=$(env_value_for BUSYBEE_STATE_DIR) || ! is_local_path "$value"; then
+          if ! state_path_is_local BUSYBEE_STATE_DIR; then
             deny "launch bzbd only with a workspace-local BUSYBEE_STATE_DIR"
           fi
           ;;

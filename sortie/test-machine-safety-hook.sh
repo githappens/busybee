@@ -93,6 +93,18 @@ expect_deny 'PWD-prefixed path traversal' 'workspace-local PUEUE_CONFIG_PATH' Ba
   'PUEUE_CONFIG_PATH=$PWD/../../user-config pueued --daemonize'
 expect_deny 'project-prefixed path traversal' 'workspace-local PUEUE_CONFIG_PATH' Bash \
   "PUEUE_CONFIG_PATH=$root/../user-config pueued --daemonize"
+# shellcheck disable=SC2016
+expect_deny 'last duplicate assignment is the effective path' \
+  'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'PUEUE_CONFIG_PATH=build/test PUEUE_CONFIG_PATH="$HOME/.config/pueue" pueued --daemonize'
+# shellcheck disable=SC2016
+expect_deny 'env --chdir then relative config path' \
+  'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'env --chdir="$HOME" PUEUE_CONFIG_PATH=.config/pueue pueued --daemonize'
+# shellcheck disable=SC2016
+expect_deny 'env -C then relative config path' \
+  'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'env -C "$HOME" PUEUE_CONFIG_PATH=.config/pueue pueued --daemonize'
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \
@@ -118,6 +130,12 @@ expect_allow 'env -i with isolated pueued' Bash \
   'env -i PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
 expect_allow 'env -u then reassign isolated pueued' Bash \
   'PUEUE_CONFIG_PATH=build/test env -u PUEUE_CONFIG_PATH PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
+# shellcheck disable=SC2016
+expect_allow 'last duplicate assignment local' Bash \
+  'PUEUE_CONFIG_PATH="$HOME/.config/pueue" PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
+# shellcheck disable=SC2016
+expect_allow 'env --chdir with PWD-prefixed config' Bash \
+  'env --chdir="$HOME" PUEUE_CONFIG_PATH=$PWD/build/test/pueue pueued --daemonize'
 expect_allow 'read cargo config' Bash 'cat .cargo/config.toml'
 expect_allow 'read runtime hook' Bash 'cat .claude/hooks/machine-safety-hook.sh'
 expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"
