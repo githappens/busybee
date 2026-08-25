@@ -409,14 +409,67 @@ segment_mentions_daemon() {
 }
 
 # argv0 is a command that can mention pueued/bzbd without launching it
-# (test names, log grep). Anything else that mentions a daemon is denied.
+# (test names, log grep). cargo is handled separately: cargo run can launch.
 known_non_launch() {
   case "$1" in
-    cargo|command|true|false|echo|printf|cat|less|more|head|tail|wc|stat|file|ls|grep|egrep|fgrep|rg|bat|nl|od|hexdump|sha256sum|md5sum|cksum|diff|jq)
+    command|true|false|echo|printf|cat|less|more|head|tail|wc|stat|file|ls|grep|egrep|fgrep|rg|bat|nl|od|hexdump|sha256sum|md5sum|cksum|diff|jq)
       return 0
       ;;
   esac
   return 1
+}
+
+# Empty: not cargo run. bzbd/pueued: classified package/bin. unknown: cargo run
+# whose target we will not guess.
+cargo_run_daemon_target() {
+  local args=${1##+([[:space:]])}
+  if [[ $args =~ ^\+[^[:space:]]+[[:space:]]+(.*)$ ]]; then
+    args=${BASH_REMATCH[1]}
+  fi
+  [[ $args =~ ^run([[:space:]]|$) ]] || { printf ''; return 0; }
+  if [[ $args =~ (^|[[:space:]])(-p|--package|--bin)[[:space:]]+bzbd([[:space:]]|$) ]] \
+    || [[ $args =~ --(package|bin)=bzbd([[:space:]]|$) ]]; then
+    printf 'bzbd'
+    return 0
+  fi
+  if [[ $args =~ (^|[[:space:]])(-p|--package|--bin)[[:space:]]+pueued([[:space:]]|$) ]] \
+    || [[ $args =~ --(package|bin)=pueued([[:space:]]|$) ]]; then
+    printf 'pueued'
+    return 0
+  fi
+  printf 'unknown'
+}
+
+git_clean_removes_ignored() {
+  local args=$1 tok
+  [[ $args =~ (^|[[:space:]])clean([[:space:]]|$) ]] || return 1
+  # shellcheck disable=SC2086
+  for tok in $args; do
+    case "$tok" in
+      --*) continue ;;
+      -*[xX]*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+claude_runtime_dir_in() {
+  [[ $1 =~ (^|[[:space:]\"\'])(\./)?\.claude(/|[[:space:]\"\']|$) ]]
+}
+
+require_pueued_isolation() {
+  if ! state_path_is_local PUEUE_CONFIG_PATH; then
+    deny "launch pueued only with a workspace-local PUEUE_CONFIG_PATH"
+  fi
+}
+
+require_bzbd_isolation() {
+  if ! state_path_is_local BUSYBEE_STATE_DIR; then
+    deny "launch bzbd only with a workspace-local BUSYBEE_STATE_DIR"
+  fi
+  if ! state_path_is_local PUEUE_CONFIG_PATH; then
+    deny "launch bzbd only with a workspace-local PUEUE_CONFIG_PATH"
+  fi
 }
 
 is_runtime_hook_path() {
@@ -516,6 +569,32 @@ case "$tool" in
     for seg in "${segments[@]}"; do
       peel_segment "$seg"
       base=$(daemon_basename "$argv0")
+      if [ "$base" = git ] && git_clean_removes_ignored "$rest_args"; then
+        deny "do not modify the machine-safety hook or its settings"
+      fi
+      case "$base" in
+        rm|mv|rmdir|unlink)
+          if claude_runtime_dir_in "$rest_args"; then
+            deny "do not modify the machine-safety hook or its settings"
+          fi
+          ;;
+      esac
+      if [ "$base" = cargo ]; then
+        case "$(cargo_run_daemon_target "$rest_args")" in
+          bzbd)
+            require_bzbd_isolation
+            ;;
+          pueued)
+            require_pueued_isolation
+            ;;
+          unknown)
+            if segment_mentions_daemon "$seg"; then
+              deny "could not classify a pueued/bzbd launch; refusing"
+            fi
+            ;;
+        esac
+        continue
+      fi
       if segment_mentions_daemon "$seg"; then
         if [ "$peel_uncertain" -eq 1 ] || [ -z "$argv0" ]; then
           deny "could not classify a pueued/bzbd launch; refusing"
@@ -536,17 +615,10 @@ case "$tool" in
           cwd_uncertain=1
           ;;
         pueued)
-          if ! state_path_is_local PUEUE_CONFIG_PATH; then
-            deny "launch pueued only with a workspace-local PUEUE_CONFIG_PATH"
-          fi
+          require_pueued_isolation
           ;;
         bzbd)
-          if ! state_path_is_local BUSYBEE_STATE_DIR; then
-            deny "launch bzbd only with a workspace-local BUSYBEE_STATE_DIR"
-          fi
-          if ! state_path_is_local PUEUE_CONFIG_PATH; then
-            deny "launch bzbd only with a workspace-local PUEUE_CONFIG_PATH"
-          fi
+          require_bzbd_isolation
           ;;
       esac
     done

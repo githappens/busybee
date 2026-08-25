@@ -70,6 +70,18 @@ expect_deny 'exec unisolated pueued' 'workspace-local PUEUE_CONFIG_PATH' Bash \
   'exec pueued --daemonize'
 expect_deny 'command -p unisolated pueued' 'workspace-local PUEUE_CONFIG_PATH' Bash \
   'command -p pueued --daemonize'
+expect_deny 'cargo run -p bzbd unisolated' 'workspace-local BUSYBEE_STATE_DIR' Bash \
+  'cargo run -p bzbd -- --foreground'
+expect_deny 'cargo run -p pueued unisolated' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'cargo run -p pueued'
+expect_deny 'git clean -fdx' 'do not modify the machine-safety hook' Bash \
+  'git clean -fdx'
+expect_deny 'git clean -xfd' 'do not modify the machine-safety hook' Bash \
+  'git clean -xfd'
+expect_deny 'git clean separated -x' 'do not modify the machine-safety hook' Bash \
+  'git clean -f -d -x'
+expect_deny 'rm -rf .claude' 'do not modify the machine-safety hook' Bash \
+  'rm -rf .claude'
 expect_deny 'Edit of cargo config' 'do not edit .cargo/config.toml' Edit \
   "$root/.cargo/config.toml"
 expect_deny 'Bash write to cargo config' 'do not edit .cargo/config.toml' Bash \
@@ -142,6 +154,10 @@ expect_allow 'clippy command' Bash 'cargo clippy --workspace --all-targets -- -D
 expect_allow 'format command' Bash 'cargo fmt --all'
 expect_allow 'test-fixture name as an argument' Bash \
   'cargo test -p bzb-test-support pueued'
+# shellcheck disable=SC2016
+expect_allow 'cargo run -p bzbd isolated' Bash \
+  'BUSYBEE_STATE_DIR=$PWD/build/test/state PUEUE_CONFIG_PATH=$PWD/build/test/pueue cargo run -p bzbd -- --foreground'
+expect_allow 'git clean -fd' Bash 'git clean -fd'
 expect_allow 'isolated pueued' Bash \
   'PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
 # shellcheck disable=SC2016
