@@ -50,8 +50,18 @@ hooks:
     # adversarial sandbox.
     grep -qxF '/.claude/' .git/info/exclude || printf '/.claude/\n' >> .git/info/exclude
     mkdir -p .claude/hooks
-    install -m 0755 sortie/machine-safety-hook.sh .claude/hooks/machine-safety-hook.sh
-    install -m 0644 sortie/claude-settings.json .claude/settings.json
+    # Payload comes from origin/main so a persisted issue branch that
+    # predates the hook still receives it. Until that blob exists on main,
+    # HEAD is this change (pre-merge only); say so on stderr.
+    hook_ref=origin/main
+    if ! git cat-file -e "$hook_ref:sortie/machine-safety-hook.sh" 2>/dev/null; then
+      printf 'sortie: machine-safety payload missing on origin/main; using HEAD\n' >&2
+      hook_ref=HEAD
+    fi
+    git show "$hook_ref:sortie/machine-safety-hook.sh" > .claude/hooks/machine-safety-hook.sh
+    chmod 0755 .claude/hooks/machine-safety-hook.sh
+    git show "$hook_ref:sortie/claude-settings.json" > .claude/settings.json
+    chmod 0644 .claude/settings.json
     # Per-issue model override: a `model:<name>` label (e.g. model:fable)
     # becomes .sortie/model, read by sortie/agent.sh. No label = default model.
     mkdir -p .sortie
