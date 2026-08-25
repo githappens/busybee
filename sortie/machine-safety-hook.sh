@@ -27,18 +27,35 @@ fi
 
 # True when $1 is a workspace-local path (relative, under $PWD / project_dir).
 # Reject `..` first so a project/`$PWD` prefix cannot smuggle a traversal.
+# Unresolved `$VAR` expansions are not local unless they are `$PWD` / `${PWD}`.
 is_local_path() {
-  local value=$1
+  local value=$1 rest
   value=${value#\"}; value=${value%\"}
   value=${value#\'}; value=${value%\'}
   case "$value" in
     *../*|*/..|..)
       return 1
       ;;
-    "$project_dir"/*|\$PWD/*|\$\{PWD\}/*)
+    \$PWD|\$\{PWD\})
+      return 0
+      ;;
+    \$PWD/*)
+      rest=${value#\$PWD/}
+      [[ $rest == *\$* ]] && return 1
+      return 0
+      ;;
+    \$\{PWD\}/*)
+      rest=${value#\$\{PWD\}/}
+      [[ $rest == *\$* ]] && return 1
+      return 0
+      ;;
+    "$project_dir"/*)
       return 0
       ;;
     /*|~*|\$HOME*|\$\{HOME\}*)
+      return 1
+      ;;
+    *\$*)
       return 1
       ;;
     *)
@@ -233,13 +250,17 @@ peel_segment() {
     rest=${rest##+([[:space:]])}
     peel_assignments
     rest=${rest##+([[:space:]])}
-    if [[ $rest =~ ^env([[:space:]]+(.*))?$ ]]; then
-      rest=${BASH_REMATCH[2]-}
-      peel_env_options
-      if [ "$peel_uncertain" -eq 1 ]; then
-        break
+    # Match env by basename so /usr/bin/env and ./env unwrap like env.
+    if [[ $rest =~ $argv_re ]]; then
+      local wrap_cmd=${BASH_REMATCH[1]} wrap_rest=${BASH_REMATCH[3]-}
+      if [ "$(daemon_basename "$wrap_cmd")" = env ]; then
+        rest=$wrap_rest
+        peel_env_options
+        if [ "$peel_uncertain" -eq 1 ]; then
+          break
+        fi
+        continue
       fi
-      continue
     fi
     if [[ $rest =~ $command_re ]]; then
       # `command -v` is a lookup, not a launch wrapper.
@@ -303,7 +324,7 @@ resolve_against_chdir() {
   value=${value#\'}; value=${value%\'}
   [ -n "$dir" ] || { printf '%s\n' "$value"; return 0; }
   case "$value" in
-    "$project_dir"/*|\$PWD/*|\$\{PWD\}/*|/*|~*|\$HOME*|\$\{HOME\}*)
+    "$project_dir"/*|\$PWD/*|\$\{PWD\}/*|/*|~*|\$HOME*|\$\{HOME\}*|\$*)
       printf '%s\n' "$value"
       ;;
     *)

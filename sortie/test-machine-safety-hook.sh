@@ -105,6 +105,13 @@ expect_deny 'env --chdir then relative config path' \
 expect_deny 'env -C then relative config path' \
   'workspace-local PUEUE_CONFIG_PATH' Bash \
   'env -C "$HOME" PUEUE_CONFIG_PATH=.config/pueue pueued --daemonize'
+expect_deny 'absolute env path unisolated pueued' \
+  'workspace-local PUEUE_CONFIG_PATH' Bash \
+  '/usr/bin/env pueued --daemonize'
+# shellcheck disable=SC2016
+expect_deny 'unresolved XDG_CONFIG_HOME in state path' \
+  'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'PUEUE_CONFIG_PATH=$XDG_CONFIG_HOME/pueue pueued --daemonize'
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \
@@ -136,6 +143,8 @@ expect_allow 'last duplicate assignment local' Bash \
 # shellcheck disable=SC2016
 expect_allow 'env --chdir with PWD-prefixed config' Bash \
   'env --chdir="$HOME" PUEUE_CONFIG_PATH=$PWD/build/test/pueue pueued --daemonize'
+expect_allow 'absolute env with isolated pueued' Bash \
+  '/usr/bin/env PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
 expect_allow 'read cargo config' Bash 'cat .cargo/config.toml'
 expect_allow 'read runtime hook' Bash 'cat .claude/hooks/machine-safety-hook.sh'
 expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"
