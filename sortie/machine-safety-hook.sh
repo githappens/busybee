@@ -267,7 +267,7 @@ peel_segment() {
     rest=${rest##+([[:space:]])}
     peel_assignments
     rest=${rest##+([[:space:]])}
-    # Unwrap env / exec / command by basename. command -v/-V is a lookup.
+    # Unwrap env / exec / builtin / command by basename. command -v/-V is a lookup.
     if [[ $rest =~ $argv_re ]]; then
       local wrap_cmd=${BASH_REMATCH[1]} wrap_rest=${BASH_REMATCH[3]-}
       case "$(daemon_basename "$wrap_cmd")" in
@@ -280,6 +280,10 @@ peel_segment() {
           continue
           ;;
         exec)
+          rest=$wrap_rest
+          continue
+          ;;
+        builtin)
           rest=$wrap_rest
           continue
           ;;
@@ -609,6 +613,7 @@ case "$tool" in
     segments=()
     split_segments "$command" segments
     cwd_uncertain=0
+    cwd_may_run_daemon_pkg=0
     for seg in "${segments[@]}"; do
       peel_segment "$seg"
       base=$(daemon_basename "$argv0")
@@ -623,6 +628,11 @@ case "$tool" in
       case "$cwd_base" in
         cd|pushd|popd)
           cwd_uncertain=1
+          # Targetless `cargo run` after cd into a daemon crate is not classified
+          # as -p bzbd/pueued; remember that the new cwd may select that package.
+          if [ "$cwd_base" = popd ] || segment_mentions_daemon "$seg"; then
+            cwd_may_run_daemon_pkg=1
+          fi
           ;;
       esac
       if [ "$base" = git ] && git_clean_removes_ignored "$rest_args"; then
@@ -644,7 +654,7 @@ case "$tool" in
             require_pueued_isolation
             ;;
           unknown)
-            if segment_mentions_daemon "$seg"; then
+            if segment_mentions_daemon "$seg" || [ "${cwd_may_run_daemon_pkg:-0}" -eq 1 ]; then
               deny "could not classify a pueued/bzbd launch; refusing"
             fi
             ;;

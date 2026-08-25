@@ -161,6 +161,16 @@ expect_deny 'cd then PWD-prefixed config path' \
 expect_deny 'grouped cd then relative config path' \
   'workspace-local PUEUE_CONFIG_PATH' Bash \
   '(cd "$HOME" && PUEUE_CONFIG_PATH=.config/pueue pueued --daemonize)'
+# shellcheck disable=SC2016
+expect_deny 'builtin cd then relative config path' \
+  'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'builtin cd "$HOME" && PUEUE_CONFIG_PATH=.config/pueue pueued --daemonize'
+expect_deny 'cd bzbd crate then targetless cargo run' \
+  'could not classify a pueued/bzbd launch' Bash \
+  'cd crates/bzbd && cargo run -- --foreground'
+expect_deny 'cd bzbd crate then targetless cargo r' \
+  'could not classify a pueued/bzbd launch' Bash \
+  'cd crates/bzbd && cargo r -- --foreground'
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \
@@ -225,6 +235,14 @@ expect_allow 'nested env -C then CLAUDE_PROJECT_DIR config path' Bash \
 # shellcheck disable=SC2016
 expect_allow 'nested env -C then CLAUDE_PROJECT_DIR bzbd paths' Bash \
   'env -C "$HOME" env -C . BUSYBEE_STATE_DIR=$CLAUDE_PROJECT_DIR/build/state PUEUE_CONFIG_PATH=$CLAUDE_PROJECT_DIR/build/pueue bzbd'
+# shellcheck disable=SC2016
+expect_allow 'builtin cd then CLAUDE_PROJECT_DIR config path' Bash \
+  'builtin cd "$HOME" && PUEUE_CONFIG_PATH=$CLAUDE_PROJECT_DIR/build/test/pueue pueued --daemonize'
+expect_allow 'cd bzbd crate then cargo test' Bash \
+  'cd crates/bzbd && cargo test'
+# shellcheck disable=SC2016
+expect_allow 'cd bzbd crate then cargo run -p bzbd isolated' Bash \
+  'cd crates/bzbd && BUSYBEE_STATE_DIR=$CLAUDE_PROJECT_DIR/build/state PUEUE_CONFIG_PATH=$CLAUDE_PROJECT_DIR/build/pueue cargo run -p bzbd -- --foreground'
 expect_allow 'read cargo config' Bash 'cat .cargo/config.toml'
 expect_allow 'read runtime hook' Bash 'cat .claude/hooks/machine-safety-hook.sh'
 expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"
