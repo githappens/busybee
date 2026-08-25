@@ -19,6 +19,12 @@ command -v sortie >/dev/null || die "sortie not on PATH"
 command -v gh >/dev/null     || die "gh not on PATH"
 [ -f "$REPO_ROOT/flake.nix" ] || die "flake.nix not found at $REPO_ROOT"
 
+# jq is required by the machine-safety hook. A missing binary makes the hook
+# exit 127, which Claude Code does not treat as a deny. Check inside the
+# same nix develop environment the agents inherit.
+nix develop -c sh -c 'command -v jq >/dev/null' \
+  || die "jq is missing from nix develop (required by the machine-safety hook)"
+
 # Tracker token: sortie reads $GITHUB_TOKEN (see tracker.api_key); reuse gh's.
 if [ -z "${GITHUB_TOKEN:-}" ]; then
   GITHUB_TOKEN="$(gh auth token 2>/dev/null)" || die "gh is not authenticated (gh auth login)"

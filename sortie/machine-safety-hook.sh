@@ -6,6 +6,13 @@ shopt -s extglob
 input=$(cat)
 project_dir=${CLAUDE_PROJECT_DIR:-$PWD}
 
+# Claude Code treats hook exits other than 0 / 2 as non-blocking. If jq is
+# missing, emitting this JSON with exit 0 still denies the tool call.
+if ! command -v jq >/dev/null 2>&1; then
+  printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"machine-safety rule: jq is required to evaluate tool calls"}}'
+  exit 0
+fi
+
 emit_deny() {
   jq -n --arg reason "$1" '{
     hookSpecificOutput: {

@@ -33,7 +33,7 @@ sortie/run.sh --dry-run  # one poll cycle, nothing dispatched, nothing written
 
 `run.sh` pins the HTTP/metrics port (7678), reuses `gh auth token` as
 `GITHUB_TOKEN`, verifies the ssh alias, refuses to start if the port is busy,
-and runs inside `nix develop` so agents inherit cargo, pueued, make and ninja.
+and runs inside `nix develop` so agents inherit cargo, pueued, make, ninja and jq.
 
 First launch after a long gap: set `agent.max_concurrent_agents: 1` in
 `WORKFLOW.md`, watch one issue reach a PR, then raise it. That key hot-reloads.

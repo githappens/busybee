@@ -80,6 +80,10 @@
             pkgs.ninja
             pkgs.git
             pkgs.pkg-config
+            # PreToolUse hook (sortie/machine-safety-hook.sh) parses JSON with jq.
+            # A missing jq makes the hook exit 127, which Claude Code does not
+            # treat as a deny.
+            pkgs.jq
           ];
         };
       });

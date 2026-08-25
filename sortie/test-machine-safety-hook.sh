@@ -251,6 +251,46 @@ expect_allow 'read cargo config' Bash 'cat .cargo/config.toml'
 expect_allow 'read runtime hook' Bash 'cat .claude/hooks/machine-safety-hook.sh'
 expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"
 
+# jq must be present in the agent environment; without it the hook cannot
+# emit a deny and Claude Code would treat exit 127 as non-blocking.
+no_jq_bin=$(mktemp -d)
+ln -s "$(command -v cat)" "$no_jq_bin/cat"
+bash_bin=$(command -v bash)
+no_jq_input=$(jq -nc '{tool_name:"Bash",tool_input:{command:"pueued --daemonize"}}')
+no_jq_output=$(printf '%s\n' "$no_jq_input" \
+  | PATH="$no_jq_bin" CLAUDE_PROJECT_DIR="$root" "$bash_bin" "$hook")
+if jq -e '
+  .hookSpecificOutput.permissionDecision == "deny"
+  and (.hookSpecificOutput.permissionDecisionReason | contains("jq is required"))
+' >/dev/null <<<"$no_jq_output"; then
+  printf 'ok - hook denies when jq is missing\n'
+else
+  printf 'not ok - hook denies when jq is missing\n%s\n' "$no_jq_output" >&2
+  failures=$((failures + 1))
+fi
+if PATH="$no_jq_bin" "$bash_bin" "$root/sortie/agent.sh" >/dev/null 2>"$no_jq_bin/err"; then
+  printf 'not ok - agent.sh requires jq\n' >&2
+  failures=$((failures + 1))
+elif grep -q 'jq is required' "$no_jq_bin/err"; then
+  printf 'ok - agent.sh requires jq\n'
+else
+  printf 'not ok - agent.sh requires jq\n%s\n' "$(cat "$no_jq_bin/err")" >&2
+  failures=$((failures + 1))
+fi
+rm -rf "$no_jq_bin"
+if grep -q 'pkgs.jq' "$root/flake.nix"; then
+  printf 'ok - flake.nix provides jq\n'
+else
+  printf 'not ok - flake.nix provides jq\n' >&2
+  failures=$((failures + 1))
+fi
+if grep -q 'command -v jq' "$root/sortie/run.sh"; then
+  printf 'ok - run.sh checks jq in nix develop\n'
+else
+  printf 'not ok - run.sh checks jq in nix develop\n' >&2
+  failures=$((failures + 1))
+fi
+
 # Exercise WORKFLOW.md's before_run install: payload from origin/main, even
 # when the checked-out issue branch does not contain those files.
 scratch=$(mktemp -d)
