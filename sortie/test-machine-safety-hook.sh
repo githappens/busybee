@@ -104,6 +104,19 @@ expect_deny 'find .claude -delete' 'do not modify the machine-safety hook' Bash 
 expect_deny 'find project-prefixed .claude -delete' \
   'do not modify the machine-safety hook' Bash \
   'find "$CLAUDE_PROJECT_DIR"/.claude -depth -delete'
+# -delete on a tree that contains .claude does not have to name that directory.
+expect_deny 'find . -depth -delete' 'do not modify the machine-safety hook' Bash \
+  'find . -depth -delete'
+expect_deny 'find . -delete' 'do not modify the machine-safety hook' Bash \
+  'find . -delete'
+expect_deny 'find default-root -delete' 'do not modify the machine-safety hook' Bash \
+  'find -delete'
+# shellcheck disable=SC2016
+expect_deny 'find PWD-root -delete' 'do not modify the machine-safety hook' Bash \
+  'find "$PWD" -depth -delete'
+# shellcheck disable=SC2016
+expect_deny 'find project-root -delete' 'do not modify the machine-safety hook' Bash \
+  'find "$CLAUDE_PROJECT_DIR" -delete'
 expect_deny 'Edit of cargo config' 'do not edit .cargo/config.toml' Edit \
   "$root/.cargo/config.toml"
 expect_deny 'Bash write to cargo config' 'do not edit .cargo/config.toml' Bash \

@@ -591,6 +591,12 @@ claude_runtime_dir_in() {
   [[ $1 =~ (^|[[:space:]\"\'/])(\./)?\.(\*|\[) ]]
 }
 
+# GNU find -delete removes matched files. `find . -delete` wipes `.claude`
+# without naming it. Do not evaluate start points or predicates.
+find_has_delete() {
+  [[ $1 =~ (^|[[:space:]\"\'])-delete([[:space:]\"\']|$) ]]
+}
+
 require_pueued_isolation() {
   if ! state_path_is_local PUEUE_CONFIG_PATH; then
     deny "launch pueued only with a workspace-local PUEUE_CONFIG_PATH"
@@ -732,8 +738,13 @@ case "$tool" in
         deny "do not modify the machine-safety hook or its settings"
       fi
       case "$base" in
-        rm|mv|rmdir|unlink|find)
+        rm|mv|rmdir|unlink)
           if claude_runtime_dir_in "$rest_args"; then
+            deny "do not modify the machine-safety hook or its settings"
+          fi
+          ;;
+        find)
+          if claude_runtime_dir_in "$rest_args" || find_has_delete "$rest_args"; then
             deny "do not modify the machine-safety hook or its settings"
           fi
           ;;
