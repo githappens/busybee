@@ -258,6 +258,15 @@ expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' E
   "$root/.claude/settings.json"
 expect_deny 'Bash overwrite of runtime hook' 'do not modify the machine-safety hook' Bash \
   'printf "exit 0\n" > .claude/hooks/machine-safety-hook.sh'
+expect_deny 'Bash overwrite of runtime hook via ..' \
+  'do not modify the machine-safety hook' Bash \
+  "printf 'exit 0\n' > .claude/hooks/../hooks/machine-safety-hook.sh"
+expect_deny 'Write of runtime hook via ..' \
+  'do not modify the machine-safety hook' Write \
+  "$root/.claude/hooks/../hooks/machine-safety-hook.sh"
+expect_deny 'Edit of runtime settings via ..' \
+  'do not modify the machine-safety hook' Edit \
+  "$root/.claude/hooks/../settings.json"
 
 expect_allow 'workspace test command' Bash \
   'BUSYBEE_STATE_DIR=build/test/state PUEUE_CONFIG_PATH=build/test/pueue busybee -- cargo test --workspace'
@@ -344,6 +353,8 @@ expect_allow 'cd bzbd crate then cargo run -p bzbd isolated' Bash \
   'cd crates/bzbd && BUSYBEE_STATE_DIR=$CLAUDE_PROJECT_DIR/build/state PUEUE_CONFIG_PATH=$CLAUDE_PROJECT_DIR/build/pueue cargo run -p bzbd -- --foreground'
 expect_allow 'read cargo config' Bash 'cat .cargo/config.toml'
 expect_allow 'read runtime hook' Bash 'cat .claude/hooks/machine-safety-hook.sh'
+expect_allow 'read runtime hook via ..' Bash \
+  'cat .claude/hooks/../hooks/machine-safety-hook.sh'
 expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"
 
 # jq must be present in the agent environment; without it the hook cannot

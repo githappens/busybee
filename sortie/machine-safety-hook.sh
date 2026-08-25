@@ -649,10 +649,18 @@ is_runtime_hook_path() {
     .claude/settings.json|*/.claude/settings.json|.claude/hooks/machine-safety-hook.sh|*/.claude/hooks/machine-safety-hook.sh)
       return 0
       ;;
-    *)
-      return 1
+  esac
+  # `.claude/hooks/../hooks/…` resolves to the hook; do not evaluate `..`.
+  [[ $1 == *'..'* ]] && claude_runtime_dir_in "$1"
+}
+
+is_known_reader() {
+  case "$1" in
+    cat|less|more|head|tail|wc|stat|file|ls|grep|egrep|fgrep|rg|bat|nl|od|hexdump|sha256sum|md5sum|cksum|diff|jq)
+      return 0
       ;;
   esac
+  return 1
 }
 
 # Deny writes to a named path unless every mentioning segment is a known reader.
@@ -670,13 +678,28 @@ deny_unless_readonly_mention() {
     [[ $seg == *"$needle"* ]] || continue
     peel_segment "$seg"
     base=$(daemon_basename "$argv0")
-    case "$base" in
-      cat|less|more|head|tail|wc|stat|file|ls|grep|egrep|fgrep|rg|bat|nl|od|hexdump|sha256sum|md5sum|cksum|diff|jq)
-        ;;
-      *)
-        deny "$reason"
-        ;;
-    esac
+    if ! is_known_reader "$base"; then
+      deny "$reason"
+    fi
+  done
+}
+
+# Traversal spellings of `.claude` bypass the literal hook/settings needles.
+deny_unless_readonly_runtime_traversal() {
+  local reason=$1
+  local segments seg base
+  [[ $command == *'..'* ]] || return 0
+  claude_runtime_dir_in "$command" || return 0
+  segments=()
+  split_segments "$command" segments
+  for seg in "${segments[@]}"; do
+    [[ $seg == *'..'* ]] || continue
+    claude_runtime_dir_in "$seg" || continue
+    peel_segment "$seg"
+    base=$(daemon_basename "$argv0")
+    if ! is_known_reader "$base"; then
+      deny "$reason"
+    fi
   done
 }
 
@@ -733,6 +756,8 @@ case "$tool" in
     deny_unless_readonly_mention '.claude/settings.json' \
       'do not modify the machine-safety hook or its settings'
     deny_unless_readonly_mention '.claude/hooks/machine-safety-hook.sh' \
+      'do not modify the machine-safety hook or its settings'
+    deny_unless_readonly_runtime_traversal \
       'do not modify the machine-safety hook or its settings'
 
     segments=()
