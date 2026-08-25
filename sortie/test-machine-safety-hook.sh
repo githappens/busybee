@@ -94,6 +94,10 @@ expect_deny 'rm project-prefixed .claude' 'do not modify the machine-safety hook
 # shellcheck disable=SC2016
 expect_deny 'rm PWD-prefixed .claude' 'do not modify the machine-safety hook' Bash \
   'rm -rf "$PWD"/.claude'
+expect_deny 'rm hidden glob .[!.]*' 'do not modify the machine-safety hook' Bash \
+  'rm -rf .[!.]*'
+expect_deny 'rm hidden glob .*' 'do not modify the machine-safety hook' Bash \
+  'rm -rf .*'
 expect_deny 'Edit of cargo config' 'do not edit .cargo/config.toml' Edit \
   "$root/.cargo/config.toml"
 expect_deny 'Bash write to cargo config' 'do not edit .cargo/config.toml' Bash \
@@ -205,6 +209,12 @@ expect_deny 'unisolated pueue clean' 'workspace-local PUEUE_CONFIG_PATH' Bash \
   'pueue clean'
 expect_deny 'unisolated pueue group remove' 'workspace-local PUEUE_CONFIG_PATH' Bash \
   'pueue group remove busybee'
+symlink_outside=$(mktemp -d)
+mkdir -p "$root/build/hook-symlink-test"
+ln -sfn "$symlink_outside" "$root/build/hook-symlink-test/config"
+expect_deny 'symlink state path escapes workspace' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'PUEUE_CONFIG_PATH=build/hook-symlink-test/config/pueue pueue clean'
+rm -rf "$root/build/hook-symlink-test" "$symlink_outside"
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \

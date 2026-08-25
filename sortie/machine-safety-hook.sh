@@ -81,6 +81,67 @@ is_local_path() {
   esac
 }
 
+# Map a hook-visible local state path to a filesystem path, then walk up to
+# an existing ancestor and physically resolve it. Reject workspace-relative
+# strings whose existing components are symlinks out of the project.
+path_resolves_inside_workspace() {
+  local value=$1 rest fs path resolved root
+  value=${value#\"}; value=${value%\"}
+  value=${value#\'}; value=${value%\'}
+  case "$value" in
+    \$PWD|\$\{PWD\})
+      fs=$PWD
+      ;;
+    \$PWD/*)
+      rest=${value#\$PWD/}
+      fs=$PWD/$rest
+      ;;
+    \$\{PWD\}/*)
+      rest=${value#\$\{PWD\}/}
+      fs=$PWD/$rest
+      ;;
+    \$CLAUDE_PROJECT_DIR|\$\{CLAUDE_PROJECT_DIR\})
+      fs=$project_dir
+      ;;
+    \$CLAUDE_PROJECT_DIR/*)
+      rest=${value#\$CLAUDE_PROJECT_DIR/}
+      fs=$project_dir/$rest
+      ;;
+    \$\{CLAUDE_PROJECT_DIR\}/*)
+      rest=${value#\$\{CLAUDE_PROJECT_DIR\}/}
+      fs=$project_dir/$rest
+      ;;
+    /*)
+      fs=$value
+      ;;
+    *)
+      fs=$project_dir/$value
+      ;;
+  esac
+  path=$fs
+  while [ ! -e "$path" ] && [ "$path" != / ]; do
+    rest=$(dirname "$path")
+    [ "$rest" = "$path" ] && break
+    path=$rest
+  done
+  if [ -d "$path" ]; then
+    resolved=$(cd "$path" && pwd -P) || return 1
+  elif [ -e "$path" ]; then
+    resolved=$(cd "$(dirname "$path")" && pwd -P)/$(basename "$path") || return 1
+  else
+    return 0
+  fi
+  root=$(cd "$project_dir" && pwd -P) || return 1
+  case "$resolved" in
+    "$root"|"$root"/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 # Split a flattened Bash string into shell segments on ; && || | & while
 # respecting single/double quotes. Each segment is checked on its own so an
 # assignment on an earlier command cannot satisfy a later daemon launch.
@@ -392,7 +453,8 @@ state_path_is_local() {
         ;;
     esac
   fi
-  is_local_path "$value"
+  is_local_path "$value" || return 1
+  path_resolves_inside_workspace "$value"
 }
 
 unquote_token() {
@@ -519,7 +581,9 @@ git_clean_removes_ignored() {
 }
 
 claude_runtime_dir_in() {
-  [[ $1 =~ (^|[[:space:]\"\'/])(\./)?\.claude(/|[[:space:]\"\']|$) ]]
+  [[ $1 =~ (^|[[:space:]\"\'/])(\./)?\.claude(/|[[:space:]\"\']|$) ]] && return 0
+  # `.*` and `.[!.]*` expand to `.claude`; do not interpret the glob.
+  [[ $1 =~ (^|[[:space:]\"\'/])(\./)?\.(\*|\[) ]]
 }
 
 require_pueued_isolation() {
