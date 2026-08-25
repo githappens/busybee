@@ -33,10 +33,17 @@ sortie/run.sh --dry-run  # one poll cycle, nothing dispatched, nothing written
 
 `run.sh` pins the HTTP/metrics port (7678), reuses `gh auth token` as
 `GITHUB_TOKEN`, verifies the ssh alias, refuses to start if the port is busy,
-and runs inside `nix develop` so agents inherit cargo, pueued, make and ninja.
+and runs inside `nix develop` so agents inherit cargo, pueued, make, ninja and jq.
 
 First launch after a long gap: set `agent.max_concurrent_agents: 1` in
 `WORKFLOW.md`, watch one issue reach a PR, then raise it. That key hot-reloads.
+
+Each workspace gets a PreToolUse hook on `before_run` (sources in `sortie/`,
+runtime copies in `.claude/`). It denies global Busy Bee installs, writes to
+`.cargo/config.toml`, and any `bzb`/`busybee`/`bzbd`/`pueued`/`pueue` launch
+that is not `.claude/isolated.sh <tool> ...`. It is a guard for cooperative
+agents, not a same-UID sandbox. `sortie/test-machine-safety-hook.sh` covers
+the invariants.
 
 Watch a session read-only: `sortie/peek.sh <issue>` (last events from the agent's
 transcript plus the workspace's git state; `-f` follows).
