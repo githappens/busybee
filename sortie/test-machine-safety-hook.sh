@@ -98,6 +98,12 @@ expect_deny 'rm hidden glob .[!.]*' 'do not modify the machine-safety hook' Bash
   'rm -rf .[!.]*'
 expect_deny 'rm hidden glob .*' 'do not modify the machine-safety hook' Bash \
   'rm -rf .*'
+expect_deny 'find .claude -delete' 'do not modify the machine-safety hook' Bash \
+  'find .claude -depth -delete'
+# shellcheck disable=SC2016
+expect_deny 'find project-prefixed .claude -delete' \
+  'do not modify the machine-safety hook' Bash \
+  'find "$CLAUDE_PROJECT_DIR"/.claude -depth -delete'
 expect_deny 'Edit of cargo config' 'do not edit .cargo/config.toml' Edit \
   "$root/.cargo/config.toml"
 expect_deny 'Bash write to cargo config' 'do not edit .cargo/config.toml' Bash \
@@ -218,6 +224,11 @@ rm -rf "$root/build/hook-symlink-test" "$symlink_outside"
 # shellcheck disable=SC2016
 expect_deny 'ln then relative state path' 'workspace-local PUEUE_CONFIG_PATH' Bash \
   'ln -s "$HOME/.config" build/hook-link; PUEUE_CONFIG_PATH=build/hook-link/pueue pueue clean'
+mkdir -p "$root/build/review-local-state/config/pueue"
+# shellcheck disable=SC2016
+expect_deny 'rm ln then existing state path' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'rm -rf build/review-local-state/config; ln -s "$HOME/.config" build/review-local-state/config; PUEUE_CONFIG_PATH=build/review-local-state/config/pueue pueue clean'
+rm -rf "$root/build/review-local-state"
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \

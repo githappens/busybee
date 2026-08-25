@@ -118,9 +118,9 @@ path_resolves_inside_workspace() {
       fs=$project_dir/$value
       ;;
   esac
-  # An earlier ln in this tool call can create a symlink on a missing
-  # component after we return; do not treat missing paths as local.
-  if [ "${fs_uncertain:-0}" -eq 1 ] && [ ! -e "$fs" ]; then
+  # An earlier rm/ln/mv in this tool call can replace a path after we
+  # inspect the filesystem; do not trust pre-execution ancestors.
+  if [ "${fs_uncertain:-0}" -eq 1 ]; then
     return 1
   fi
   path=$fs
@@ -716,7 +716,7 @@ case "$tool" in
         cd|pushd|popd)
           cwd_uncertain=1
           ;;
-        ln)
+        ln|rm|mv|rmdir|unlink)
           fs_uncertain=1
           ;;
         builtin)
@@ -732,7 +732,7 @@ case "$tool" in
         deny "do not modify the machine-safety hook or its settings"
       fi
       case "$base" in
-        rm|mv|rmdir|unlink)
+        rm|mv|rmdir|unlink|find)
           if claude_runtime_dir_in "$rest_args"; then
             deny "do not modify the machine-safety hook or its settings"
           fi
@@ -779,7 +779,7 @@ case "$tool" in
         cd|pushd|popd)
           cwd_uncertain=1
           ;;
-        ln)
+        ln|rm|mv|rmdir|unlink)
           fs_uncertain=1
           ;;
         pueued|pueue)
