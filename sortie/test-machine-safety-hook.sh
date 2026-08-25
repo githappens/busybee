@@ -171,6 +171,9 @@ expect_deny 'cd bzbd crate then targetless cargo run' \
 expect_deny 'cd bzbd crate then targetless cargo r' \
   'could not classify a pueued/bzbd launch' Bash \
   'cd crates/bzbd && cargo r -- --foreground'
+expect_deny 'targetless cargo run' \
+  'could not classify a pueued/bzbd launch' Bash \
+  'cargo run -- --foreground'
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \
@@ -181,6 +184,7 @@ expect_deny 'Bash overwrite of runtime hook' 'do not modify the machine-safety h
 expect_allow 'workspace test command' Bash 'busybee -- cargo test --workspace'
 expect_allow 'clippy command' Bash 'cargo clippy --workspace --all-targets -- -D warnings'
 expect_allow 'format command' Bash 'cargo fmt --all'
+expect_allow 'cargo run of the CLI package' Bash 'cargo run -p bzb -- --help'
 expect_allow 'test-fixture name as an argument' Bash \
   'cargo test -p bzb-test-support pueued'
 # shellcheck disable=SC2016

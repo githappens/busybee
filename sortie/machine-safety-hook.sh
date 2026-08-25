@@ -267,7 +267,7 @@ peel_segment() {
     rest=${rest##+([[:space:]])}
     peel_assignments
     rest=${rest##+([[:space:]])}
-    # Unwrap env / exec / builtin / command by basename. command -v/-V is a lookup.
+    # Unwrap env / exec / command by basename. command -v/-V is a lookup.
     if [[ $rest =~ $argv_re ]]; then
       local wrap_cmd=${BASH_REMATCH[1]} wrap_rest=${BASH_REMATCH[3]-}
       case "$(daemon_basename "$wrap_cmd")" in
@@ -280,10 +280,6 @@ peel_segment() {
           continue
           ;;
         exec)
-          rest=$wrap_rest
-          continue
-          ;;
-        builtin)
           rest=$wrap_rest
           continue
           ;;
@@ -431,9 +427,10 @@ known_non_launch() {
   return 1
 }
 
-# Empty: not cargo run. bzbd/pueued: classified package/bin. unknown: cargo run
-# whose target we will not guess. Accepts run|r and a short list of Cargo
-# global options that may precede the command.
+# Empty: not cargo run, or an explicit non-daemon package/bin. bzbd/pueued:
+# classified daemon target. targetless: `run`/`r` with no -p/--package/--bin.
+# unknown: a run we will not guess (unsupported globals). No workspace or
+# manifest resolution — targetless cannot be proven non-daemon.
 cargo_run_daemon_target() {
   local args=${1##+([[:space:]])} tok
   if [[ $args =~ ^\+[^[:space:]]+[[:space:]]+(.*)$ ]]; then
@@ -484,7 +481,12 @@ cargo_run_daemon_target() {
     printf 'pueued'
     return 0
   fi
-  printf 'unknown'
+  if [[ $args =~ (^|[[:space:]])(-p|--package|--bin)[[:space:]]+[^[:space:]] ]] \
+    || [[ $args =~ --(package|bin)=[^[:space:]] ]]; then
+    printf ''
+    return 0
+  fi
+  printf 'targetless'
 }
 
 git_clean_removes_ignored() {
@@ -613,7 +615,6 @@ case "$tool" in
     segments=()
     split_segments "$command" segments
     cwd_uncertain=0
-    cwd_may_run_daemon_pkg=0
     for seg in "${segments[@]}"; do
       peel_segment "$seg"
       base=$(daemon_basename "$argv0")
@@ -628,11 +629,14 @@ case "$tool" in
       case "$cwd_base" in
         cd|pushd|popd)
           cwd_uncertain=1
-          # Targetless `cargo run` after cd into a daemon crate is not classified
-          # as -p bzbd/pueued; remember that the new cwd may select that package.
-          if [ "$cwd_base" = popd ] || segment_mentions_daemon "$seg"; then
-            cwd_may_run_daemon_pkg=1
-          fi
+          ;;
+        builtin)
+          # Only cwd-changing builtins; do not unwrap builtin in general.
+          case "$(daemon_basename "${rest_args%%[[:space:]]*}")" in
+            cd|pushd|popd)
+              cwd_uncertain=1
+              ;;
+          esac
           ;;
       esac
       if [ "$base" = git ] && git_clean_removes_ignored "$rest_args"; then
@@ -653,8 +657,11 @@ case "$tool" in
           pueued)
             require_pueued_isolation
             ;;
+          targetless)
+            deny "could not classify a pueued/bzbd launch; refusing"
+            ;;
           unknown)
-            if segment_mentions_daemon "$seg" || [ "${cwd_may_run_daemon_pkg:-0}" -eq 1 ]; then
+            if segment_mentions_daemon "$seg"; then
               deny "could not classify a pueued/bzbd launch; refusing"
             fi
             ;;
