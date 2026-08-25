@@ -519,7 +519,7 @@ git_clean_removes_ignored() {
 }
 
 claude_runtime_dir_in() {
-  [[ $1 =~ (^|[[:space:]\"\'])(\./)?\.claude(/|[[:space:]\"\']|$) ]]
+  [[ $1 =~ (^|[[:space:]\"\'/])(\./)?\.claude(/|[[:space:]\"\']|$) ]]
 }
 
 require_pueued_isolation() {

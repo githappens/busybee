@@ -88,6 +88,12 @@ expect_deny 'git clean separated -x' 'do not modify the machine-safety hook' Bas
   'git clean -f -d -x'
 expect_deny 'rm -rf .claude' 'do not modify the machine-safety hook' Bash \
   'rm -rf .claude'
+# shellcheck disable=SC2016
+expect_deny 'rm project-prefixed .claude' 'do not modify the machine-safety hook' Bash \
+  'rm -rf "$CLAUDE_PROJECT_DIR"/.claude'
+# shellcheck disable=SC2016
+expect_deny 'rm PWD-prefixed .claude' 'do not modify the machine-safety hook' Bash \
+  'rm -rf "$PWD"/.claude'
 expect_deny 'Edit of cargo config' 'do not edit .cargo/config.toml' Edit \
   "$root/.cargo/config.toml"
 expect_deny 'Bash write to cargo config' 'do not edit .cargo/config.toml' Bash \
