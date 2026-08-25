@@ -143,10 +143,9 @@ peel_segment() {
 
   # Keep unwrapping env / nix develop -c / busybee -- / command until the
   # argv0 is the real program.
-  local assign_re command_re busybee_re nix_re nix_c_re argv_re token_re
+  local assign_re busybee_re nix_re nix_c_re argv_re token_re
   # Keep the regex in a variable so quotes inside the pattern are literal.
   assign_re='^([A-Za-z_][A-Za-z0-9_]*)=("([^"]*)"|'\''([^'\'']*)'\''|[^[:space:]&;|]+)[[:space:]]+(.*)$'
-  command_re='^command([[:space:]]+-v)?[[:space:]]+(.*)$'
   busybee_re='^busybee([[:space:]]+--+)?[[:space:]]+(.*)$'
   nix_re='^nix[[:space:]]+develop[[:space:]]+(.*)$'
   nix_c_re='^(.*[[:space:]])?-c[[:space:]]+(.*)$'
@@ -260,25 +259,44 @@ peel_segment() {
     rest=${rest##+([[:space:]])}
     peel_assignments
     rest=${rest##+([[:space:]])}
-    # Match env by basename so /usr/bin/env and ./env unwrap like env.
+    # Unwrap env / exec / command by basename. command -v/-V is a lookup.
     if [[ $rest =~ $argv_re ]]; then
       local wrap_cmd=${BASH_REMATCH[1]} wrap_rest=${BASH_REMATCH[3]-}
-      if [ "$(daemon_basename "$wrap_cmd")" = env ]; then
-        rest=$wrap_rest
-        peel_env_options
-        if [ "$peel_uncertain" -eq 1 ]; then
-          break
-        fi
-        continue
-      fi
-    fi
-    if [[ $rest =~ $command_re ]]; then
-      # `command -v` is a lookup, not a launch wrapper.
-      if [ -n "${BASH_REMATCH[1]-}" ]; then
-        break
-      fi
-      rest=${BASH_REMATCH[2]}
-      continue
+      case "$(daemon_basename "$wrap_cmd")" in
+        env)
+          rest=$wrap_rest
+          peel_env_options
+          if [ "$peel_uncertain" -eq 1 ]; then
+            break
+          fi
+          continue
+          ;;
+        exec)
+          rest=$wrap_rest
+          continue
+          ;;
+        command)
+          wrap_rest=${wrap_rest##+([[:space:]])}
+          case "$wrap_rest" in
+            -v|-V|-v[[:space:]]*|-V[[:space:]]*)
+              break
+              ;;
+            -p)
+              rest=
+              continue
+              ;;
+            -p[[:space:]]*)
+              rest=${wrap_rest#-p}
+              rest=${rest##+([[:space:]])}
+              continue
+              ;;
+            *)
+              rest=$wrap_rest
+              continue
+              ;;
+          esac
+          ;;
+      esac
     fi
     # busybee [--] <cmd>
     if [[ $rest =~ $busybee_re ]]; then
@@ -390,16 +408,15 @@ segment_mentions_daemon() {
   [[ $1 =~ (^|[^[:alnum:]_])(pueued|bzbd)([^[:alnum:]_]|$) ]]
 }
 
-# True when argv0 looks like a daemon name the parser failed to isolate
-# (leftover quotes, prefixes) rather than an exact pueued/bzbd basename.
-garbled_daemon_basename() {
-  local base=$1
-  case "$base" in
-    pueued|bzbd)
-      return 1
+# argv0 is a command that can mention pueued/bzbd without launching it
+# (test names, log grep). Anything else that mentions a daemon is denied.
+known_non_launch() {
+  case "$1" in
+    cargo|command|true|false|echo|printf|cat|less|more|head|tail|wc|stat|file|ls|grep|egrep|fgrep|rg|bat|nl|od|hexdump|sha256sum|md5sum|cksum|diff|jq)
+      return 0
       ;;
   esac
-  [[ $base == *pueued* || $base == *bzbd* ]]
+  return 1
 }
 
 is_runtime_hook_path() {
@@ -500,9 +517,18 @@ case "$tool" in
       peel_segment "$seg"
       base=$(daemon_basename "$argv0")
       if segment_mentions_daemon "$seg"; then
-        if [ "$peel_uncertain" -eq 1 ] || [ -z "$argv0" ] || garbled_daemon_basename "$base"; then
+        if [ "$peel_uncertain" -eq 1 ] || [ -z "$argv0" ]; then
           deny "could not classify a pueued/bzbd launch; refusing"
         fi
+        case "$base" in
+          pueued|bzbd|cd|pushd|popd)
+            ;;
+          *)
+            if ! known_non_launch "$base"; then
+              deny "could not classify a pueued/bzbd launch; refusing"
+            fi
+            ;;
+        esac
       fi
       [ -n "$argv0" ] || continue
       case "$base" in
