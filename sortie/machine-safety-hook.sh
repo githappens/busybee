@@ -149,12 +149,11 @@ peel_segment() {
   peel_uncertain=0
   peeled_chdir=
 
-  # Keep unwrapping env / nix develop -c / busybee -- / command until the
-  # argv0 is the real program.
-  local assign_re busybee_re nix_re nix_c_re argv_re token_re
+  # Keep unwrapping env / nix develop -c / command until the argv0 is the
+  # real program. bzb/busybee are not unwrapped: they auto-spawn bzbd.
+  local assign_re nix_re nix_c_re argv_re token_re
   # Keep the regex in a variable so quotes inside the pattern are literal.
   assign_re='^([A-Za-z_][A-Za-z0-9_]*)=("([^"]*)"|'\''([^'\'']*)'\''|[^[:space:]&;|]+)[[:space:]]+(.*)$'
-  busybee_re='^busybee([[:space:]]+--+)?[[:space:]]+(.*)$'
   nix_re='^nix[[:space:]]+develop[[:space:]]+(.*)$'
   nix_c_re='^(.*[[:space:]])?-c[[:space:]]+(.*)$'
   argv_re='^([^[:space:]&;|]+)([[:space:]]+(.*))?$'
@@ -313,11 +312,6 @@ peel_segment() {
           ;;
       esac
     fi
-    # busybee [--] <cmd>
-    if [[ $rest =~ $busybee_re ]]; then
-      rest=${BASH_REMATCH[2]}
-      continue
-    fi
     # nix develop [flake-args…] -c <cmd>
     if [[ $rest =~ $nix_re ]]; then
       local nix_rest=${BASH_REMATCH[1]}
@@ -420,7 +414,7 @@ daemon_basename() {
 }
 
 segment_mentions_daemon() {
-  [[ $1 =~ (^|[^[:alnum:]_])(pueued|bzbd)([^[:alnum:]_]|$) ]]
+  [[ $1 =~ (^|[^[:alnum:]_])(pueued|bzbd|busybee|pueue|bzb)([^[:alnum:]_]|$) ]]
 }
 
 # Command / process / backtick substitution can launch a nested daemon.
@@ -440,10 +434,9 @@ known_non_launch() {
   return 1
 }
 
-# Empty: not cargo run, or an explicit non-daemon package/bin. bzbd/pueued:
-# classified daemon target. targetless: `run`/`r` with no -p/--package/--bin.
-# unknown: a run we will not guess (unsupported globals). No workspace or
-# manifest resolution — targetless cannot be proven non-daemon.
+# Empty: not cargo run, or an explicit non-daemon package/bin. bzbd/bzb/pueued:
+# classified client or daemon target. targetless: `run`/`r` with no
+# -p/--package/--bin. unknown: a run we will not guess (unsupported globals).
 cargo_run_daemon_target() {
   local args=${1##+([[:space:]])} tok
   if [[ $args =~ ^\+[^[:space:]]+[[:space:]]+(.*)$ ]]; then
@@ -487,6 +480,11 @@ cargo_run_daemon_target() {
   if [[ $args =~ (^|[[:space:]])(-p|--package|--bin)[[:space:]]+bzbd([[:space:]]|$) ]] \
     || [[ $args =~ --(package|bin)=bzbd([[:space:]]|$) ]]; then
     printf 'bzbd'
+    return 0
+  fi
+  if [[ $args =~ (^|[[:space:]])(-p|--package|--bin)[[:space:]]+bzb([[:space:]]|$) ]] \
+    || [[ $args =~ --(package|bin)=bzb([[:space:]]|$) ]]; then
+    printf 'bzb'
     return 0
   fi
   if [[ $args =~ (^|[[:space:]])(-p|--package|--bin)[[:space:]]+pueued([[:space:]]|$) ]] \
@@ -667,7 +665,7 @@ case "$tool" in
       fi
       if [ "$base" = cargo ]; then
         case "$(cargo_run_daemon_target "$rest_args")" in
-          bzbd)
+          bzbd|bzb)
             require_bzbd_isolation
             ;;
           pueued)
@@ -689,7 +687,7 @@ case "$tool" in
           deny "could not classify a pueued/bzbd launch; refusing"
         fi
         case "$base" in
-          pueued|bzbd|cd|pushd|popd)
+          pueued|pueue|bzbd|bzb|busybee|cd|pushd|popd)
             ;;
           *)
             if ! known_non_launch "$base"; then
@@ -703,10 +701,10 @@ case "$tool" in
         cd|pushd|popd)
           cwd_uncertain=1
           ;;
-        pueued)
+        pueued|pueue)
           require_pueued_isolation
           ;;
-        bzbd)
+        bzbd|bzb|busybee)
           require_bzbd_isolation
           ;;
       esac

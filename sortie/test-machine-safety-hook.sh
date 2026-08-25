@@ -182,6 +182,18 @@ expect_deny 'command substitution nested pueued' \
 expect_deny 'process substitution nested pueued' \
   'could not classify a pueued/bzbd launch' Bash \
   'cat <(pueued --daemonize)'
+expect_deny 'unisolated bzb client' 'workspace-local BUSYBEE_STATE_DIR' Bash \
+  './build/debug/bzb -- xcodebuild -project App.xcodeproj'
+expect_deny 'unisolated bzb cmake' 'workspace-local BUSYBEE_STATE_DIR' Bash \
+  'bzb -- cmake --build build'
+expect_deny 'unisolated busybee client' 'workspace-local BUSYBEE_STATE_DIR' Bash \
+  'busybee -- cargo test --workspace'
+expect_deny 'cargo run -p bzb unisolated' 'workspace-local BUSYBEE_STATE_DIR' Bash \
+  'cargo run -p bzb -- --help'
+expect_deny 'unisolated pueue clean' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'pueue clean'
+expect_deny 'unisolated pueue group remove' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'pueue group remove busybee'
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \
@@ -189,10 +201,14 @@ expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' E
 expect_deny 'Bash overwrite of runtime hook' 'do not modify the machine-safety hook' Bash \
   'printf "exit 0\n" > .claude/hooks/machine-safety-hook.sh'
 
-expect_allow 'workspace test command' Bash 'busybee -- cargo test --workspace'
+expect_allow 'workspace test command' Bash \
+  'BUSYBEE_STATE_DIR=build/test/state PUEUE_CONFIG_PATH=build/test/pueue busybee -- cargo test --workspace'
 expect_allow 'clippy command' Bash 'cargo clippy --workspace --all-targets -- -D warnings'
 expect_allow 'format command' Bash 'cargo fmt --all'
-expect_allow 'cargo run of the CLI package' Bash 'cargo run -p bzb -- --help'
+expect_allow 'cargo test without the busybee client' Bash 'cargo test --workspace'
+# shellcheck disable=SC2016
+expect_allow 'cargo run of the CLI package isolated' Bash \
+  'BUSYBEE_STATE_DIR=$PWD/build/test/state PUEUE_CONFIG_PATH=$PWD/build/test/pueue cargo run -p bzb -- --help'
 expect_allow 'test-fixture name as an argument' Bash \
   'cargo test -p bzb-test-support pueued'
 # shellcheck disable=SC2016
@@ -212,6 +228,13 @@ expect_allow 'isolated pueued' Bash \
 # shellcheck disable=SC2016
 expect_allow 'isolated bzbd' Bash \
   'BUSYBEE_STATE_DIR=$PWD/build/test/state PUEUE_CONFIG_PATH=$PWD/build/test/pueue ./build/debug/bzbd'
+# shellcheck disable=SC2016
+expect_allow 'isolated bzb xcodebuild' Bash \
+  'BUSYBEE_STATE_DIR=$PWD/build/test/state PUEUE_CONFIG_PATH=$PWD/build/test/pueue ./build/debug/bzb -- xcodebuild -project App.xcodeproj'
+expect_allow 'isolated bzb cmake' Bash \
+  'BUSYBEE_STATE_DIR=build/test/state PUEUE_CONFIG_PATH=build/test/pueue bzb -- cmake --build build'
+expect_allow 'isolated pueue clean' Bash \
+  'PUEUE_CONFIG_PATH=build/test/pueue pueue clean'
 # shellcheck disable=SC2016
 expect_allow 'quoted isolated bzbd' Bash \
   'BUSYBEE_STATE_DIR=$CLAUDE_PROJECT_DIR/build/test/state PUEUE_CONFIG_PATH=$CLAUDE_PROJECT_DIR/build/test/pueue "$CLAUDE_PROJECT_DIR/build/debug/bzbd" --foreground'
