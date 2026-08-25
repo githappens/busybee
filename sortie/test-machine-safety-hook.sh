@@ -74,6 +74,12 @@ expect_deny 'cargo run -p bzbd unisolated' 'workspace-local BUSYBEE_STATE_DIR' B
   'cargo run -p bzbd -- --foreground'
 expect_deny 'cargo run -p pueued unisolated' 'workspace-local PUEUE_CONFIG_PATH' Bash \
   'cargo run -p pueued'
+expect_deny 'cargo r -p bzbd unisolated' 'workspace-local BUSYBEE_STATE_DIR' Bash \
+  'cargo r -p bzbd -- --foreground'
+expect_deny 'cargo --locked run -p bzbd unisolated' 'workspace-local BUSYBEE_STATE_DIR' Bash \
+  'cargo --locked run -p bzbd -- --foreground'
+expect_deny 'cargo --locked r -p pueued unisolated' 'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'cargo --locked r -p pueued -- --daemonize'
 expect_deny 'git clean -fdx' 'do not modify the machine-safety hook' Bash \
   'git clean -fdx'
 expect_deny 'git clean -xfd' 'do not modify the machine-safety hook' Bash \
@@ -142,6 +148,10 @@ expect_deny 'cd then relative config path' \
 expect_deny 'cd then PWD-prefixed config path' \
   'workspace-local PUEUE_CONFIG_PATH' Bash \
   'cd "$HOME" && PUEUE_CONFIG_PATH=$PWD/build/test/pueue pueued --daemonize'
+# shellcheck disable=SC2016
+expect_deny 'grouped cd then relative config path' \
+  'workspace-local PUEUE_CONFIG_PATH' Bash \
+  '(cd "$HOME" && PUEUE_CONFIG_PATH=.config/pueue pueued --daemonize)'
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \
@@ -157,6 +167,14 @@ expect_allow 'test-fixture name as an argument' Bash \
 # shellcheck disable=SC2016
 expect_allow 'cargo run -p bzbd isolated' Bash \
   'BUSYBEE_STATE_DIR=$PWD/build/test/state PUEUE_CONFIG_PATH=$PWD/build/test/pueue cargo run -p bzbd -- --foreground'
+# shellcheck disable=SC2016
+expect_allow 'cargo r -p bzbd isolated' Bash \
+  'BUSYBEE_STATE_DIR=$PWD/build/test/state PUEUE_CONFIG_PATH=$PWD/build/test/pueue cargo r -p bzbd -- --foreground'
+# shellcheck disable=SC2016
+expect_allow 'cargo --locked run -p bzbd isolated' Bash \
+  'BUSYBEE_STATE_DIR=$PWD/build/test/state PUEUE_CONFIG_PATH=$PWD/build/test/pueue cargo --locked run -p bzbd -- --foreground'
+expect_allow 'cargo --locked r -p pueued isolated' Bash \
+  'PUEUE_CONFIG_PATH=build/test/pueue cargo --locked r -p pueued -- --daemonize'
 expect_allow 'git clean -fd' Bash 'git clean -fd'
 expect_allow 'isolated pueued' Bash \
   'PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
@@ -189,6 +207,9 @@ expect_allow 'absolute env with isolated pueued' Bash \
 # shellcheck disable=SC2016
 expect_allow 'cd then CLAUDE_PROJECT_DIR config path' Bash \
   'cd "$HOME" && PUEUE_CONFIG_PATH=$CLAUDE_PROJECT_DIR/build/test/pueue pueued --daemonize'
+# shellcheck disable=SC2016
+expect_allow 'grouped cd then CLAUDE_PROJECT_DIR config path' Bash \
+  '(cd "$HOME" && PUEUE_CONFIG_PATH=$CLAUDE_PROJECT_DIR/build/test/pueue pueued --daemonize)'
 expect_allow 'read cargo config' Bash 'cat .cargo/config.toml'
 expect_allow 'read runtime hook' Bash 'cat .claude/hooks/machine-safety-hook.sh'
 expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"

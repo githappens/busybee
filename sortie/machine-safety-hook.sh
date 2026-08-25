@@ -420,13 +420,48 @@ known_non_launch() {
 }
 
 # Empty: not cargo run. bzbd/pueued: classified package/bin. unknown: cargo run
-# whose target we will not guess.
+# whose target we will not guess. Accepts run|r and a short list of Cargo
+# global options that may precede the command.
 cargo_run_daemon_target() {
-  local args=${1##+([[:space:]])}
+  local args=${1##+([[:space:]])} tok
   if [[ $args =~ ^\+[^[:space:]]+[[:space:]]+(.*)$ ]]; then
     args=${BASH_REMATCH[1]}
   fi
-  [[ $args =~ ^run([[:space:]]|$) ]] || { printf ''; return 0; }
+  while :; do
+    args=${args##+([[:space:]])}
+    [ -n "$args" ] || { printf ''; return 0; }
+    tok=${args%%[[:space:]]*}
+    case "$tok" in
+      --locked|--offline|--frozen|--quiet|-q|--verbose|-v|--version|-V|--list)
+        args=${args#"$tok"}
+        ;;
+      --color|--config|-Z|--manifest-path|--target-dir|--target|-C|--explain)
+        args=${args#"$tok"}
+        args=${args##+([[:space:]])}
+        [ -n "$args" ] || { printf 'unknown'; return 0; }
+        tok=${args%%[[:space:]]*}
+        args=${args#"$tok"}
+        ;;
+      --color=*|--config=*|--manifest-path=*|--target-dir=*|--target=*|-Z=*|--explain=*)
+        args=${args#"$tok"}
+        ;;
+      -*)
+        printf 'unknown'
+        return 0
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  args=${args##+([[:space:]])}
+  case "${args%%[[:space:]]*}" in
+    run|r) ;;
+    *)
+      printf ''
+      return 0
+      ;;
+  esac
   if [[ $args =~ (^|[[:space:]])(-p|--package|--bin)[[:space:]]+bzbd([[:space:]]|$) ]] \
     || [[ $args =~ --(package|bin)=bzbd([[:space:]]|$) ]]; then
     printf 'bzbd'
@@ -569,6 +604,19 @@ case "$tool" in
     for seg in "${segments[@]}"; do
       peel_segment "$seg"
       base=$(daemon_basename "$argv0")
+      # Grouping `(cd` / `{cd` is not a full subshell parser: treat it as an
+      # unclassified cwd change so later relative paths are not trusted.
+      cwd_base=$base
+      while [[ $cwd_base == '('* || $cwd_base == '{'* ]]; do
+        cwd_uncertain=1
+        cwd_base=${cwd_base#(}
+        cwd_base=${cwd_base#\{}
+      done
+      case "$cwd_base" in
+        cd|pushd|popd)
+          cwd_uncertain=1
+          ;;
+      esac
       if [ "$base" = git ] && git_clean_removes_ignored "$rest_args"; then
         deny "do not modify the machine-safety hook or its settings"
       fi
