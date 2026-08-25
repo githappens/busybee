@@ -585,6 +585,21 @@ git_clean_removes_ignored() {
   return 1
 }
 
+# `git stash --all` includes ignored files and removes `.claude/`.
+git_stash_includes_ignored() {
+  local args=$1 tok
+  [[ $args =~ (^|[[:space:]])stash([[:space:]]|$) ]] || return 1
+  # shellcheck disable=SC2086
+  for tok in $args; do
+    case "$tok" in
+      --all) return 0 ;;
+      --*) continue ;;
+      -*[aA]*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 claude_runtime_dir_in() {
   [[ $1 =~ (^|[[:space:]\"\'/])(\./)?\.claude(/|[[:space:]\"\']|$) ]] && return 0
   # `.*` and `.[!.]*` expand to `.claude`; do not interpret the glob.
@@ -796,7 +811,7 @@ case "$tool" in
           esac
           ;;
       esac
-      if [ "$base" = git ] && git_clean_removes_ignored "$rest_args"; then
+      if [ "$base" = git ] && { git_clean_removes_ignored "$rest_args" || git_stash_includes_ignored "$rest_args"; }; then
         deny "do not modify the machine-safety hook or its settings"
       fi
       case "$base" in

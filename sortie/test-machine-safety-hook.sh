@@ -86,6 +86,10 @@ expect_deny 'git clean -xfd' 'do not modify the machine-safety hook' Bash \
   'git clean -xfd'
 expect_deny 'git clean separated -x' 'do not modify the machine-safety hook' Bash \
   'git clean -f -d -x'
+expect_deny 'git stash push --all' 'do not modify the machine-safety hook' Bash \
+  'git stash push --all'
+expect_deny 'git stash -a' 'do not modify the machine-safety hook' Bash \
+  'git stash -a'
 expect_deny 'rm -rf .claude' 'do not modify the machine-safety hook' Bash \
   'rm -rf .claude'
 # shellcheck disable=SC2016
@@ -296,6 +300,8 @@ expect_allow 'cargo --locked run -p bzbd isolated' Bash \
 expect_allow 'cargo --locked r -p pueued isolated' Bash \
   'PUEUE_CONFIG_PATH=build/test/pueue cargo --locked r -p pueued -- --daemonize'
 expect_allow 'git clean -fd' Bash 'git clean -fd'
+expect_allow 'git stash push' Bash 'git stash push'
+expect_allow 'git stash push -u' Bash 'git stash push -u'
 expect_allow 'isolated pueued' Bash \
   'PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
 # shellcheck disable=SC2016
