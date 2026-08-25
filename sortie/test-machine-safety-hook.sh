@@ -112,6 +112,14 @@ expect_deny 'absolute env path unisolated pueued' \
 expect_deny 'unresolved XDG_CONFIG_HOME in state path' \
   'workspace-local PUEUE_CONFIG_PATH' Bash \
   'PUEUE_CONFIG_PATH=$XDG_CONFIG_HOME/pueue pueued --daemonize'
+# shellcheck disable=SC2016
+expect_deny 'cd then relative config path' \
+  'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'cd "$HOME" && PUEUE_CONFIG_PATH=.config/pueue pueued --daemonize'
+# shellcheck disable=SC2016
+expect_deny 'cd then PWD-prefixed config path' \
+  'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'cd "$HOME" && PUEUE_CONFIG_PATH=$PWD/build/test/pueue pueued --daemonize'
 expect_deny 'Write of runtime hook' 'do not modify the machine-safety hook' Write \
   "$root/.claude/hooks/machine-safety-hook.sh"
 expect_deny 'Edit of runtime settings' 'do not modify the machine-safety hook' Edit \
@@ -145,24 +153,50 @@ expect_allow 'env --chdir with PWD-prefixed config' Bash \
   'env --chdir="$HOME" PUEUE_CONFIG_PATH=$PWD/build/test/pueue pueued --daemonize'
 expect_allow 'absolute env with isolated pueued' Bash \
   '/usr/bin/env PUEUE_CONFIG_PATH=build/test/pueue pueued --daemonize'
+# shellcheck disable=SC2016
+expect_allow 'cd then CLAUDE_PROJECT_DIR config path' Bash \
+  'cd "$HOME" && PUEUE_CONFIG_PATH=$CLAUDE_PROJECT_DIR/build/test/pueue pueued --daemonize'
 expect_allow 'read cargo config' Bash 'cat .cargo/config.toml'
 expect_allow 'read runtime hook' Bash 'cat .claude/hooks/machine-safety-hook.sh'
 expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"
 
-# Exercise the same two copies made by WORKFLOW.md's before_run hook.
+# Exercise WORKFLOW.md's before_run install: payload from origin/main, even
+# when the checked-out issue branch does not contain those files.
 scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 git -C "$scratch" init -q
+git -C "$scratch" checkout -q -b main
+mkdir -p "$scratch/sortie"
+install -m 0755 "$hook" "$scratch/sortie/machine-safety-hook.sh"
+install -m 0644 "$settings" "$scratch/sortie/claude-settings.json"
+git -C "$scratch" add sortie
+git -C "$scratch" -c user.email=test@example.com -c user.name=test \
+  commit -qm 'payload on main'
+git -C "$scratch" checkout -q -b old-issue
+git -C "$scratch" rm -rq sortie
+git -C "$scratch" -c user.email=test@example.com -c user.name=test \
+  commit -qm 'issue branch without payload'
+git -C "$scratch" update-ref refs/remotes/origin/main main
 grep -qxF '/.claude/' "$scratch/.git/info/exclude" \
   || printf '/.claude/\n' >> "$scratch/.git/info/exclude"
 mkdir -p "$scratch/.claude/hooks"
-install -m 0755 "$hook" "$scratch/.claude/hooks/machine-safety-hook.sh"
-install -m 0644 "$settings" "$scratch/.claude/settings.json"
+hook_ref=origin/main
+if ! git -C "$scratch" cat-file -e "$hook_ref:sortie/machine-safety-hook.sh" 2>/dev/null; then
+  hook_ref=HEAD
+fi
+git -C "$scratch" show "$hook_ref:sortie/machine-safety-hook.sh" \
+  > "$scratch/.claude/hooks/machine-safety-hook.sh"
+chmod 0755 "$scratch/.claude/hooks/machine-safety-hook.sh"
+git -C "$scratch" show "$hook_ref:sortie/claude-settings.json" \
+  > "$scratch/.claude/settings.json"
+chmod 0644 "$scratch/.claude/settings.json"
 test -x "$scratch/.claude/hooks/machine-safety-hook.sh"
+test "$hook_ref" = origin/main
 jq -e '.hooks.PreToolUse[] | select(.matcher | contains("Bash"))' \
   "$scratch/.claude/settings.json" >/dev/null
 test -z "$(git -C "$scratch" status --porcelain)"
-printf 'ok - before_run hook payload\n'
+test ! -e "$scratch/sortie/machine-safety-hook.sh"
+printf 'ok - before_run hook payload from origin/main\n'
 
 if [ "$failures" -ne 0 ]; then
   printf '%s machine-safety test(s) failed\n' "$failures" >&2

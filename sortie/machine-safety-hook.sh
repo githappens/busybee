@@ -36,7 +36,7 @@ is_local_path() {
     *../*|*/..|..)
       return 1
       ;;
-    \$PWD|\$\{PWD\})
+    \$PWD|\$\{PWD\}|\$CLAUDE_PROJECT_DIR|\$\{CLAUDE_PROJECT_DIR\})
       return 0
       ;;
     \$PWD/*)
@@ -46,6 +46,16 @@ is_local_path() {
       ;;
     \$\{PWD\}/*)
       rest=${value#\$\{PWD\}/}
+      [[ $rest == *\$* ]] && return 1
+      return 0
+      ;;
+    \$CLAUDE_PROJECT_DIR/*)
+      rest=${value#\$CLAUDE_PROJECT_DIR/}
+      [[ $rest == *\$* ]] && return 1
+      return 0
+      ;;
+    \$\{CLAUDE_PROJECT_DIR\}/*)
+      rest=${value#\$\{CLAUDE_PROJECT_DIR\}/}
       [[ $rest == *\$* ]] && return 1
       return 0
       ;;
@@ -335,6 +345,9 @@ resolve_against_chdir() {
 
 # True when the named isolation variable is set to a workspace-local path
 # in this segment, after env -u/-i and after resolving against env --chdir.
+# After an earlier cd/pushd/popd, relative and $PWD paths are not local:
+# $PWD follows the new directory. Require $CLAUDE_PROJECT_DIR or an
+# absolute project path.
 state_path_is_local() {
   local value
   if ! value=$(env_value_for "$1"); then
@@ -342,6 +355,15 @@ state_path_is_local() {
   fi
   if [ -n "$peeled_chdir" ]; then
     value=$(resolve_against_chdir "$peeled_chdir" "$value")
+  fi
+  if [ "${cwd_uncertain:-0}" -eq 1 ]; then
+    case "$value" in
+      "$project_dir"|"$project_dir"/*|\$CLAUDE_PROJECT_DIR|\$CLAUDE_PROJECT_DIR/*|\$\{CLAUDE_PROJECT_DIR\}|\$\{CLAUDE_PROJECT_DIR\}/*)
+        ;;
+      *)
+        return 1
+        ;;
+    esac
   fi
   is_local_path "$value"
 }
@@ -445,6 +467,7 @@ case "$tool" in
 
     segments=()
     split_segments "$command" segments
+    cwd_uncertain=0
     for seg in "${segments[@]}"; do
       peel_segment "$seg"
       if [ "$peel_uncertain" -eq 1 ] && [[ $seg =~ (^|[^[:alnum:]_])(pueued|bzbd)([^[:alnum:]_]|$) ]]; then
@@ -453,6 +476,9 @@ case "$tool" in
       [ -n "$argv0" ] || continue
       base=$(daemon_basename "$argv0")
       case "$base" in
+        cd|pushd|popd)
+          cwd_uncertain=1
+          ;;
         pueued)
           if ! state_path_is_local PUEUE_CONFIG_PATH; then
             deny "launch pueued only with a workspace-local PUEUE_CONFIG_PATH"
