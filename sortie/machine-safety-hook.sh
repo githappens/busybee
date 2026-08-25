@@ -168,14 +168,17 @@ case "$tool" in
     if [[ $command =~ (^|[[:space:]\&;\|])nix[[:space:]]+profile[[:space:]]+(install|add)([[:space:]]|$) ]]; then
       deny "do not run nix profile install from an agent workspace"
     fi
+    if [[ $command =~ nix[[:space:]]+profile[[:space:]]+(remove|upgrade)[[:space:]].*(busybee|bzb|bzbd|pueued) ]]; then
+      deny "do not install or replace the global busybee/bzb/bzbd/pueued binaries"
+    fi
     if [[ $command =~ (^|[[:space:]\&;\|])cargo([[:space:]]+\+[^[:space:]]+)?[[:space:]]+install([[:space:]]|$) ]]; then
       deny "do not run cargo install from an agent workspace"
     fi
     if [[ $command =~ (^|[[:space:]\&;\|])(\./)?scripts/buildanddeploy\.sh([[:space:]]|$) ]]; then
       deny "do not install or replace the global busybee/bzb/bzbd/pueued binaries"
     fi
-    if [[ $command =~ (cp|mv|install)[[:space:]].*(/usr/local/bin|/opt/homebrew/bin|/\.cargo/bin|/\.nix-profile/bin|/\.local/bin)/(busybee|bzb|bzbd|pueued)([^[:alnum:]_.-]|$) ]]; then
-      deny "do not write to a global busybee/bzb/bzbd/pueued binary"
+    if [[ $command =~ (cp|mv|install|rm|ln)[[:space:]].*(/usr/local/bin|/opt/homebrew/bin|/\.cargo/bin|/\.nix-profile/bin|/\.local/bin)/(busybee|bzb|bzbd|pueued)([^[:alnum:]_.-]|$) ]]; then
+      deny "do not install or replace a global busybee/bzb/bzbd/pueued binary"
     fi
 
     if [[ $command =~ git[[:space:]]+clean[[:space:]].*-[a-zA-Z]*[xX] ]]; then

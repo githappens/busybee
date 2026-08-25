@@ -86,12 +86,20 @@ expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"
 # Global install / deploy and .cargo/config.toml.
 expect_deny 'nix profile install' 'nix profile install' Bash \
   'nix profile install .'
+expect_deny 'nix profile upgrade busybee' 'global busybee/bzb/bzbd/pueued' Bash \
+  'nix profile upgrade busybee'
+expect_deny 'nix profile remove busybee' 'global busybee/bzb/bzbd/pueued' Bash \
+  'nix profile remove busybee'
 expect_deny 'cargo install' 'cargo install' Bash \
   'cargo +stable install bzb'
 expect_deny 'deploy script' 'global busybee/bzb/bzbd/pueued' Bash \
   './scripts/buildanddeploy.sh'
 expect_deny 'copy to ~/.local/bin' 'global busybee/bzb/bzbd/pueued' Bash \
   "cp build/release/bzbd '$HOME/.local/bin/bzbd'"
+expect_deny 'rm ~/.local/bin/bzb' 'global busybee/bzb/bzbd/pueued' Bash \
+  "rm '$HOME/.local/bin/bzb'"
+expect_deny 'ln -sf to ~/.local/bin/bzb' 'global busybee/bzb/bzbd/pueued' Bash \
+  "ln -sf build/release/bzb '$HOME/.local/bin/bzb'"
 expect_deny 'Edit of cargo config' 'do not edit .cargo/config.toml' Edit \
   "$root/.cargo/config.toml"
 expect_deny 'Bash write to cargo config' 'do not edit .cargo/config.toml' Bash \
