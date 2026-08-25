@@ -129,8 +129,9 @@ split_segments() {
 
 # Peel leading VAR=val assignments and unwrap supported wrappers from one
 # segment. Sets: peeled_env (name=value lines), argv0, rest_args,
-# peeled_chdir (env -C/--chdir operand), peel_uncertain (1 when an env
-# option could not be parsed confidently).
+# peeled_chdir (a single env -C/--chdir operand), peel_uncertain (1 when
+# an env option could not be parsed confidently). A second cwd wrapper
+# sets cwd_uncertain rather than composing directories.
 peel_segment() {
   local seg=$1
   local rest=${seg##+([[:space:]])}
@@ -233,15 +234,22 @@ peel_segment() {
             peel_uncertain=1
             return 0
           fi
+          # One env -C/--chdir is resolved; a second cwd wrapper is not composed.
+          if [ -n "$peeled_chdir" ]; then
+            cwd_uncertain=1
+          fi
           peeled_chdir=${BASH_REMATCH[1]}
           rest=${BASH_REMATCH[3]-}
           ;;
         --chdir=*)
-          peeled_chdir=${tok#--chdir=}
-          if [ -z "$peeled_chdir" ]; then
+          if [ -z "${tok#--chdir=}" ]; then
             peel_uncertain=1
             return 0
           fi
+          if [ -n "$peeled_chdir" ]; then
+            cwd_uncertain=1
+          fi
+          peeled_chdir=${tok#--chdir=}
           rest=$optarg
           ;;
         -*)

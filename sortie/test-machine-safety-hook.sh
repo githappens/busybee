@@ -133,6 +133,15 @@ expect_deny 'env --chdir then relative config path' \
 expect_deny 'env -C then relative config path' \
   'workspace-local PUEUE_CONFIG_PATH' Bash \
   'env -C "$HOME" PUEUE_CONFIG_PATH=.config/pueue pueued --daemonize'
+# Nested env -C is not composed: a second cwd wrapper makes relative paths unsafe.
+# shellcheck disable=SC2016
+expect_deny 'nested env -C then relative config path' \
+  'workspace-local PUEUE_CONFIG_PATH' Bash \
+  'env -C "$HOME" env -C . PUEUE_CONFIG_PATH=.config/pueue pueued --daemonize'
+# shellcheck disable=SC2016
+expect_deny 'nested env -C then relative bzbd paths' \
+  'workspace-local BUSYBEE_STATE_DIR' Bash \
+  'env -C "$HOME" env -C . BUSYBEE_STATE_DIR=build/state PUEUE_CONFIG_PATH=build/pueue bzbd'
 expect_deny 'absolute env path unisolated pueued' \
   'workspace-local PUEUE_CONFIG_PATH' Bash \
   '/usr/bin/env pueued --daemonize'
@@ -210,6 +219,12 @@ expect_allow 'cd then CLAUDE_PROJECT_DIR config path' Bash \
 # shellcheck disable=SC2016
 expect_allow 'grouped cd then CLAUDE_PROJECT_DIR config path' Bash \
   '(cd "$HOME" && PUEUE_CONFIG_PATH=$CLAUDE_PROJECT_DIR/build/test/pueue pueued --daemonize)'
+# shellcheck disable=SC2016
+expect_allow 'nested env -C then CLAUDE_PROJECT_DIR config path' Bash \
+  'env -C "$HOME" env -C . PUEUE_CONFIG_PATH=$CLAUDE_PROJECT_DIR/build/pueue pueued --daemonize'
+# shellcheck disable=SC2016
+expect_allow 'nested env -C then CLAUDE_PROJECT_DIR bzbd paths' Bash \
+  'env -C "$HOME" env -C . BUSYBEE_STATE_DIR=$CLAUDE_PROJECT_DIR/build/state PUEUE_CONFIG_PATH=$CLAUDE_PROJECT_DIR/build/pueue bzbd'
 expect_allow 'read cargo config' Bash 'cat .cargo/config.toml'
 expect_allow 'read runtime hook' Bash 'cat .claude/hooks/machine-safety-hook.sh'
 expect_allow 'edit ordinary source' Write "$root/crates/bzb/src/main.rs"
