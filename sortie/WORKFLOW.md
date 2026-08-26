@@ -160,18 +160,8 @@ Blocked-by issues (all must already be merged on `main`): {{ range $i, $b := .is
 
 ## Ground rules
 
-1. **Read first.** `CLAUDE.md` (if present) for build/test commands and layout, then
-   `docs/design/bzbd.md` — **the design document is the specification.** Every
-   rule, state machine, table and contract is decided there; conform to it, do
-   not redesign. If the spec and the task conflict, the task wins for scope and
-   the spec wins for semantics; say so in the PR body. If your change alters
-   behaviour the spec describes, update the spec section in the same PR.
-2. **Scope.** Implement exactly the issue's Scope and Acceptance criteria. No
-   adjacent refactors, no speculative features. If something outside scope
-   blocks you, write `blocked` to `.sortie/status` with one line explaining why,
-   and stop. If the acceptance criteria cannot be made to pass and every
-   remaining move is low-confidence, write `blocked` with one line of reasoning
-   and stop; that is a successful escalation, not a failed attempt.
+1. **Read first.** `CLAUDE.md` (build/test/layout) and `docs/design/bzbd.md` (the specification; `AGENTS.md` §Conform to the specification). If the spec and the task conflict, the task wins for scope and the spec wins for semantics; say so in the PR body.
+2. **Scope.** The issue's Scope and Acceptance criteria are the whole scope (`AGENTS.md` §Stay within the issue's scope). If something outside that blocks you, or the criteria cannot be made to pass and remaining moves are low-confidence, write `blocked` to `.sortie/status` with one line of reasoning and stop; that is a successful escalation, not a failed attempt.
 3. **Use these skills when they are available (check the skill list):**
    - `ponytail:ponytail` before writing any code — simplest solution that
      works: standard library before dependencies, one function before an
@@ -182,27 +172,16 @@ Blocked-by issues (all must already be merged on `main`): {{ range $i, $b := .is
    - `superpowers:systematic-debugging` the moment a test fails unexpectedly or
      behaviour surprises you — form a hypothesis from evidence before changing
      code; no guess-and-rerun loops.
-   The issue's acceptance criteria are the whole scope.
-4. **TDD.** Write the failing test named in the issue first, then the code. Never
-   weaken, skip, or delete an existing test to get green; if a test disagrees
-   with your change, assume the code is wrong until proven otherwise.
-5. **No silent fallbacks.** Errors propagate with context; degraded paths must be
-   loud. Do not add `unwrap_or_default`-style masking to make something pass.
-6. **Build and test through the dev shell.** `cargo test --workspace`,
-   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all`
-   are allowed as-is. Wrap Busy Bee / Pueue in `.claude/isolated.sh` so they
-   cannot see the user's daemons: `.claude/isolated.sh busybee -- cargo test --workspace`,
+4. **TDD.** Failing test first; never weaken, skip, or delete an existing test to get green (`CLAUDE.md` §Conventions).
+5. **No silent fallbacks.** Errors propagate with context; degraded paths stay loud (`CLAUDE.md` §Conventions, `AGENTS.md` §No silent fallbacks).
+6. **Build and test.** Commands live in `CLAUDE.md` §Build and test; cargo test/clippy/fmt are allowed as-is.
+   Wrap Busy Bee / Pueue in `.claude/isolated.sh` so they cannot see the user's
+   daemons: `.claude/isolated.sh busybee -- cargo test --workspace`,
    `.claude/isolated.sh bzb -- xcodebuild ...`, `.claude/isolated.sh bzb -- cmake --build ...`.
    Cargo output goes to `build/`; do not change `.cargo/config.toml`. Never
    install or replace the machine's global `busybee`/`bzb`/`bzbd`/`pueued`.
-7. **Isolation.** Integration tests spawn their own `pueued`/`bzbd` in a temp
-   dir. Direct `bzb`/`busybee`/`bzbd`/`pueued`/`pueue` Bash is denied; use
-   `.claude/isolated.sh`. The PreToolUse hook is a guard for cooperative
-   agents, not a same-UID sandbox.
-8. **Public repo hygiene.** Everything you write — code, comments, tests,
-   fixtures, commit messages, PR text — is public. Use generic examples only: no
-   machine names, user names, local paths, or references to other projects.
-   No AI co-author trailers in commits.
+7. **Isolation.** Integration tests spawn their own `pueued`/`bzbd` (`CLAUDE.md` §Integration tests). Direct `bzb`/`busybee`/`bzbd`/`pueued`/`pueue` Bash is denied; use `.claude/isolated.sh`. The PreToolUse hook is a guard for cooperative agents, not a same-UID sandbox.
+8. **Public repo hygiene.** Generic examples only; no machine names, user names, local paths, or other projects (`AGENTS.md` §Public repository hygiene). No AI co-author trailers in commits.
 
 ## Prohibitions
 
@@ -316,8 +295,9 @@ Acknowledge each `waiting` or `blocked` id with 👀:
 `gh api -X POST repos/githappens/busybee/pulls/comments/<id>/reactions -f content=eyes`.
 P0/P1 findings block until the reviewer clears the head. P2/P3 findings clear
 when their threads carry an author reply; fix one only when the fix is small and
-inside the acceptance criteria, otherwise defer it to a follow-up issue. A bare
-acknowledgement is not an answer: state the fix, or why it does not apply here.
+inside the acceptance criteria, otherwise defer it to a follow-up issue.
+<!-- Reply-contract twin: .github/workflows/codex-gate.yml (Decide prompt). -->
+A bare acknowledgement is not an answer: state the fix, or why it does not apply here.
 
 Reply with
 `gh api -X POST repos/githappens/busybee/pulls/<pr>/comments -F in_reply_to=<id> -f body='…'`.

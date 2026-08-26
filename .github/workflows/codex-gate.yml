@@ -236,6 +236,7 @@ jobs:
               Codex comment says, despite variable wording, that its review found no
               major issues. A task-started message, acknowledgement or ambiguous
               comment is UNSURE.
+            # Reply-contract twin: sortie/WORKFLOW.md (Automated review findings).
             - Before approving answered P2/P3 findings, require each author reply to
               state a reason for not changing this PR (scope, spec, not applicable,
               or a linked follow-up). A bare acknowledgement, or a promise that a fix
