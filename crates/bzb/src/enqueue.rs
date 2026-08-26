@@ -14,6 +14,8 @@
 
 use std::{
     collections::BTreeMap,
+    io::Write,
+    os::unix::process::CommandExt,
     time::{Duration, Instant},
 };
 
@@ -21,9 +23,10 @@ use anyhow::{bail, Context, Result};
 use bzb_core::{
     classify::{classify, default_table, Class, Overrides},
     client,
-    daemon::connect_or_spawn_bzbd,
+    daemon::{connect_or_spawn_bzbd, socket_path, Connection},
     log::fetch_log_chunk,
-    protocol::{LeaseEvent, LeaseRequest, Request},
+    nest::{self, LEASE_ENV},
+    protocol::{LeaseEvent, LeaseRequest, Request, Response},
     wait::QueueLines,
 };
 use pueue_lib::Client;
@@ -67,6 +70,14 @@ pub async fn run(
     class: Option<Class>,
     cores: Option<u32>,
 ) -> Result<()> {
+    if let Some(id) = live_parent_lease().await? {
+        // The parent already holds the machine. Queueing would deadlock
+        // (`docs/design/bzbd.md` §Nesting). stderr first, flushed, then exec
+        // so the command's own exit code is this process's.
+        eprintln!("{}", nest::passthrough_line(id));
+        let _ = std::io::stderr().flush();
+        exec_command(&cmd)?;
+    }
     let request = lease_request(cmd, name, class, cores, false)?;
     // Only for the running line: the class the task is admitted under is the
     // daemon's to decide and comes back in the event.
@@ -245,6 +256,41 @@ fn format_elapsed(d: Duration) -> String {
     } else {
         format!("{}h{:02}m", s / 3600, (s / 60) % 60)
     }
+}
+
+/// A live parent lease this process is running under, if any. Talks to bzbd
+/// only when the marker is present, so the common un-nested path does not
+/// grow a status round-trip. An unreachable daemon is not a parent: the
+/// submit path below will start one, and a stale export must not disable
+/// gating.
+async fn live_parent_lease() -> Result<Option<u64>> {
+    let marker = std::env::var(LEASE_ENV).ok();
+    if marker
+        .as_deref()
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let socket = socket_path()?;
+    let Some(mut conn) = Connection::connect_if_listening(&socket).await? else {
+        return Ok(None);
+    };
+    conn.send(Request::Status).await?;
+    match conn.recv().await? {
+        Response::Status(status) => Ok(nest::passthrough_parent(marker.as_deref(), &status.leases)),
+        Response::Error { message } => {
+            bail!("cannot read status to check nesting: {message}")
+        }
+        other => bail!("expected a status reply while checking nesting, got {other:?}"),
+    }
+}
+
+/// Replaces this process with `cmd`. Returns only if the exec itself failed.
+fn exec_command(cmd: &[String]) -> Result<()> {
+    anyhow::ensure!(!cmd.is_empty(), "no command given");
+    let err = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
+    Err(err).with_context(|| format!("cannot exec {}", cmd[0]))
 }
 
 #[cfg(test)]
