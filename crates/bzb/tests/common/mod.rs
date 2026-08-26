@@ -163,7 +163,7 @@ pub fn stdout(output: &Output) -> String {
 /// Runs `cmd` with piped output, killing it if it has not exited by `timeout`.
 pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Output {
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn busybee");
+    let child = cmd.spawn().expect("spawn busybee");
     let pid = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
