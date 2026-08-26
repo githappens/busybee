@@ -341,6 +341,8 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
     // collision guard below covers them too: these two report the bargain the
     // task was admitted under, and a row that replaced them would describe
     // itself to the task as something other than what the scheduler booked.
+    // `BUSYBEE_LEASE` is filled at admission (the classifier does not know
+    // the id) and is reserved by name so a row cannot take it either.
     plan.env_set
         .push(("BUSYBEE_CLASS".to_string(), class.as_str().to_string()));
     plan.env_set
@@ -358,7 +360,10 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
             let taken = plan.env_set.iter().any(|(set, _)| set == name);
             let reserved =
                 class == Class::Jobserver && JOBSERVER_AUTH_VARS.contains(&name.as_str());
-            if taken || reserved {
+            // The daemon writes `BUSYBEE_LEASE` at admission; a row that set
+            // it here would be overwritten there, which is a silent drop.
+            let owned = name == crate::nest::LEASE_ENV;
+            if taken || reserved || owned {
                 plan.notices.push(format!(
                     "the {} row for {} sets {name}; busybee owns that variable and the \
                      configured value is dropped",
@@ -761,10 +766,10 @@ mod tests {
     }
 
     /// `BUSYBEE_CLASS` and `BUSYBEE_CORES` are how a task reports the bargain
-    /// it was admitted under, so a row's own variables may not take them
-    /// either. They are injected for every class, not by a recipe, so the
-    /// collision has to be caught for them by name rather than by whatever
-    /// [`apply_injection`] happened to set.
+    /// it was admitted under, and `BUSYBEE_LEASE` is how a nested client
+    /// knows not to queue; a row's own variables may not take any of them.
+    /// The first two are injected here; the lease id is filled at admission
+    /// and reserved by name so the collision is still loud.
     #[test]
     fn a_rows_own_env_cannot_take_the_busybee_variables() {
         let table = Table {
@@ -777,6 +782,10 @@ mod tests {
                 env_set: vec![
                     ("BUSYBEE_CLASS".to_string(), "none".to_string()),
                     ("BUSYBEE_CORES".to_string(), "64".to_string()),
+                    (
+                        crate::nest::LEASE_ENV.to_string(),
+                        "not-a-real-lease".to_string(),
+                    ),
                 ],
             }],
         };
@@ -805,6 +814,15 @@ mod tests {
         );
         assert!(plan.notices.iter().any(|n| n.contains("BUSYBEE_CLASS")));
         assert!(plan.notices.iter().any(|n| n.contains("BUSYBEE_CORES")));
+        assert!(plan.notices.iter().any(|n| n.contains("BUSYBEE_LEASE")));
+        assert!(
+            !plan
+                .env_set
+                .iter()
+                .any(|(k, _)| k == crate::nest::LEASE_ENV),
+            "the daemon owns BUSYBEE_LEASE; env_set was {:?}",
+            plan.env_set
+        );
     }
 
     /// `docs/design/bzbd.md` §Classification: forcing static or none off the

@@ -1,6 +1,6 @@
 //! The injection plan, executed: jobserver tasks get the fifo, static tasks
 //! get tokens drained on their behalf and the count injected, and every task
-//! gets `BUSYBEE_CLASS` / `BUSYBEE_CORES`.
+//! gets `BUSYBEE_CLASS` / `BUSYBEE_CORES` / `BUSYBEE_LEASE`.
 //!
 //! Real GNU make from the dev shell on a Makefile of `sleep` targets; an
 //! isolated `pueued` and a `bzbd` in a temporary state directory. Each target
@@ -229,6 +229,10 @@ async fn a_make_lease_joins_the_pool_and_returns_every_token() {
     assert!(
         env.lines().any(|l| l == "BUSYBEE_CORES=4"),
         "no BUSYBEE_CORES=4 in:\n{env}"
+    );
+    assert!(
+        env.lines().any(|l| l == "BUSYBEE_LEASE=1"),
+        "no BUSYBEE_LEASE=1 in:\n{env}"
     );
 }
 

@@ -31,6 +31,7 @@ use bzb_core::{
     exit_code::task_result_to_exit_code,
     group::BUSYBEE_GROUP,
     jobserver::Jobserver,
+    nest::LEASE_ENV,
     protocol::{LeaseEvent, LeaseRequest, LeaseView, StatusReply},
     scheduler::{Action, Event, LeaseId, Params, Request as LeaseSpec, Scheduler},
 };
@@ -804,13 +805,18 @@ impl Leases {
         // anything else is told the tokens it actually holds, with the
         // implicit one as the minimum.
         let share = cores.unwrap_or(got.max(1));
-        let injected = inject(
+        let mut injected = inject(
             &lease.plan,
             lease.request.argv.len(),
             lease.request.env.clone(),
             &self.jobserver.path().display().to_string(),
             share,
         );
+        // Nested clients look this up and skip the queue
+        // (`docs/design/bzbd.md` §Nesting). Always overwrite: a caller that
+        // carried a stale value, or a row that tried to set it, must not keep
+        // it. The id is this lease's, known only here.
+        injected.env.insert(LEASE_ENV.to_string(), id.0.to_string());
         let spec = TaskSpec {
             command: shell_escape_join(&injected.argv),
             cwd: lease.request.cwd.clone(),
