@@ -108,7 +108,7 @@ The board (Projects → "busybee · bzbd", Kanban view) mirrors these labels thr
      (from `claude setup-token`; tied to the Max subscription, so it expires with
      it and shares its rate window).
   3. `reactions.bot_review` routes Codex's comments to the agent as a continuation
-     turn (max 5 per issue, then `needs-human`).
+     turn (`reactions.bot_review.max_continuation_turns` in `WORKFLOW.md`, then `needs-human`).
   4. `reactions.auto_merge` squash-merges once the decision is APPROVED and CI is
      green; `reactions.merge_completion` sets `sortie:done` and closes the issue;
      the unblock sidecar releases dependents.
