@@ -102,7 +102,7 @@ A required token (`--build`, `build`) counts only as the tool's *first* argument
 For `make`/`gmake` the parallelism scan walks argv the way make's own option parser does, because only the `-j` make actually sees overrides the injected jobserver: short options cluster (`-ksj8` puts `-j8` in `MAKEFLAGS`), the first value-taking option in a cluster swallows the rest of the token (`-Cjobs` is a directory, `-EFOO=j` an expression) and, when that value is mandatory, the next argument too (`make -f -kj` builds a makefile named `-kj`), and `--` ends the options. Other tools keep the plain scan for the flags their row lists.
 
 3. Overrides: `--class jobserver|static|none`, `--cores N` (static target; ignored with a notice for jobserver class). A user-supplied parallelism flag always wins over injection and produces a one-line notice.
-4. Every task additionally gets `BUSYBEE_CLASS=<class>` and `BUSYBEE_CORES=<fair share>` in its env so opaque scripts can cooperate (`xcodebuild ... -jobs "${BUSYBEE_CORES:-8}"`). This is the only remedy for argv-only tools hidden inside scripts.
+4. Every task additionally gets `BUSYBEE_CLASS=<class>`, `BUSYBEE_CORES=<fair share>` and `BUSYBEE_LEASE=<id>` in its env. The first two are so opaque scripts can cooperate (`xcodebuild ... -jobs "${BUSYBEE_CORES:-8}"`). `BUSYBEE_LEASE` is how a nested `busybee` sees that it is already running under a lease and skips the queue (§Nesting). This is the only remedy for argv-only tools hidden inside scripts, and the only remedy for re-entrancy.
 
 The `Plan` is data: `{ class, tool: String, env_set: Vec<(String,String)>, env_append: Vec<(String,String)>, env_unset: Vec<String>, argv: Vec<String>, cores_wanted: Option<u32>, notices: Vec<String> }`. Executing it is a separate concern.
 
@@ -121,6 +121,14 @@ busybee: note: you passed -j8; ninja will ignore the shared pool
 busybee: command exited 0 (elapsed 2m14s)
 ```
 
+A nested blocking client that runs inside an already-admitted task prints one more line, then `exec`s:
+
+```
+busybee: nested under lease 3, passing through
+```
+
+That client *is* the parent task, so the line lands in the task's combined output — the outer client's stdout — not on the outer client's stderr. `--detach` does not take this path.
+
 A `none` task reports the pool rather than a held count: it is admitted alone, so the cores it holds a token for understate what it was granted.
 
 Notices the classifier raises about the request itself (a `-j` that defeats the pool, a `--cores` the class ignores) precede `Queued`, since a `--detach` client returns on that event and would never see one raised after it. A notice raised at admission — a static drain that found no token within its deadline — follows `Queued` and precedes `Admitted`.
@@ -133,6 +141,20 @@ Exit-code mapping is unchanged (`bzb-core/src/exit_code.rs`).
 busybee: lease 7 detached (pueue task assigned once admitted)
 busybee: lease 7 detached (pueue task 12)
 ```
+
+## Nesting
+
+A `busybee --` whose command itself invokes `busybee --` used to deadlock: the outer lease holds the machine, the inner client queues behind it, and both wait forever. The stall is indistinguishable from a slow build. That is not a user error. The documented pattern is that scripts gate their own compiler invocations so they can be called bare, and that agents wrap heavy commands in `busybee --`. Those two compose: `busybee -- ./build.sh` where `build.sh` already contains `busybee -- cargo`. GNU make solved the same shape with `MAKEFLAGS`; busybee does the same with an env marker. Tracking: githappens/busybee#64.
+
+**Client-side, no script parsing.** At admission the daemon writes `BUSYBEE_LEASE=<id>` into the task's environment. A blocking client that starts with that variable set asks bzbd whether the named lease is still live (`running` or `orphaned`, not `queued`). If it is, the parent already holds the machine: the client prints the pass-through line and `exec`s the command. No second lease, no queue, no tokens taken. Deeper nesting sees the same marker and passes through the same way.
+
+A stale marker — exported in a shell, a lease that has already finished, a value that is not a lease id — does not match a live lease, so the client submits normally. The common un-nested path does not talk to bzbd for this: the marker is absent, and there is no extra status round-trip.
+
+`--detach` is not this path. A nested detach is asking to queue a second lease and return, and it can, because detach returns on `Queued` rather than waiting for the parent to finish.
+
+`env -u BUSYBEE_LEASE` restores strict queueing for one invocation. Under an exclusive parent that is a deadlock again, which is why there is no `--no-passthrough` flag: the flag would be a way to request the bug. Unsetting the marker is the escape hatch for the rare case where the parent is jobserver or static and a nested command genuinely wants its own lease.
+
+**Not done here.** Walking `/proc` to treat a descendant pid as nested even when the marker was stripped (`env -i`, ssh) is parked. The observed footgun inherits the environment. The inner busybee is a descendant of pueued's child, not of the outer client, so the walk needs the task pid (which pueue's status does not carry) and a `/proc` that macOS does not have. Erroring out ("self-deadlock detected; drop the outer busybee") was considered and rejected: it breaks the composition the docs recommend, and agents would then unwrap at random. Pass-through is the make-jobserver answer. A daemon-side "grant immediately, shared with the parent" would still create a second pueue task and a second concurrent slot, which an exclusive parent must not give away.
 
 ## Failure and recovery
 
@@ -191,10 +213,11 @@ with a notice rather than leaving a task that reserves no tokens running
 outside the pool. A jobserver row owns `CARGO_MAKEFLAGS` on the same grounds
 even though the forced injection sets only `MAKEFLAGS` — cargo reads the
 cargo-specific spelling first, so leaving it open would be the same escape by
-another name. The same holds for the `BUSYBEE_CLASS` and `BUSYBEE_CORES`
-of point 4 above, which every class injects: they are how a task reads back the
-bargain it was admitted under, so a row cannot describe itself to the task as
-something other than what the scheduler booked.
+another name. The same holds for the `BUSYBEE_CLASS`, `BUSYBEE_CORES` and `BUSYBEE_LEASE`
+of point 4 above: the first two are how a task reads back the bargain it was
+admitted under, the third is how a nested client knows not to queue behind
+its parent, so a row cannot describe itself to the task as something other
+than what the scheduler booked, nor take the re-entrancy marker.
 
 Reload is SIGHUP or `busybee config reload`, which is the same reload over the
 socket so the client can report a refusal instead of leaving it in the log. New
@@ -223,6 +246,7 @@ crates/bzb-core/src/scheduler.rs   admission state machine                 (#4)
 crates/bzb-core/src/jobserver.rs   fifo create/seed/acquire/release/FIONREAD (#5)
 crates/bzb-core/src/protocol.rs    client<->bzbd messages (serde, JSON lines) (#6)
 crates/bzb-core/src/config.rs      config file + overrides                 (#11)
+crates/bzb-core/src/nest.rs        env marker + live leases → pass through  (#64)
 crates/bzbd/                       daemon binary: server, leases, submit, inject, recovery
 crates/bzb/src/enqueue.rs          client on the bzbd protocol             (#9)
 crates/bzb/src/status.rs           `busybee status`                        (#10)
@@ -237,7 +261,7 @@ crates/bzb/src/monitor/            TUI on bzbd data                        (#19)
 | scheduler | pure state machine tests, no IO (same style as `bzb-core/src/wait.rs`) |
 | jobserver | integration tests running real GNU make 4.4 from the dev shell on a Makefile of `sleep` targets; assert peak concurrency ≤ pool + 1 via a counter file (the `+ 1` is the implicit job every participant runs without a token, see admission rule 1); two makes sharing one fifo, bound at pool + 2; FIONREAD accounting |
 | bzbd + pueue | isolated `pueued` + `bzbd` in a temp dir, extending `crates/bzb/tests/common/pueued.rs` |
-| client | `crates/bzb/tests/smoke.rs` extended: exit codes, Ctrl-C, detach, preamble lines |
+| client | `crates/bzb/tests/smoke.rs` extended: exit codes, Ctrl-C, detach, preamble lines, nested pass-through |
 | recovery | `crates/bzbd/tests/recovery.rs`: kill bzbd mid-task and restart; SIGTERM bzbd mid-task; SIGKILL a client mid-task; kill pueued mid-task; stale fifos at startup |
 
 Dev shell gains `gnumake` and `ninja`. CI (#14) runs the full suite on macOS and Linux.
@@ -247,6 +271,7 @@ Dev shell gains `gnumake` and `ninja`. CI (#14) runs the full suite on macOS and
 - **Keep pueue, add a broker** rather than replacing pueue: the broker is the novel part; pueue's supervision/logging stays useful; busybee keeps working during the transition. Replacing pueue later is a contained follow-up (give bzbd spawn duties).
 - **Opt-in join** (only `busybee --`-wrapped commands see the fifo) rather than exporting `MAKEFLAGS` globally: no always-on daemon, nothing breaks when bzbd is down. Ambient mode is parked (#15).
 - **Unknown → none**: every unrecognised command seen in practice was a benchmark, render, or opaque script — all of which want exclusivity. The override table and `--class` are the escape hatches.
+- **Nested `busybee` passes through**: a child whose parent already holds a lease `exec`s rather than queueing or erroring out. Error-out would break the documented composition (scripts self-gate so they can be called bare; agents wrap heavy commands). PID-ancestry as a belt-and-braces for `env -i` is parked (#64).
 - **User-supplied parallelism wins, class is unchanged**: `ninja -j8`, `make -j8` and the env spelling of the same thing (`env MAKEFLAGS=-j100 make`) all defeat the injection, so the task runs uncontrolled while admitted as `jobserver`, which reserves nothing. Accepted knowingly: the remedy is the notice, which tells the user to drop their flag. Demoting these to `none` (exclusive) is a defensible alternative, but it is one admission-policy decision covering every spelling — not something to apply to the env spelling alone — and it would make a plain `ninja -j8` block the whole pool. Revisit in the scheduler (#4), not in `classify`.
 - **CPU only** for this iteration. RAM admission (#16) reuses the lease/admission machinery later.
 - **Static tasks are locked in**: accepted; the alternatives (restarting xcodebuild with a bigger `-jobs`) are parked (#18).
