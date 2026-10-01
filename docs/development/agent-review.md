@@ -119,8 +119,14 @@ present and distinct. Author comments and invented model session IDs cannot
 supply review authority.
 
 The sanitized bundle is retained as an Actions artifact for 90 days. Formal
-reviews include both reports, findings, and the run link; raw transcripts and
-credentials are not published as evidence. Reuse is allowed only from this
+reviews include both reports, findings, and the run link. Each Action execution
+transcript is uploaded separately as `claude-transcript-PR-HEAD-SKILL-ATTEMPT`
+with **seven-day retention**, including failed sessions when the Action emits
+an execution file. Upload happens immediately after each session because the
+Action reuses its output path. Logs keep the Action's concise default output;
+download the transcript artifact when debugging. Failure before session startup
+or a hard termination may produce no transcript; the run logs remain available.
+Transcripts are diagnostic data, never approval evidence. Reuse is allowed only from this
 workflow's default-branch runs and only for the same head, merge-base, contract,
 PR description, author dispositions, and trusted policy/skills. Bot chatter and
 unrelated advances of the base do not create a fresh review. Expired evidence

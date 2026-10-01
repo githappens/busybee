@@ -122,4 +122,6 @@ bash sortie/test-harness-docs.sh
 
 The ordinary Linux/macOS workflow also runs these harness checks. See the
 review contract for the OAuth secret, Actions approval setting, evidence
-artifacts, and the pinned one-PR bootstrap procedure.
+artifacts, and the pinned one-PR bootstrap procedure. Each review run retains
+separate contract/ponytail transcript artifacts for seven days, including
+failed sessions that produced a transcript; download them from the run to debug.
