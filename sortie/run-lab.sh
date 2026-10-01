@@ -24,7 +24,7 @@ case "$runner" in
   cursor) kind=agent-client-protocol; agent_command=${BUSYBEE_CURSOR_COMMAND:-agent acp} ;;
   *) echo "Unsupported agent: $runner" >&2; exit 2 ;;
 esac
-export BUSYBEE_SORTIE_AGENT_KIND=$kind BUSYBEE_SORTIE_AGENT_COMMAND=$agent_command
+export BUSYBEE_SORTIE_AGENT_KIND=$kind
 export SORTIE_AGENT_KIND=$kind SORTIE_AGENT_COMMAND=$agent_command
 export BUSYBEE_SORTIE_STATE="$root/build/sortie-lab"
 export BUSYBEE_SORTIE_CLONE_URL=${BUSYBEE_SORTIE_CLONE_URL:-https://github.com/githappens/busybee.git}

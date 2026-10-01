@@ -21,7 +21,7 @@ polling:
 
 hooks:
   after_create: |
-    git -c credential.helper='!gh auth git-credential' clone "$BUSYBEE_SORTIE_CLONE_URL" .
+    git -c credential.helper= -c credential.helper='!gh auth git-credential' clone "$BUSYBEE_SORTIE_CLONE_URL" .
   before_run: |
     bash "$BUSYBEE_SORTIE_TRUSTED/sortie/prepare-lab.sh"
   timeout_ms: 120000

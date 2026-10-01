@@ -1,12 +1,9 @@
-import importlib.util
 from pathlib import Path
 import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-spec = importlib.util.spec_from_file_location("lab", Path(__file__).resolve().parents[1] / "lab.py")
-lab = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(lab)
+import lab
 
 
 class DependencyTests(unittest.TestCase):

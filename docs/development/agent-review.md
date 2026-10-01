@@ -5,6 +5,10 @@ The implementing agent owns implementation and the review/fix loop. These are
 separate from the [VM lab](../design/agent-lab.md), whose worker controller is
 still being implemented.
 
+Task checkouts route HTTPS Git credentials through `gh` using local Git
+configuration, so fetch and push use the dispatcher's authenticated identity
+without changing global credential settings.
+
 The lab uses `sortie/LAB_WORKFLOW.md`. Existing product work retains
 `sortie/WORKFLOW.md` until migrated. Same-repository branches named
 `sortie-lab/<issue-number>` belong exclusively to the lab review gate; the old
