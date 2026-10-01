@@ -132,10 +132,6 @@ impl Fixture {
         self.state.join("bzbd.log")
     }
 
-    pub fn config_path(&self) -> &Path {
-        &self.config
-    }
-
     pub fn write_config(&self, body: &str) {
         std::fs::write(&self.config, body).expect("rewrite the config");
     }
