@@ -30,6 +30,11 @@ cpus = 4
 memory_mib = 8192
 storage_gib = 64
 
+[worker]
+cpus = 2
+memory_mib = 4096
+storage_gib = 32
+
 [templates.linux]
 manifest = "templates/linux/manifest.json"
 """
@@ -266,6 +271,9 @@ class ConfigTests(unittest.TestCase):
             "string budget": VALID_CONFIG.replace("cpus = 4", 'cpus = "4"'),
             "boolean budget": VALID_CONFIG.replace("cpus = 4", "cpus = true"),
             "unknown key": VALID_CONFIG.replace("[budget]", "[budget]\ngpus = 1"),
+            "worker over budget": VALID_CONFIG.replace("memory_mib = 4096", "memory_mib = 16384"),
+            "missing worker allocation": VALID_CONFIG.replace("[worker]\ncpus = 2\nmemory_mib = 4096\n"
+                                                              "storage_gib = 32\n", ""),
             "wrong schema": VALID_CONFIG.replace("schema = 1", "schema = 2"),
             "state outside build/vm": VALID_CONFIG.replace('"build/vm"', '"build/other"'),
             "absolute state": VALID_CONFIG.replace('"build/vm"', '"/tmp/vm"'),
@@ -309,10 +317,16 @@ class ContractTests(unittest.TestCase):
         record = {"schema": contracts.WORKER_SCHEMA, "run_id": run_id, "worker": contracts.worker_name(run_id),
                   "vm_id": "{11111111-2222-3333-4444-555555555555}", "template": "linux",
                   "snapshot_id": "{66666666-7777-8888-9999-000000000000}", "clone_strategy": "linked",
+                  "candidate": "r-20261001T000000Z-abcdef", "baseline_vm_id": "{22222222-2222-3333-4444-555555555555}",
+                  "reset_snapshot_id": "{77777777-7777-8888-9999-000000000000}", "status": "ready",
+                  "allocation": {"cpus": 2, "memory_mib": 4096, "storage_gib": 32},
+                  "source": {"revision": "0" * 40, "patch_sha256": None},
                   "created_at": "2026-10-01T00:00:00Z", "deadline": "2026-10-01T02:00:00Z"}
         self.assertEqual(contracts.worker_errors(record), [])
         self.assertTrue(contracts.worker_errors({**record, "worker": "someone-elses-vm"}))
         self.assertTrue(contracts.worker_errors({**record, "deadline": "2026-09-30T00:00:00Z"}))
+        self.assertTrue(contracts.worker_errors({**record, "reset_snapshot_id": "latest"}))
+        self.assertTrue(contracts.worker_errors({**record, "source": {"revision": "main"}}))
 
     def test_result_states_are_the_documented_set(self):
         self.assertEqual(set(contracts.RESULT_STATES), {
@@ -327,17 +341,14 @@ class CliTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(self.SCRIPT), *args], capture_output=True, text=True)
 
     def test_controller_reports_unimplemented_operations(self):
-        for argv in (["worker", "create", "linux"],
-                     ["worker", "reset", "w"], ["worker", "destroy", "w"], ["exec", "w", "--", "true"],
-                     ["terminal", "open", "w"], ["terminal", "send", "w", "q"], ["terminal", "resize", "w"],
-                     ["terminal", "capture", "w"], ["inspect", "w"], ["signal", "w", "TERM", "1"],
-                     ["console", "capture", "w"], ["collect", "w"]):
+        for argv in (["terminal", "open", "w"], ["terminal", "send", "w", "q"], ["terminal", "resize", "w"],
+                     ["terminal", "capture", "w"]):
             with self.subTest(argv):
                 out = self.run_cli("--json", *argv)
                 self.assertEqual(out.returncode, vmctl.EXIT_UNSUPPORTED, out.stderr)
                 result = json.loads(out.stdout)
                 self.assertEqual(result["status"], "unsupported")
-                self.assertEqual(result["operation"], " ".join(argv[:2] if argv[0] in vmctl.GROUPS else argv[:1]))
+                self.assertEqual(result["operation"], " ".join(argv[:2]))
                 self.assertNotEqual(result["status"], "success")
                 human = self.run_cli(*argv)
                 self.assertEqual(human.returncode, vmctl.EXIT_UNSUPPORTED)
@@ -351,6 +362,19 @@ class CliTests(unittest.TestCase):
         result = json.loads(out.stdout)
         self.assertEqual(result["status"], "environment_failure")
         self.assertIn("config_missing", {f["code"] for f in result["findings"]})
+
+    def test_worker_operations_need_a_valid_config(self):
+        run_id = contracts.new_run_id()
+        with tempfile.TemporaryDirectory() as tmp:
+            absent = str(Path(tmp) / "absent.toml")
+            for argv in (["worker", "create", "linux", "--revision", "HEAD"], ["worker", "reset", run_id],
+                         ["worker", "destroy", run_id], ["exec", run_id, "--cwd", "/", "--timeout", "5"],
+                         ["inspect", run_id], ["signal", run_id, "TERM", "42"], ["console", "capture", run_id],
+                         ["collect", run_id], ["template", "prune", "linux"]):
+                with self.subTest(argv):
+                    out = self.run_cli("--json", *argv, "--config", absent)
+                    self.assertEqual(out.returncode, vmctl.EXIT_FAILED, out.stderr)
+                    self.assertIn("config_missing", {f["code"] for f in json.loads(out.stdout)["findings"]})
 
     def test_an_unknown_operation_is_a_usage_error(self):
         self.assertEqual(self.run_cli("frobnicate").returncode, 2)

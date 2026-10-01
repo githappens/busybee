@@ -28,6 +28,11 @@ DEADLINE_BOUNDS = {"command": (1, 6 * 3600), "scenario": (1, 12 * 3600), "run": 
                    "cleanup": (1, 3600)}
 BUDGET_BOUNDS = {"cpus": (1, 256), "memory_mib": (1024, 1024 * 1024), "storage_gib": (8, 16 * 1024)}
 
+# provisioning: its source is not (or no longer) in the guest; ready: running
+# with its source; stopped: halted after guest control failed; retained:
+# collection failed, kept stopped; failed: creation did not finish.
+WORKER_STATES = ("provisioning", "ready", "stopped", "retained", "failed", "destroyed")
+
 UUID = re.compile(r"^\{[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\}$")
 RUN_ID = re.compile(r"^r-\d{8}T\d{6}Z-[0-9a-f]{6}$")
 TIMESTAMP = "%Y-%m-%dT%H:%M:%SZ"
@@ -61,7 +66,7 @@ def state_dir(config, repo):
 def config_errors(config, repo):
     """Every problem with a parsed local config, as (code, message) pairs."""
     errors = []
-    known = {"schema", "state_dir", "clone_strategy", "parallels", "deadlines", "budget", "templates"}
+    known = {"schema", "state_dir", "clone_strategy", "parallels", "deadlines", "budget", "worker", "templates"}
     for key in sorted(set(config) - known):
         errors.append(("config_invalid", f"unknown key {key!r}"))
     if config.get("schema") != CONFIG_SCHEMA:
@@ -94,6 +99,14 @@ def config_errors(config, repo):
         if not deadlines["command"] <= deadlines["scenario"] <= deadlines["run"]:
             errors.append(("config_invalid", "deadlines must nest: command <= scenario <= run"))
     _bounded("budget", config.get("budget"), BUDGET_BOUNDS, errors)
+    # One worker's allocation; all active workers together stay within the budget.
+    _bounded("worker", config.get("worker"), BUDGET_BOUNDS, errors)
+    budget, allocation = config.get("budget"), config.get("worker")
+    if isinstance(budget, dict) and isinstance(allocation, dict):
+        for key in BUDGET_BOUNDS:
+            if _integer(budget.get(key)) and _integer(allocation.get(key)) and allocation[key] > budget[key]:
+                errors.append(("config_invalid",
+                               f"[worker] {key} = {allocation[key]} exceeds the budget's {budget[key]}"))
 
     templates = config.get("templates", {})
     if not isinstance(templates, dict):
@@ -154,8 +167,8 @@ def worker_name(run_id):
 
 def worker_errors(record):
     """Problems with a worker ownership record, written before guest work starts."""
-    fields = {"schema", "run_id", "worker", "vm_id", "template", "snapshot_id", "clone_strategy",
-              "created_at", "deadline"}
+    fields = {"schema", "run_id", "worker", "vm_id", "template", "candidate", "baseline_vm_id", "snapshot_id",
+              "reset_snapshot_id", "clone_strategy", "allocation", "source", "status", "created_at", "deadline"}
     errors = [f"unknown field {k!r}" for k in sorted(set(record) - fields)]
     errors += [f"missing field {k!r}" for k in sorted(fields - set(record))]
     if errors:
@@ -166,9 +179,17 @@ def worker_errors(record):
         errors.append("run_id is malformed")
     elif record["worker"] != worker_name(record["run_id"]):
         errors.append("worker name does not belong to this run")
-    for key in ("vm_id", "snapshot_id"):
+    for key in ("vm_id", "baseline_vm_id", "snapshot_id", "reset_snapshot_id"):
         if not isinstance(record[key], str) or not UUID.match(record[key]):
             errors.append(f"{key} must be a Parallels UUID")
+    if not valid_run_id(record["candidate"]):
+        errors.append("candidate must be the run id of the baseline's build")
+    if record["status"] not in WORKER_STATES:
+        errors.append(f"status must be one of {', '.join(WORKER_STATES)}")
+    if not isinstance(record["source"], dict) or not re.match(r"^[0-9a-f]{40}$", str(record["source"].get("revision"))):
+        errors.append("source must record the full revision transferred")
+    if not isinstance(record["allocation"], dict) or set(record["allocation"]) != set(BUDGET_BOUNDS):
+        errors.append(f"allocation must name {', '.join(BUDGET_BOUNDS)}")
     if record["template"] not in GUEST_OS or record["clone_strategy"] not in CLONE_STRATEGIES:
         errors.append("template or clone_strategy is not a supported value")
     try:

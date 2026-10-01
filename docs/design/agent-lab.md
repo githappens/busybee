@@ -5,9 +5,10 @@ disposable Parallels VMs. An agent must be able to reproduce an issue, change
 the code, inspect the running terminal UI, and verify the fix on Linux and
 macOS without asking a person to operate its development environment.
 
-**Status: design for implementation.** `doctor` and the Linux `template`
-operations (`scripts/vm/vmctl.py`) have shipped; every other operation returns
-`unsupported`.
+**Status: design for implementation.** `doctor`, the Linux `template`
+operations, and Linux workers with `exec`, `inspect`, `signal`, `console
+capture` and `collect` (`scripts/vm/vmctl.py`) have shipped; the `terminal`
+operations return `unsupported`.
 Until the rest lands, [CLAUDE.md](../../CLAUDE.md) and the
 [Sortie workflow](../../sortie/README.md) remain the operational instructions.
 
@@ -226,10 +227,43 @@ replaces. Every VM the controller creates is claimed in
 `build/vm/registry.json` before it exists, and no Parallels call changes a VM
 that is not claimed there.
 
+`worker create linux --revision REV [--patch FILE]` claims the worker in the
+registry, naming the baseline it depends on, then clones the promoted
+baseline's snapshot with the configured strategy, applies the `[worker]`
+allocation, and snapshots the clone before it first starts. The run record
+`build/vm/runs/<run-id>/worker.json` holds that reset snapshot, the source
+revision and patch hash, and the run deadline. One worker is active at a time,
+its allocation must fit `[budget]`, its `storage_gib` must cover the baseline's
+disk, which a clone can grow to, and the host must have that storage free.
+The revision travels as a Git bundle with its history and tags, so the guest
+checkout versions its build like the host's. `exec RUN --cwd DIR [--env
+NAME=VALUE] [--timeout S] -- ARGV` quotes every word, bounds the command by
+`timeout(1)` in the guest and by the run deadline, streams stdout and stderr to
+separate files under the run directory, and records exit status, timings, the
+guest checkout's revision and the digests of any built `busybee`, `bzb` and
+`bzbd`. A nonzero exit is `product_failure`; an expired deadline is `timeout`.
+If the guest stops answering, the controller captures its console and stops the
+VM, which stays registered. `inspect` reports VM state, guest processes and
+daemon state; `signal RUN SIGNAL PID` signals one guest process; `console
+capture` saves the display of a running worker. `collect` exports the commits
+made since the recorded revision as a bundle, uncommitted and untracked changes
+as a diff, and the digests of the exec logs, each written durably, and lists
+what it could not save. `worker reset` and `destroy` collect first; when
+collection is incomplete they stop the clone and keep it registered, and the
+result is `incomplete_collection`. Reset then restores the snapshot recorded at
+creation and transfers the source again; destroy deletes the clone. Until its
+source is in the guest a worker is `provisioning`: exec refuses it, and reset
+and destroy have nothing to collect from it. These
+deadlines hold while the controller process runs; supervision that outlives it
+is not provided yet.
+
+`template prune linux` deletes each retained baseline that no registered worker
+was cloned from, and keeps and reports the rest.
+
 The unit tests under `scripts/vm/tests` need no Parallels. The acceptance tests
-that build, validate and compare real candidates run against the local config
-when opted in: `BUSYBEE_VM_LAB=1 python3 -m unittest test_real_template` in
-that directory.
+that build, validate and compare real candidates, and drive real workers, run
+against the local config when opted in: `BUSYBEE_VM_LAB=1 python3 -m unittest
+test_real_template test_real_worker` in that directory.
 
 Long commands return a run handle with status, elapsed time, last-output time,
 and artifact locations. Agents can await completion and read output from a byte

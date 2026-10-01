@@ -10,7 +10,7 @@ from pathlib import Path
 
 SCHEMA = "busybee.vm.registry/v1"
 PREFIX = "busybee-lab-"
-ROLES = ("candidate", "validation")
+ROLES = ("candidate", "validation", "worker")
 
 
 class Registry:
@@ -37,14 +37,21 @@ class Registry:
     def owns(self, name):
         return name in self._load()["vms"]
 
-    def claim(self, name, role, template, run_id, deadline):
+    def entries(self):
+        return self._load()["vms"]
+
+    def name_for(self, vm_id):
+        return next((name for name, entry in self.entries().items() if entry["vm_id"] == vm_id), None)
+
+    def claim(self, name, role, template, run_id, deadline, parent=None):
+        """`parent` is the VM id of the baseline a clone depends on."""
         if not name.startswith(PREFIX) or role not in ROLES:
             raise ValueError(f"refusing to claim {name!r} as {role!r}")
         data = self._load()
         if name in data["vms"]:
             raise ValueError(f"{name} is already claimed")
         data["vms"][name] = {"role": role, "template": template, "run_id": run_id, "vm_id": None,
-                             "deadline": deadline}
+                             "deadline": deadline, "parent": parent}
         self._save(data)
 
     def bind(self, name, vm_id):

@@ -30,6 +30,13 @@ cpus = 4
 memory_mib = 8192
 storage_gib = 64
 
+# One worker's allocation, within the budget. One worker is active at a time;
+# storage_gib must cover the baseline's disk, which a clone can grow to.
+[worker]
+cpus = 4
+memory_mib = 8192
+storage_gib = 64
+
 # Baselines, by guest OS. Each manifest path is relative to state_dir and is
 # written by template validation (busybee.vm.template/v1).
 [templates.linux]
