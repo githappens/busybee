@@ -45,6 +45,15 @@ touch; do not reformat the workspace as a side effect of something else.
 The dev shell gains `gnumake` and `ninja` when the jobserver work lands — add
 them to `flake.nix` in that change, not ahead of it.
 
+The VM lab controller (`docs/design/agent-lab.md`) is Python under
+`scripts/vm/`, outside the Cargo workspace. Its preflight and tests need no
+Parallels; `doctor` reads the host's Parallels when one is installed:
+
+```sh
+nix develop -c python3 scripts/vm/vmctl.py doctor
+nix develop -c python3 -m unittest discover -s scripts/vm/tests
+```
+
 ## Crate layout
 
 ```

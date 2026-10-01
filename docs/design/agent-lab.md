@@ -5,8 +5,11 @@ disposable Parallels VMs. An agent must be able to reproduce an issue, change
 the code, inspect the running terminal UI, and verify the fix on Linux and
 macOS without asking a person to operate its development environment.
 
-**Status: design for implementation.** The controller, template definitions,
-and commands described below are proposed interfaces, not shipped tooling.
+**Status: design for implementation.** Of the controller operations below,
+only the read-only `doctor` preflight has shipped (`scripts/vm/vmctl.py`, with
+its contracts and tests under `scripts/vm/`); every other operation returns an
+explicit `unsupported` result. Template definitions and the remaining commands
+are proposed interfaces, not shipped tooling.
 The initial issue dispatch and skill-review process is implemented in
 [the review workflow](../development/agent-review.md); it does not yet provide
 VM lifecycle or scenario execution.
@@ -178,6 +181,19 @@ CLI usable by different agent runners.
 | `console capture` | Capture the VM display through Parallels, including when command access is unavailable. |
 | `collect` | Export source changes and evidence, then acknowledge which artifacts were saved durably. |
 | `worker reset`, `destroy` | Collect first, then restore the recorded baseline or remove the owned clone. |
+
+The shipped entry point is `python3 scripts/vm/vmctl.py [--json] <operation>`
+inside the project development shell. Local configuration lives in ignored
+`build/vm/local.toml`, copied from `infra/vm/local.example.toml`; its state
+directory must stay inside `build/vm/`. Results follow `busybee.vm.result/v1`:
+an operation, one of the states `success`, `product_failure`,
+`environment_failure`, `timeout`, `cancelled`, `incomplete_collection` or
+`unsupported`, coded findings, and data. Only `success` is a pass; the exit
+status is 0 for success, 3 for an unsupported operation and 1 otherwise.
+Template manifests (`busybee.vm.template/v1`) and worker ownership records
+(`busybee.vm.worker/v1`) are validated by `scripts/vm/contracts.py`. All
+Parallels access goes through `scripts/vm/parallels.py`, which in this revision
+refuses anything other than its read-only queries.
 
 Long commands return a run handle with status, elapsed time, last-output time,
 and artifact locations. Agents can await completion and read output from a byte

@@ -108,6 +108,7 @@ jobs:
       - name: Check agent harness
         run: |
           python3 -m unittest discover -s sortie/tests
+          python3 -m unittest discover -s scripts/vm/tests
           bash sortie/test-machine-safety-hook.sh
           bash sortie/test-harness-docs.sh
 
