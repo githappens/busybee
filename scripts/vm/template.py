@@ -114,6 +114,42 @@ def promote(state, name, run_id):
                             data={"manifest": record["manifest"]})
 
 
+def prune(state, name, prl, reg):
+    """Delete retained baselines no registered clone depends on; keep and report the rest."""
+    retained_path = manifest_path(state, name).parent / "retained.json"
+    retained = json.loads(retained_path.read_text()) if retained_path.is_file() else []
+    current_path = manifest_path(state, name)
+    current = json.loads(current_path.read_text())["vm_id"] if current_path.is_file() else None
+    kept, pruned, findings = [], [], []
+    for baseline in retained:
+        vm_id = baseline["vm_id"]
+        users = sorted(n for n, e in reg.entries().items() if e.get("parent") == vm_id)
+        vm = reg.name_for(vm_id)
+        if vm_id == current:
+            findings.append(contracts.finding("retained_is_current", f"retained {baseline['candidate']} is the "
+                                              f"current {name} baseline; it stays", "warning"))
+        elif users:
+            findings.append(contracts.finding("retained_in_use", f"retained {baseline['candidate']} stays: "
+                                              f"{', '.join(users)} cloned from it", "warning"))
+        elif vm is None:
+            findings.append(contracts.finding("retained_not_owned", f"retained {baseline['candidate']} has no "
+                                              "registered VM; it was not touched"))
+        else:
+            try:
+                prl.delete(vm)
+            except parallels.ParallelsError as err:
+                findings.append(contracts.finding("cleanup_incomplete", f"{vm} stays registered: {err}"))
+            else:
+                reg.release(vm)
+                pruned.append(baseline["candidate"])
+                continue
+        kept.append(baseline)
+    _write_json(retained_path, kept)
+    status = "environment_failure" if any(f["severity"] == "error" for f in findings) else "success"
+    return contracts.result("template prune", status, f"pruned {len(pruned)}, kept {len(kept)} retained baseline(s)",
+                            findings, {"pruned": pruned, "kept": [b["candidate"] for b in kept]})
+
+
 def _sha256(path):
     with open(path, "rb") as f:
         return hashlib.file_digest(f, "sha256").hexdigest()

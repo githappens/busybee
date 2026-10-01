@@ -16,9 +16,11 @@ import sys
 import tomllib
 
 import contracts
+import guest
 import parallels
 import registry
 import template
+import worker
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = contracts.STATE_ROOT / "local.toml"
@@ -28,9 +30,8 @@ EXIT_OK, EXIT_FAILED, EXIT_UNSUPPORTED = 0, 1, 3
 # config names no path. Reported as the source so the choice is visible.
 APP_BUNDLE = Path("/Applications/Parallels Desktop.app/Contents/MacOS")
 
-GROUPS = {"worker": ("create", "reset", "destroy"),
-          "terminal": ("open", "send", "resize", "capture"), "console": ("capture",)}
-SINGLE = ("exec", "inspect", "signal", "collect")
+# Operations this revision does not implement yet.
+UNSUPPORTED = {"terminal": ("open", "send", "resize", "capture")}
 
 
 class Host:
@@ -209,29 +210,72 @@ def doctor(repo, config_path, host, runner=parallels.run):
     return contracts.result("doctor", status, summary, findings, data)
 
 
-def template_operation(repo, args, host):
-    operation = f"template {args.action}"
+def connect(repo, args, host, operation):
+    """The config, owned registry and Parallels adapter an operation needs, or
+    the result explaining why there are none."""
     findings = []
     config = load_config(args.config, repo, findings)
-    if config and args.name not in config.get("templates", {}):
-        findings.append(contracts.finding("config_invalid", f"no [templates.{args.name}] in the local config"))
+    name = getattr(args, "name", None)
+    if config and name and name not in config.get("templates", {}):
+        findings.append(contracts.finding("config_invalid", f"no [templates.{name}] in the local config"))
     if findings:
-        return contracts.result(operation, "environment_failure", "cannot run without a valid config", findings)
-    state = contracts.state_dir(config, repo)
-    if args.action == "promote":
-        return template.promote(state, args.name, args.candidate)
-    if args.name != "linux":
-        return contracts.result(operation, "unsupported", f"{args.name} templates are not provisioned here", [
-            contracts.finding("template_unsupported", "only the linux template is provisioned by this controller")])
+        return None, contracts.result(operation, "environment_failure", "cannot run without a valid config", findings)
     prlctl, _ = resolve_tool("prlctl", config, host, findings)
     prlsrvctl, _ = resolve_tool("prlsrvctl", config, host, findings)
     if findings:
-        return contracts.result(operation, "environment_failure", "Parallels tools are missing", findings)
-    reg = registry.Registry(state)
-    lab = template.Lab(repo, config, parallels.Parallels(prlctl, prlsrvctl, owned=reg), reg)
+        return None, contracts.result(operation, "environment_failure", "Parallels tools are missing", findings)
+    reg = registry.Registry(contracts.state_dir(config, repo))
+    return (config, reg, parallels.Parallels(prlctl, prlsrvctl, owned=reg)), None
+
+
+def template_operation(repo, args, host):
+    operation = f"template {args.action}"
+    ready, failed = connect(repo, args, host, operation)
+    if failed:
+        return failed
+    config, reg, prl = ready
+    state = contracts.state_dir(config, repo)
+    if args.action == "promote":
+        return template.promote(state, args.name, args.candidate)
+    if args.action == "prune":
+        return template.prune(state, args.name, prl, reg)
+    if args.name != "linux":
+        return contracts.result(operation, "unsupported", f"{args.name} templates are not provisioned here", [
+            contracts.finding("template_unsupported", "only the linux template is provisioned by this controller")])
+    lab = template.Lab(repo, config, prl, reg)
     if args.action == "build":
         return lab.build(args.name, args.arch)
     return lab.validate(args.name, args.candidate)
+
+
+def worker_operation(repo, args, host, operation):
+    ready, failed = connect(repo, args, host, operation)
+    if failed:
+        return failed
+    config, reg, prl = ready
+    workers = worker.Workers(repo, config, prl, reg, host.free_storage_gib)
+    try:
+        if operation == "worker create":
+            return workers.create(args.name, args.revision, args.patch)
+        if operation == "exec":
+            malformed = [item for item in args.env if "=" not in item]
+            if malformed:
+                raise worker.Refused("env_invalid", f"--env takes NAME=VALUE, not {', '.join(malformed)}")
+            env = dict(item.partition("=")[::2] for item in args.env)
+            timeout = config["deadlines"]["command"] if args.timeout is None else args.timeout
+            return workers.exec(args.run_id, args.command, args.cwd, env, timeout)
+        if operation == "signal":
+            return workers.signal(args.run_id, args.signal, args.pid)
+        method = {"worker reset": workers.reset, "worker destroy": workers.destroy, "inspect": workers.inspect,
+                  "collect": workers.collect, "console capture": workers.console_capture}[operation]
+        return method(args.run_id)
+    except worker.Refused as err:
+        return contracts.result(operation, "environment_failure", "refused", [contracts.finding(err.code, str(err))])
+    except template.DeadlineExceeded as err:
+        return contracts.result(operation, "timeout", "deadline passed", [contracts.finding("deadline", str(err))])
+    except (guest.GuestError, parallels.ParallelsError) as err:
+        return contracts.result(operation, "environment_failure", "the worker did not answer",
+                                [contracts.finding("worker_unreachable", str(err))])
 
 
 def unsupported(operation):
@@ -275,23 +319,51 @@ def parser():
     for action in ("validate", "promote"):
         actions.add_parser(action, parents=[common]) \
             .add_argument("--candidate", required=True, help="run id printed by template build")
-    for group, actions in GROUPS.items():
+    actions.add_parser("prune", parents=[common], help="delete retained baselines no worker depends on")
+
+    target = argparse.ArgumentParser(add_help=False)
+    target.add_argument("run_id", help="run id printed by worker create")
+    target.add_argument("--config", type=Path, default=REPO / DEFAULT_CONFIG)
+    workers = ops.add_parser("worker", help="create, reset and destroy owned workers") \
+        .add_subparsers(dest="action", required=True)
+    create = workers.add_parser("create", parents=[common], help="clone the promoted baseline")
+    create.add_argument("--revision", required=True, help="commit to check out in the worker")
+    create.add_argument("--patch", type=Path, help="patch applied on top of the revision")
+    workers.add_parser("reset", parents=[target], help="collect, then restore the recorded baseline")
+    workers.add_parser("destroy", parents=[target], help="collect, then delete the clone")
+    run = ops.add_parser("exec", parents=[target], help="run argv in a worker: exec RUN_ID --cwd DIR -- ARGV...")
+    run.add_argument("--cwd", required=True)
+    run.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
+    run.add_argument("--timeout", type=int, help="seconds, at most deadlines.scenario; default deadlines.command")
+    sig = ops.add_parser("signal", parents=[target], help="signal a process in a worker")
+    sig.add_argument("signal")
+    sig.add_argument("pid")
+    ops.add_parser("inspect", parents=[target], help="VM state, processes and daemons")
+    ops.add_parser("collect", parents=[target], help="export source changes and log digests")
+    ops.add_parser("console", help="capture a worker's display").add_subparsers(dest="action", required=True) \
+        .add_parser("capture", parents=[target])
+    for group, names in UNSUPPORTED.items():
         sub = ops.add_parser(group).add_subparsers(dest="action", required=True)
-        for action in actions:
-            sub.add_parser(action).add_argument("args", nargs=argparse.REMAINDER)
-    for name in SINGLE:
-        ops.add_parser(name).add_argument("args", nargs=argparse.REMAINDER)
+        for name in names:
+            sub.add_parser(name).add_argument("args", nargs=argparse.REMAINDER)
     return root
 
 
 def main(argv=None):
-    args = parser().parse_args(argv)
+    argv = sys.argv[1:] if argv is None else argv
+    # Everything after the first `--` is the guest argv of `exec`, verbatim.
+    split = argv.index("--") if "--" in argv else len(argv)
+    args = parser().parse_args(argv[:split])
+    args.command = argv[split + 1:]
     if args.operation == "doctor":
         outcome = doctor(REPO, args.config, Host())
     elif args.operation == "template":
         outcome = template_operation(REPO, args, Host())
+    elif args.operation in UNSUPPORTED:
+        outcome = unsupported(f"{args.operation} {args.action}")
     else:
-        outcome = unsupported(" ".join(filter(None, (args.operation, getattr(args, "action", None)))))
+        operation = " ".join(filter(None, (args.operation, getattr(args, "action", None))))
+        outcome = worker_operation(REPO, args, Host(), operation)
     print(json.dumps(outcome, indent=2) if args.json else summary(outcome))
     if outcome["status"] == "unsupported":
         return EXIT_UNSUPPORTED

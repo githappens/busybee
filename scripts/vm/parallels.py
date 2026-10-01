@@ -99,7 +99,7 @@ class Parallels:
         self._owned(name, ["create", "--distribution", "linux", "--dst", str(dst)])
 
     def configure(self, name, cpus, memory_mib, iso):
-        self._owned(name, ["set", "--cpus", str(cpus), "--memsize", str(memory_mib)])
+        self.allocate(name, cpus, memory_mib)
         # A worker needs none of the host's devices or sharing. The default
         # sound card's input alone raises a macOS microphone prompt. USB stays
         # until the install is done: the keyboard the bootstrap types on is a
@@ -118,10 +118,14 @@ class Parallels:
         self._owned(name, ["set", "--device-bootorder", "hdd0"])
         self._owned(name, ["set", "--device-del", "usb"])
 
+    def allocate(self, name, cpus, memory_mib):
+        self._owned(name, ["set", "--cpus", str(cpus), "--memsize", str(memory_mib)])
+
     def info(self, name):
         vm = json.loads(self._owned(name, ["list", "--info", "--json"], timeout=QUERY_TIMEOUT_S))[0]
+        disk = re.fullmatch(r"(\d+)Mb", vm["Hardware"].get("hdd0", {}).get("size", ""))
         return {"vm_id": braced(vm["ID"]), "state": vm["State"], "mac": vm["Hardware"]["net0"]["mac"],
-                "devices": sorted(vm["Hardware"])}
+                "devices": sorted(vm["Hardware"]), "disk_mib": int(disk.group(1)) if disk else None}
 
     def start(self, name):
         self._owned(name, ["start"])

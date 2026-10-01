@@ -75,6 +75,15 @@ class Guest:
             raise GuestError(f"`{command}` exited {done.returncode}: {err.strip()[-500:]}")
         return done.returncode, out, err
 
+    def stream(self, command, timeout, stdout, stderr):
+        """Run a command with its output written straight to open files, so a
+        controller that dies mid-command leaves what it had. Returns ssh's status."""
+        try:
+            return subprocess.run(self._ssh() + [command], stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr,
+                                  timeout=timeout).returncode
+        except subprocess.TimeoutExpired as err:
+            raise GuestError(f"no answer from the guest within {timeout}s") from err
+
     def wait(self, deadline):
         """Until the guest accepts a command, or the deadline passes."""
         last = "no attempt"
