@@ -5,6 +5,7 @@
 mod common;
 
 use std::{
+    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
@@ -237,6 +238,226 @@ fn a_task_that_owns_the_machine_makes_the_next_one_wait() {
         stderr(&second)
     );
     first.wait().expect("wait for the first client");
+}
+
+/// `busybee -- <cmd>` where `<cmd>` itself invokes `busybee --` used to
+/// deadlock: the outer lease holds the machine, the inner client queues
+/// behind it. The nested client now sees `BUSYBEE_LEASE` and execs.
+/// `docs/design/bzbd.md` §Nesting; githappens/busybee#64.
+#[test]
+#[serial_test::serial]
+fn a_nested_busybee_passes_through_instead_of_deadlocking() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let bin = env!("CARGO_BIN_EXE_busybee");
+    let out = busybee.run_timed(&["--", bin, "--", "true"]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("nested under lease"),
+        "the pass-through line is missing from stdout (the parent task's stream): {}",
+        stdout(&out)
+    );
+    assert!(
+        stderr(&out).contains("busybee: running — "),
+        "the outer client still takes a lease; stderr was {}",
+        stderr(&out)
+    );
+}
+
+/// The issue's reproduction: a shell string whose body gates again.
+#[test]
+#[serial_test::serial]
+fn a_gated_shell_string_that_gates_again_completes() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let bin = env!("CARGO_BIN_EXE_busybee");
+    let inner = format!("{bin:?} -- true");
+    let out = busybee.run_timed(&["--", "sh", "-c", &inner]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("nested under lease"),
+        "stdout was {}",
+        stdout(&out)
+    );
+}
+
+/// A script that gates its own work, wrapped by a caller who also gates:
+/// the recommended pattern composing with itself.
+#[test]
+#[serial_test::serial]
+fn a_self_gating_script_runs_under_an_outer_wrapper() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let bin = env!("CARGO_BIN_EXE_busybee");
+    let script = busybee.tmp.path().join("build.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nexec {bin:?} -- printf hello\n"),
+    )
+    .expect("write build.sh");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let out = busybee.run_timed(&["--", script.to_str().expect("utf-8 path")]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("hello"),
+        "the script's output is missing from {}",
+        stdout(&out)
+    );
+    assert!(
+        stdout(&out).contains("nested under lease"),
+        "stdout was {}",
+        stdout(&out)
+    );
+}
+
+/// Nested pass-through still relays the inner command's exit code through
+/// the outer client, the same way a non-nested lease does.
+#[test]
+#[serial_test::serial]
+fn a_nested_command_s_exit_code_is_the_outer_client_s() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let bin = env!("CARGO_BIN_EXE_busybee");
+    let out = busybee.run_timed(&["--", bin, "--", "sh", "-c", "exit 42"]);
+    assert_eq!(out.status.code(), Some(42), "stderr: {}", stderr(&out));
+}
+
+/// A nested command is not a second lease: the parent already holds the
+/// machine, and status must not grow a queued sibling behind it.
+#[test]
+#[serial_test::serial]
+fn a_nested_command_does_not_take_a_second_lease() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let bin = env!("CARGO_BIN_EXE_busybee");
+    let mut outer = busybee
+        .cmd(&["--", bin, "--", "sleep", "5"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the nested client");
+    busybee.wait_for_a_running_task();
+    // The inner client starts after the task is live; give it a moment to
+    // submit if it is going to. Pass-through must leave the count at one.
+    std::thread::sleep(Duration::from_millis(500));
+    let status = busybee.status().expect("bzbd is up");
+    assert_eq!(
+        status.leases.len(),
+        1,
+        "nested busybee queued a second lease: {:?}",
+        status.leases
+    );
+
+    let _ = outer.kill();
+    let _ = outer.wait();
+}
+
+/// `docs/design/bzbd.md` §Failure and recovery, row "bzbd dies": the task
+/// keeps running under pueued and the next client restarts bzbd, which adopts
+/// the lease as `orphaned`. A nested call made after that must still find its
+/// parent, not take the dead socket for "no parent" and queue behind it.
+#[test]
+#[serial_test::serial]
+fn a_nested_busybee_under_an_orphaned_parent_passes_through() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let bin = env!("CARGO_BIN_EXE_busybee");
+    let go = busybee.tmp.path().join("go");
+    let done = busybee.tmp.path().join("done");
+    // The outer client dies with the daemon, so the nested call reports
+    // through a file rather than through the outer client's stdout.
+    let script = format!("while [ ! -e {go:?} ]; do sleep 0.1; done; {bin:?} -- touch {done:?}");
+    let mut outer = busybee
+        .cmd(&["--", "sh", "-c", &script])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the outer client");
+    busybee.wait_for_a_running_task();
+
+    let pid = std::fs::read_to_string(busybee.state_dir().join("bzbd.pid"))
+        .expect("read the daemon's pid file");
+    let pid: i32 = pid.trim().parse().expect("a pid");
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let _ = outer.wait();
+    std::fs::write(&go, "").expect("release the task");
+
+    let deadline = Instant::now() + PATIENCE;
+    while !done.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the nested call never ran; bzbd holds {:?}",
+            busybee.status().map(|s| s.leases)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Exporting a lease id that is not live must not disable gating: that
+/// would be the silent fallback a stale `BUSYBEE_LEASE` in the environment
+/// would otherwise become.
+#[test]
+#[serial_test::serial]
+fn a_stale_lease_marker_does_not_skip_the_daemon() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let out = busybee
+        .cmd(&["--", "true"])
+        .env("BUSYBEE_LEASE", "999")
+        .output()
+        .expect("run busybee");
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("busybee: queued"),
+        "a stale marker skipped the daemon; stderr was {}",
+        stderr(&out)
+    );
+    assert!(
+        !stdout(&out).contains("nested under lease"),
+        "stdout was {}",
+        stdout(&out)
+    );
+}
+
+/// `--detach` is not pass-through: it is asking to queue a second lease
+/// and return, and it can, because it returns on `Queued`.
+#[test]
+#[serial_test::serial]
+fn a_nested_detach_still_queues_its_own_lease() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let bin = env!("CARGO_BIN_EXE_busybee");
+    let out = busybee.run_timed(&[
+        "--",
+        "sh",
+        "-c",
+        &format!("{bin:?} --detach -- true; printf after"),
+    ]);
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains("after"),
+        "the script should continue after detach; stdout was {}",
+        stdout(&out)
+    );
+    assert!(
+        stdout(&out).contains("busybee: lease "),
+        "detach still prints a lease id; stdout was {}",
+        stdout(&out)
+    );
+    assert!(
+        !stdout(&out).contains("nested under lease"),
+        "detach must not pass through; stdout was {}",
+        stdout(&out)
+    );
 }
 
 /// `--detach` hands the task to bzbd and returns; the lease outlives the

@@ -112,14 +112,21 @@ at, so the tool oversubscribes it.
 benchmark, a render, an opaque `sh -c '…'`. It takes the whole pool and
 everything else waits — safe but wasteful, so name a better class when you can.
 
-Every task's environment carries `BUSYBEE_CLASS` and `BUSYBEE_CORES` — the
-remedy for a tool hidden inside a script. Keep a fallback anyway, so the script
-still runs when it is invoked outside busybee:
+Every task's environment carries `BUSYBEE_CLASS`, `BUSYBEE_CORES` and
+`BUSYBEE_LEASE` — the first two are the remedy for a tool hidden inside a
+script, the third is so a nested `busybee` can see it is already running
+under a lease and skip the queue instead of deadlocking behind its parent.
+Keep a fallback anyway, so the script still runs when it is invoked outside
+busybee:
 
 ```bash
 busybee --class static --cores 4 -- ./scripts/bench.sh
 # and inside bench.sh:  ./mytool --threads "${BUSYBEE_CORES:-4}"
 ```
+
+Wrapping a script that already gates its own compiler invocations is fine:
+the inner `busybee` prints `nested under lease N, passing through` and runs
+the command. GNU make does the same with `MAKEFLAGS`.
 
 ## Configuration
 
@@ -155,7 +162,7 @@ static = "fair"           # or a fixed core count
 | `defaults.static` | `"fair"` or integer ≥ 1 | `"fair"` | Cores such a task asks for: `"fair"` is its share of the pool at the moment it starts. |
 | `overrides.<tool>` | table | none | One classification row, replacing the built-in one for that tool outright. |
 | `overrides.<tool>.class` | `"jobserver"`, `"static"` or `"none"` | required | How the tool shares the pool. |
-| `overrides.<tool>.env` | table of strings | empty | Variables to set for the task, on top of what the class injects. Values may contain `{cores}`, `{cores-1}` and `{fifo}`, and nothing else. A variable busybee already set — `MAKEFLAGS` on a jobserver row, `BUSYBEE_CLASS`/`BUSYBEE_CORES` on every row — keeps busybee's value and the row's is dropped with a notice; a jobserver row also reserves `CARGO_MAKEFLAGS`, which cargo reads first, so that one is dropped with nothing put in its place. |
+| `overrides.<tool>.env` | table of strings | empty | Variables to set for the task, on top of what the class injects. Values may contain `{cores}`, `{cores-1}` and `{fifo}`, and nothing else. A variable busybee already set — `MAKEFLAGS` on a jobserver row, `BUSYBEE_CLASS`/`BUSYBEE_CORES`/`BUSYBEE_LEASE` on every row — keeps busybee's value and the row's is dropped with a notice; a jobserver row also reserves `CARGO_MAKEFLAGS`, which cargo reads first, so that one is dropped with nothing put in its place. |
 
 An override key is matched against the tool's basename, so `"./build.sh"` and
 `"build.sh"` name the same row (two keys that collapse to one are an error).
@@ -214,6 +221,9 @@ saying roughly this:
     script pass `${BUSYBEE_CORES:-4}` to whatever tool it runs:
 
         busybee --class static --cores 4 -- ./scripts/bench.sh
+
+    Wrapping a script that already calls `busybee --` internally is fine:
+    the inner invocation sees it is nested and passes through.
 
     Read the `busybee: running — …` line on stderr: it names the tool, the
     class, and the cores you were given. `static, holding 4/18` means four

@@ -12,7 +12,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
 
@@ -73,6 +73,32 @@ impl Busybee {
 
     pub fn run(&self, args: &[&str]) -> Output {
         self.cmd(args).output().expect("run busybee")
+    }
+
+    /// Like [`Self::run`], but kills the process and panics if it outlives
+    /// [`PATIENCE`]. Nested gating used to deadlock; a regression must fail
+    /// the test rather than stall the suite.
+    pub fn run_timed(&self, args: &[&str]) -> Output {
+        let mut cmd = self.cmd(args);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let child = cmd.spawn().expect("spawn busybee");
+        let pid = child.id();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        });
+        match rx.recv_timeout(PATIENCE) {
+            Ok(result) => result.expect("wait for busybee"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                panic!(
+                    "busybee did not finish within {PATIENCE:?}; nested gating likely deadlocked"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("the waiter thread dropped before busybee exited")
+            }
+        }
     }
 
     pub fn state_dir(&self) -> PathBuf {
