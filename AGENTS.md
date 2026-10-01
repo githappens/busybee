@@ -8,7 +8,8 @@ acceptance criteria, the specification carries semantics.
 
 Repository skills live in `skills/contract-review/SKILL.md` and
 `skills/ponytail-review/SKILL.md`. Use these exact files for PR review, regardless
-of the agent runner or identically named personal skills. For lab PRs, CI runs
+of the agent runner or identically named personal skills. For ready PRs from
+this repository, CI runs
 both skills in separate Claude Opus 5.5 high sessions and publishes a formal
 review. The implementing agent fixes valid scoped findings, tests, pushes, and
 hands the same PR back to Sortie. Local skill reviews are optional feedback.

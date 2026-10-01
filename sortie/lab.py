@@ -4,9 +4,10 @@ import argparse
 import subprocess
 import sys
 
-from reviews import MILESTONE, api
+from reviews import api
 
 REPO = "githappens/busybee"
+MILESTONE = "agent lab: autonomous VM development"
 
 
 def task_error(issue):

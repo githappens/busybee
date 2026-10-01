@@ -11,7 +11,6 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS = ("contract-review", "ponytail-review")
-MILESTONE = "agent lab: autonomous VM development"
 MODEL = "claude-opus-5-5"
 EFFORT = "high"
 GATE_MARKER = "busybee-agent-review-gate:v2 "
@@ -42,13 +41,11 @@ def paged_objects(path, key):
     return [entry for page in pages for entry in page[key]]
 
 
-def route(pr):
+def reviewable(pr):
     head, base = pr.get("head", {}), pr.get("base", {})
-    if (re.fullmatch(r"sortie-lab/[1-9][0-9]*", head.get("ref", ""))
-            and head.get("repo") and base.get("repo")
-            and head["repo"]["full_name"] == base["repo"]["full_name"]):
-        return "lab"
-    return "legacy"
+    return bool(pr.get("state") == "open" and not pr.get("draft")
+                and head.get("repo") and base.get("repo")
+                and head["repo"]["full_name"] == base["repo"]["full_name"])
 
 
 def skill_hashes():
@@ -150,8 +147,8 @@ def evaluate(packet, record, checks):
         if any(r["verdict"] == verdict for r in record["reviews"].values()):
             return verdict, [f"{s}: {r['report']}" for s, r in record["reviews"].items() if r["verdict"] == verdict]
     errors = ci_errors(packet["head"], checks)
-    if route(pr) != "lab" or pr.get("state") != "open" or pr.get("draft"):
-        errors.append("PR must be an open, ready lab PR")
+    if not reviewable(pr):
+        errors.append("PR must be open, ready, and from the same repository")
     return ("WAITING", errors) if errors else ("READY", [])
 
 
@@ -162,17 +159,6 @@ def read_pr(repo, number):
 def merge_base(repo, pr):
     comparison = api(f"repos/{repo}/compare/{pr['base']['sha']}...{pr['head']['sha']}")
     return comparison["merge_base_commit"]["sha"]
-
-
-def check_issue(repo, pr):
-    if route(pr) != "lab":
-        raise ValueError("Lab PRs use a same-repository sortie-lab/ISSUE branch")
-    number = int(pr["head"]["ref"].split("/")[1])
-    issue = api(f"repos/{repo}/issues/{number}")
-    if (issue.get("pull_request") or (issue.get("milestone") or {}).get("title") != MILESTONE
-            or "epic" in [label["name"] for label in issue.get("labels", [])]):
-        raise ValueError("Branch issue is not an implementation task in the lab milestone")
-    return issue
 
 
 def collect_packet(repo, number, issue=None):
@@ -213,7 +199,7 @@ def publish_decision(packet, record, checks):
     repo, number, head = packet["repo"], packet["pr"], packet["head"]
     verdict, reasons = evaluate(packet, record, checks)
     pr = packet["metadata"]
-    if pr.get("draft") or pr["state"] != "open":
+    if not reviewable(pr):
         return
     existing = api(f"repos/{repo}/pulls/{number}/reviews?per_page=100", pages=True)
     ours = [r for r in existing if r.get("user", {}).get("login") == "github-actions[bot]"
@@ -244,15 +230,15 @@ def publish_decision(packet, record, checks):
     if latest.get("state") == desired and latest.get("body", "").splitlines()[0] == lines[0]:
         return
     live = read_pr(repo, number)
-    if live["head"]["sha"] != head or live.get("draft") or live["state"] != "open":
+    if live["head"]["sha"] != head or not reviewable(live):
         raise ValueError("PR changed before gate publication; no verdict posted")
     api(f"repos/{repo}/pulls/{number}/reviews", "POST", {"event": event, "commit_id": head, "body": body})
 
 
 def write_handoff(pr, sha, branch, target):
-    if (route(pr) != "lab" or pr["state"] != "open" or pr.get("draft")
+    if (not reviewable(pr)
             or pr["head"]["sha"] != sha or pr["head"]["ref"] != branch):
-        raise ValueError("Handoff requires the local branch/head to match an open, ready, pushed lab PR")
+        raise ValueError("Handoff requires the local branch/head to match an open, ready, pushed same-repository PR")
     owner, repo = pr["base"]["repo"]["full_name"].split("/")
     scm = {"branch": branch, "sha": sha, "pr_number": pr["number"], "owner": owner, "repo": repo,
            "pushed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
@@ -264,7 +250,7 @@ def write_handoff(pr, sha, branch, target):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="operation", required=True)
-    for name in ("packet", "route", "handoff"):
+    for name in ("packet", "handoff"):
         p = sub.add_parser(name)
         p.add_argument("--repo", required=True)
         p.add_argument("--pr", required=True, type=int)
@@ -274,12 +260,8 @@ def main():
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo) or args.pr < 1:
         parser.error("Expected OWNER/REPO and a positive PR number")
-    if args.operation == "route":
-        print(route(read_pr(args.repo, args.pr)))
-        return
     if args.operation == "handoff":
         pr = read_pr(args.repo, args.pr)
-        check_issue(args.repo, pr)
         write_handoff(pr, command(["git", "rev-parse", "HEAD"]).strip(),
                       command(["git", "branch", "--show-current"]).strip(), Path(".sortie"))
         print(f"Handed PR #{args.pr} at {pr['head']['sha']} to Sortie and CI review")

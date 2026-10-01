@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 import zipfile
 
@@ -16,6 +17,19 @@ spec.loader.exec_module(ci)
 
 
 class CIReviewTests(unittest.TestCase):
+    def test_selection_is_repository_wide_but_excludes_forks_drafts_and_closed_prs(self):
+        candidates = [{"number": i, "state": "open", "draft": False,
+                       "head": {"ref": branch, "repo": {"full_name": "example/tool"}},
+                       "base": {"repo": {"full_name": "example/tool"}}}
+                      for i, branch in enumerate(("sortie-lab/72", "sortie/12", "feature/fix", "draft", "closed", "fork"), 1)]
+        candidates[3]["draft"] = True
+        candidates[4]["state"] = "closed"
+        candidates[5]["head"]["repo"]["full_name"] = "contributor/tool"
+        with patch.object(ci, "trigger_allowed", return_value=True), \
+                patch.object(ci, "api", return_value=candidates), patch.object(ci, "output") as output:
+            ci.select(SimpleNamespace(repo="example/tool", pr=None))
+            output.assert_called_once_with("prs", "[1, 2, 3]")
+
     def test_rejected_event_actors_cannot_create_cached_failures(self):
         for kind, permission, allowed in (("Bot", "write", False), ("User", "read", False),
                                            ("User", "none", False), ("User", "write", True),

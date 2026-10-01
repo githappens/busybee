@@ -23,11 +23,11 @@ hooks:
   after_create: |
     git -c credential.helper= -c credential.helper='!gh auth git-credential' clone "$BUSYBEE_SORTIE_CLONE_URL" .
   before_run: |
-    bash "$BUSYBEE_SORTIE_TRUSTED/sortie/prepare-lab.sh"
+    bash "$BUSYBEE_SORTIE_TRUSTED/sortie/prepare-workspace.sh"
   timeout_ms: 120000
 
 agent:
-  # run-lab.sh selects the adapter through Sortie's supported SORTIE_AGENT_*
+  # launch.sh selects the adapter through Sortie's supported SORTIE_AGENT_*
   # overrides. These fields do not expand arbitrary environment variables.
   kind: codex
   command: codex app-server
@@ -40,7 +40,7 @@ agent:
   max_retry_backoff_ms: 300000
 
 claude-code:
-  # Sortie 1.24 requires this mode; run-lab.sh limits it to an allocated worker.
+  # Sortie 1.24 requires this mode; launch.sh limits it to an allocated worker.
   permission_mode: bypassPermissions
   allowed_tools: "Bash Edit MultiEdit Write Read Glob Grep Agent TodoWrite"
   disallowed_tools: "mcp__sortie-tools__tracker_api"

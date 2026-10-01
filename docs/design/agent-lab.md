@@ -367,10 +367,10 @@ Initial scenarios should cover:
 
 Integrate with the existing agent runner through the controller interface;
 keep its issue selection and review policy separate from VM lifecycle. Include
-stable handling of already-judged review evidence. The lab's CI-owned skill
-reviews and deterministic publisher supersede the external wording judge;
-[#63](https://github.com/githappens/busybee/issues/63) remains a legacy-product
-gate issue rather than a lab prerequisite. Ordinary product agents
+stable handling of already-judged review evidence. The repository-wide CI-owned
+skill reviews and deterministic publisher replace the external wording judge
+for both lab and product PRs, retiring its loop defect tracked in
+[#63](https://github.com/githappens/busybee/issues/63). Ordinary product agents
 must not need to modify the runner, global installation, or template to verify
 their issue.
 

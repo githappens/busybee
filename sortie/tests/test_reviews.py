@@ -137,13 +137,31 @@ class ReviewGateTests(unittest.TestCase):
         self.record["run_url"] = "https://github.com/example/tool/actions/runs/2"
         self.assertEqual(self.publish(prior=prior), [])
 
-    def test_routing_is_exclusive_and_independent_of_labels(self):
-        self.assertEqual(reviews.route(self.pr), "lab")
-        self.pr["head"]["ref"] = "feature/123"
-        self.assertEqual(reviews.route(self.pr), "legacy")
-        self.pr["head"]["ref"] = "sortie-lab/72"
+    def test_review_and_handoff_support_every_same_repository_branch(self):
+        for branch in ("sortie-lab/72", "sortie/72", "feature/fix"):
+            self.pr["head"]["ref"] = branch
+            self.assertTrue(reviews.reviewable(self.pr))
+            self.assertEqual(self.decision(), "READY")
+            with TemporaryDirectory() as tmp:
+                reviews.write_handoff(self.pr, self.head, branch, Path(tmp))
         self.pr["head"]["repo"]["full_name"] = "contributor/tool"
-        self.assertEqual(reviews.route(self.pr), "legacy")
+        self.assertFalse(reviews.reviewable(self.pr))
+        self.assertNotEqual(self.decision(), "READY")
+        with TemporaryDirectory() as tmp, self.assertRaises(ValueError):
+            reviews.write_handoff(self.pr, self.head, "feature/fix", Path(tmp))
+
+    def test_packet_uses_linked_contracts_or_explicit_pr_description_scope(self):
+        for refs in ([], [{"url": "https://github.com/example/tool/issues/72"}]):
+            def fake_api(path, **kwargs):
+                return {"number": 72, "title": "Task", "body": "Contract"} if path.endswith("/issues/72") else []
+
+            with patch.object(reviews, "read_pr", return_value=self.pr), \
+                    patch.object(reviews, "merge_base", return_value=self.base), \
+                    patch.object(reviews, "api", side_effect=fake_api), \
+                    patch.object(reviews, "command", side_effect=[json.dumps({"closingIssuesReferences": refs}), "diff"]):
+                packet = reviews.collect_packet("example/tool", 123)
+            self.assertEqual(len(packet["contracts"]), len(refs))
+            self.assertEqual(packet["contract_source"], "issues" if refs else "PR description only")
 
     def publish(self, *, prior=None, changed=False):
         live = copy.deepcopy(self.pr)

@@ -6,7 +6,8 @@ skills and publishes the formal approval or request for changes. Implementation
 may use Claude, Codex, or Cursor; CI reviewers use **Claude Opus 5.5, high effort**
 (`claude-opus-5-5`, `--effort high`).
 
-This is the bootstrap for the [VM lab](../design/agent-lab.md); it does not yet
+This is the standard repository review workflow and the bootstrap for the
+[VM lab](../design/agent-lab.md); it does not yet
 provide its worker controller, visual scenarios, or artifact matrix enforcement.
 Project Nix and configuration stay in this repository. No host activation or
 private configuration import is required.
@@ -32,7 +33,8 @@ early feedback; they do not grant approval or replace either CI session.
    Implement the assigned scope and named regressions. Infrastructure issues
    may change the controller/runner files explicitly in scope; ordinary product
    tasks do not gain authority over dispatch or approval policy.
-2. Commit and push on `sortie-lab/<issue>`, then create/reuse a draft PR. Include
+2. Commit and push on the task branch (`sortie/<issue>` for product tasks,
+   `sortie-lab/<issue>` for lab tasks), then create/reuse a draft PR. Include
    `Closes #<issue>`, the concrete behavior change, and verification evidence.
    Task checkouts use local Git configuration to route credentials through
    `gh`; no global credential change is needed.
@@ -73,9 +75,12 @@ builds use controller limits instead of the binary under test.
 
 `.github/workflows/agent-review-gate.yml` runs on completed CI, issue comments,
 a five-minute recovery schedule, or a manual dispatch on the default branch.
-It selects only open, ready, same-repository lab PRs whose branch issue is an
-implementation task in the lab milestone. The old product gate skips these
-branches. Only human event actors with repository write access may start a
+It selects all open, ready, same-repository PRs, including manually created
+feature branches and changes to CI or orchestration. Linked closing issues
+provide the acceptance criteria; a PR without linked issues uses its description
+as the explicit scope. Fork PRs require maintainer review. Issue eligibility and
+milestone constraints belong to dispatch, not review. Only human event actors
+with repository write access may start a
 review. Bot or outside-commenter events leave pending work for the next trusted
 schedule run; they cannot create a cached Action rejection. Only repository
 owner/member/collaborator issue comments change the contract fingerprint.
@@ -127,8 +132,8 @@ observes invalidated evidence or failing CI on that head. GitHub's stale-review
 dismissal protects new pushes. VM artifact and full scenario-matrix enforcement
 are delivered by #80; this bootstrap does not imply those checks already exist.
 
-Sortie's human `review_comments` handler excludes bots, so the lab explicitly
-uses `bot_review` for `github-actions[bot]`. Its trusted triage helper re-reads
+Sortie's human `review_comments` handler excludes bots, so both profiles
+use `bot_review` for `github-actions[bot]`. Their trusted triage helper re-reads
 live reviews: current `BLOCKED` dispatches fixes, `READY`/`WAITING` and stale
 signals do not waste a continuation, and `UNSURE` or an unreadable gate result
 escalates to `needs-human`. The reaction's continuation cap bounds fix rounds;
@@ -146,10 +151,14 @@ does not require installing the Claude GitHub App. Repository Actions settings
 must permit GitHub Actions to create/approve PR reviews. Keep the existing
 required approval and stale-review dismissal rules.
 
-This workflow must first land under the repository's existing approval policy:
-a candidate cannot activate its own gate. After merge, a trusted run verifies
-that the stored OAuth token and approval permissions work end to end. A local
-review or syntax check is not proof that those hosted credentials work.
+Normal triggers load this workflow from the default branch. To bootstrap the
+first PR before it lands, a maintainer can create a temporary push-triggered
+workflow on a separate branch, pin every policy checkout to a reviewed commit,
+and fix selection to that one PR. It must run both real reviews and the same
+publisher with existing protections intact. Delete the temporary branch after
+qualification; do not add candidate-ref dispatch to the standard gate. The run
+and formal review provide evidence that hosted OAuth and approval permissions
+work. Local reviews and syntax checks alone cannot establish that.
 
 For manual, read-only inspection, any runner can collect the same packet:
 

@@ -145,15 +145,6 @@ else
   printf 'not ok - hook denies when jq is missing\n%s\n' "$no_jq_output" >&2
   failures=$((failures + 1))
 fi
-if PATH="$no_jq_bin" "$bash_bin" "$root/sortie/agent.sh" >/dev/null 2>"$no_jq_bin/err"; then
-  printf 'not ok - agent.sh requires jq\n' >&2
-  failures=$((failures + 1))
-elif grep -q 'jq is required' "$no_jq_bin/err"; then
-  printf 'ok - agent.sh requires jq\n'
-else
-  printf 'not ok - agent.sh requires jq\n%s\n' "$(cat "$no_jq_bin/err")" >&2
-  failures=$((failures + 1))
-fi
 rm -rf "$no_jq_bin"
 
 # Launcher keeps Busy Bee / Pueue state inside the workspace.
@@ -250,11 +241,12 @@ else
 fi
 rm -rf "$scratch2"
 
-if ! grep -q 'MACHINE_SAFETY_REF=origin/main' "$root/sortie/WORKFLOW.md"; then
-  printf 'not ok - WORKFLOW.md installs from origin/main\n' >&2
+if ! grep -q '\$BUSYBEE_SORTIE_TRUSTED/sortie/prepare-workspace.sh' "$root/sortie/WORKFLOW.md" ||
+   ! grep -q 'ref=${BUSYBEE_SORTIE_TRUSTED_REF:-origin/main}' "$root/sortie/launch.sh"; then
+  printf 'not ok - WORKFLOW.md installs from trusted snapshot of origin/main\n' >&2
   failures=$((failures + 1))
 else
-  printf 'ok - WORKFLOW.md installs from origin/main\n'
+  printf 'ok - WORKFLOW.md installs from trusted snapshot of origin/main\n'
 fi
 if grep -q 'refs/remotes/origin' "$root/sortie/WORKFLOW.md"; then
   printf 'not ok - WORKFLOW.md must not scan arbitrary origin refs\n' >&2

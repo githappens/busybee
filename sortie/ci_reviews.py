@@ -10,9 +10,9 @@ import subprocess
 import sys
 import zipfile
 
-from reviews import (EFFORT, MODEL, SKILLS, api, check_issue, checks_for, ci_errors,
+from reviews import (EFFORT, MODEL, SKILLS, api, checks_for, ci_errors,
                      collect_packet, input_id, paged_objects, publish_decision,
-                     read_pr, result_errors, route)
+                     read_pr, result_errors, reviewable)
 
 WORKFLOW = ".github/workflows/agent-review-gate.yml"
 SCHEMA = {
@@ -111,17 +111,17 @@ def select(args):
         candidates = api(f"repos/{args.repo}/pulls?state=open&per_page=100", pages=True)
     selected = []
     for pr in candidates:
-        if route(pr) != "lab" or pr["state"] != "open" or pr["draft"]:
+        if not reviewable(pr):
             continue
-        check_issue(args.repo, pr)
         selected.append(pr["number"])
     output("prs", json.dumps(selected))
 
 
 def prepare(args):
     pr = read_pr(args.repo, args.pr)
-    issue = check_issue(args.repo, pr)
-    packet = collect_packet(args.repo, args.pr, issue["number"])
+    if not reviewable(pr):
+        raise ValueError("PR is no longer eligible for review")
+    packet = collect_packet(args.repo, args.pr)
     checks = checks_for(args.repo, packet["head"])
     packet["checks"] = checks
     name = f"busybee-reviews-{args.pr}-{input_id(packet)}"
@@ -130,7 +130,7 @@ def prepare(args):
     args.directory.mkdir(parents=True, exist_ok=True)
     (args.directory / "packet.json").write_text(json.dumps(packet, indent=2) + "\n")
     (args.directory / "record.json").write_text(json.dumps(record, indent=2) + "\n")
-    needed = record is None and not ci_errors(packet["head"], checks) and not pr["draft"] and pr["state"] == "open"
+    needed = record is None and not ci_errors(packet["head"], checks) and reviewable(packet["metadata"])
     flags = ["--model", MODEL, "--effort", EFFORT, "--max-turns", "40", "--restricted",
              "--tools", "Read,Glob,Grep", "--allowedTools", "Read,Glob,Grep", "--permission-mode", "dontAsk",
              "--setting-sources", "user", "--disable-slash-commands", "--strict-mcp-config",
@@ -155,8 +155,9 @@ def collect(args):
 
 def publish(args):
     pr = read_pr(args.repo, args.pr)
-    issue = check_issue(args.repo, pr)
-    packet = collect_packet(args.repo, args.pr, issue["number"])
+    if not reviewable(pr):
+        return
+    packet = collect_packet(args.repo, args.pr)
     path = args.directory / "record.json"
     if path.exists():
         record = json.loads(path.read_text())

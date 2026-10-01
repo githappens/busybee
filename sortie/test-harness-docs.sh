@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
-# Invariants for #55: documented loop numbers match the config, duplicated
-# ground rules stay one line with a pointer, and the reply-contract copies
-# name each other.
+# Documented loop limits come from config, ground rules point at their source,
+# and both dispatch profiles use the shared CI review/handoff contract.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd -P)
 workflow="$root/sortie/WORKFLOW.md"
 readme="$root/sortie/README.md"
-gate="$root/.github/workflows/codex-gate.yml"
 failures=0
 
 ok() { printf 'ok - %s\n' "$1"; }
@@ -76,17 +74,15 @@ else
   not_ok 'scope rule must point at AGENTS.md'
 fi
 
-twin='Reply-contract twin:'
-if grep -q "$twin" "$workflow" && grep -q 'codex-gate.yml' "$workflow"; then
-  ok 'WORKFLOW.md reply contract names its twin'
-else
-  not_ok 'WORKFLOW.md reply contract must name .github/workflows/codex-gate.yml'
-fi
-if grep -q "$twin" "$gate" && grep -q 'WORKFLOW.md' "$gate"; then
-  ok 'codex-gate.yml reply contract names its twin'
-else
-  not_ok 'codex-gate.yml reply contract must name sortie/WORKFLOW.md'
-fi
+for profile in WORKFLOW.md LAB_WORKFLOW.md; do
+  if grep -q 'docs/development/agent-review.md' "$root/sortie/$profile" &&
+     grep -q '\$BUSYBEE_SORTIE_TRUSTED/sortie/reviews.py handoff' "$root/sortie/$profile" &&
+     grep -q '\$BUSYBEE_SORTIE_TRUSTED/sortie/review-triage.py' "$root/sortie/$profile"; then
+    ok "$profile uses the shared trusted review and handoff contract"
+  else
+    not_ok "$profile must use the shared trusted review and handoff contract"
+  fi
+done
 
 if [ "$failures" -ne 0 ]; then
   printf '%s harness-docs test(s) failed\n' "$failures" >&2

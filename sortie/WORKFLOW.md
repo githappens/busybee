@@ -1,86 +1,72 @@
 ---
-# Sortie workflow for githappens/busybee.
-#
-# Launch with sortie/run.sh (pins this instance's port, reuses gh's token,
-# checks the ssh alias, runs inside the dev shell so the agent inherits
-# cargo/pueued/make/ninja on PATH). `sortie/run.sh --dry-run` polls once.
-#
-# Issues are selected by the `sortie` marker label and moved through
-# sortie:ready -> sortie:working -> sortie:review -> sortie:done by sortie
-# itself. The agent never touches issue state.
-
+# Launch with run.sh. It selects a native adapter, pins the executing
+# scripts outside issue workspaces, and uses the repo-owned agent dev shell.
 tracker:
   kind: github
   project: githappens/busybee
   api_key: $GITHUB_TOKEN
-  query_filter: "label:sortie milestone:\"bzbd: shared CPU token pool\""
+  query_filter: 'label:sortie milestone:"bzbd: shared CPU token pool"'
   active_states: [sortie:ready, sortie:working]
   in_progress_state: sortie:working
   handoff_state: sortie:review
   terminal_states: [sortie:done]
-  handoff_evidence: observed
+  handoff_evidence: strict
+
+workspace:
+  root: $BUSYBEE_SORTIE_STATE/sortie-workspaces
+db_path: $BUSYBEE_SORTIE_STATE/sortie.db
 
 polling:
   interval_ms: 60000
 
-workspace:
-  root: $PWD/build/sortie-workspaces
-
-db_path: $PWD/build/sortie.db
-
 hooks:
-  # Full clone (not --depth 1): agents rebase and inspect history.
   after_create: |
-    git clone git@github.com-sortie:githappens/busybee.git .
-  # Keep the issue branch across attempts and continuation turns; only
-  # create it from origin/main the first time.
+    git -c credential.helper= -c credential.helper='!gh auth git-credential' clone "$BUSYBEE_SORTIE_CLONE_URL" .
   before_run: |
-    set -e
-    git fetch -q origin main
-    b="sortie/${SORTIE_ISSUE_IDENTIFIER}"
-    if git rev-parse -q --verify "$b" >/dev/null; then
-      git checkout -q "$b"
-    else
-      git checkout -q -B "$b" origin/main
-    fi
-    # Install the machine-safety payload into the otherwise disposable
-    # workspace. Runtime copies stay out of `git add -A`; sources live in
-    # sortie/. After merge the trusted blob is origin/main; if it is missing,
-    # fail rather than searching other refs or the issue-branch HEAD.
-    if ! git cat-file -e origin/main:sortie/install-machine-safety.sh 2>/dev/null; then
-      echo "sortie: machine-safety payload missing on origin/main" >&2
-      exit 1
-    fi
-    git show origin/main:sortie/install-machine-safety.sh \
-      | MACHINE_SAFETY_REF=origin/main bash
-    # Per-issue model override: a `model:<name>` label (e.g. model:fable)
-    # becomes .sortie/model, read by sortie/agent.sh. No label = default model.
-    mkdir -p .sortie
-    labels="$(gh issue view "$SORTIE_ISSUE_IDENTIFIER" --repo githappens/busybee --json labels --jq '[.labels[].name] | join(" ")')"
-    model=""
-    for l in $labels; do case "$l" in model:*) model="${l#model:}";; esac; done
-    if [ -n "$model" ]; then printf '%s\n' "$model" > .sortie/model; else rm -f .sortie/model; fi
+    bash "$BUSYBEE_SORTIE_TRUSTED/sortie/prepare-workspace.sh"
   timeout_ms: 120000
 
 agent:
-  kind: claude-code
-  command: sortie/agent.sh   # picks the model per issue; see the before_run hook
+  # launch.sh selects the adapter through Sortie's supported SORTIE_AGENT_*
+  # overrides. These fields do not expand arbitrary environment variables.
+  kind: codex
+  command: codex app-server
+  max_concurrent_agents: 4
   max_turns: 20
-  max_sessions: 80   # continuation turns (review fixes, rebases) count as sessions
-  max_concurrent_agents: 4   # hot-reloads; drop to 1 when bringing up a fresh setup
+  max_sessions: 20
   turn_timeout_ms: 7200000
-  read_timeout_ms: 10000
+  read_timeout_ms: 30000
   stall_timeout_ms: 900000
   max_retry_backoff_ms: 300000
 
 claude-code:
-  permission_mode: dontAsk
-  allowed_tools: "Bash Edit MultiEdit Write Read Glob Grep Agent TodoWrite WebFetch(domain:docs.rs) WebFetch(domain:github.com)"
-  disallowed_tools: "mcp__sortie-tools__tracker_api WebSearch"
+  # Sortie 1.24 requires this mode; launch.sh limits it to an allocated worker.
+  permission_mode: bypassPermissions
+  allowed_tools: "Bash Edit MultiEdit Write Read Glob Grep Agent TodoWrite"
+  disallowed_tools: "mcp__sortie-tools__tracker_api"
   session_persistence: true
 
+codex:
+  approval_policy: never
+  thread_sandbox: workspaceWrite
+  turn_sandbox_policy:
+    type: workspaceWrite
+    networkAccess: true
+
 reactions:
-  # Human CHANGES_REQUESTED reviews -> continuation turn.
+  bot_review:
+    provider: github
+    bot_usernames: ["github-actions", "github-actions[bot]"]
+    poll_interval_ms: 60000
+    debounce_ms: 60000
+    max_continuation_turns: 6
+    watch_window_ms: 21600000
+    escalation: label
+    escalation_label: needs-human
+    triage:
+      script: |
+        python3 "$BUSYBEE_SORTIE_TRUSTED/sortie/review-triage.py"
+      timeout_ms: 180000
   review_comments:
     provider: github
     max_retries: 2
@@ -88,49 +74,30 @@ reactions:
     escalation_label: needs-human
     poll_interval_ms: 120000
     debounce_ms: 60000
-    max_continuation_turns: 3
-  # Codex (chatgpt-codex-connector[bot]) reviews every push; its inline
-  # comments -> continuation turn. github-actions[bot] only posts the verdict.
-  bot_review:
+    max_continuation_turns: 6
+    watch_window_ms: 21600000
+  ci_failure:
     provider: github
-    bot_usernames: ["chatgpt-codex-connector", "chatgpt-codex-connector[bot]"]
-    max_retries: 2
+    max_retries: 3
+    max_log_lines: 80
     escalation: label
     escalation_label: needs-human
     poll_interval_ms: 60000
-    # Every new review body (Codex summary, gate verdict) changes the comment
-    # set and re-triggers a turn, so rounds are cheap no-ops more often than not.
-    # A daemon or config PR that draws one genuine finding per round burns these
-    # fast: #8 reached 15 in ninety minutes with every finding legitimate, so 30
-    # would have escalated work that was converging. Needs a restart to apply.
-    max_continuation_turns: 60
-  # Merge once the review decision is APPROVED (codex-gate approves as
-  # github-actions[bot] when Codex reports no findings on the head commit; the
-  # main ruleset requires that approval) and every check is green.
-  auto_merge:
-    provider: github
-    strategy: squash
-    require_ci: true
-    delete_branch: true
-    poll_interval_ms: 60000
-    max_retries: 2
-    escalation: label
-    escalation_label: needs-human
-  # A PR that becomes unmergeable (main moved under it) gets one rebase turn
-  # per conflicting head; auto_merge defers while conflicted.
+    watch_window_ms: 21600000
   merge_conflicts:
     provider: github
     max_retries: 2
     escalation: label
     escalation_label: needs-human
     poll_interval_ms: 60000
-  # A failing check on the PR head -> continuation turn with the log excerpt.
-  # CI runs on Linux and macOS while agents develop on one of them, so
-  # platform-specific failures are expected and must be fixed by the agent.
-  ci_failure:
+  auto_merge:
     provider: github
-    max_retries: 3
-    max_log_lines: 80
+    strategy: squash
+    require_ci: true
+    delete_branch: true
+    poll_interval_ms: 60000
+    watch_window_ms: 21600000
+    max_retries: 2
     escalation: label
     escalation_label: needs-human
   merge_completion:
@@ -155,23 +122,14 @@ deliver one pull request for it.
 {{ end }}
 {{ if .issue.blocked_by }}
 
-Blocked-by issues (all must already be merged on `main`): {{ range $i, $b := .issue.blocked_by }}{{ if $i }}, {{ end }}#{{ $b.identifier }}{{ end }}. Read their merged code before starting; build on it, do not duplicate it.
+Blocked-by issues (all must already be merged on `main`): {{ range $i, $b := .issue.blocked_by }}{{ if $i }}, {{ end }}#{{ $b.display_id }}{{ end }}. Read their merged code before starting; build on it, do not duplicate it.
 {{ end }}
 
 ## Ground rules
 
 1. **Read first.** `CLAUDE.md` (build/test/layout) and `docs/design/bzbd.md` (the specification; `AGENTS.md` §Conform to the specification). If the spec and the task conflict, the task wins for scope and the spec wins for semantics; say so in the PR body.
 2. **Scope.** The issue's Scope and Acceptance criteria are the whole scope (`AGENTS.md` §Stay within the issue's scope). If something outside that blocks you, or the criteria cannot be made to pass and remaining moves are low-confidence, write `blocked` to `.sortie/status` with one line of reasoning and stop; that is a successful escalation, not a failed attempt.
-3. **Use these skills when they are available (check the skill list):**
-   - `ponytail:ponytail` before writing any code — simplest solution that
-     works: standard library before dependencies, one function before an
-     abstraction, no speculative flexibility.
-   - `ponytail:ponytail-review` on your diff before opening the PR; delete what
-     it flags.
-   - `superpowers:test-driven-development` while implementing.
-   - `superpowers:systematic-debugging` the moment a test fails unexpectedly or
-     behaviour surprises you — form a hypothesis from evidence before changing
-     code; no guess-and-rerun loops.
+3. **Review skills.** The repository skills and CI handoff are defined in `docs/development/agent-review.md`; use the trusted copy under `$BUSYBEE_SORTIE_TRUSTED`. Local reviews are optional early feedback. CI runs both independent skill reviews.
 4. **TDD.** Failing test first; never weaken, skip, or delete an existing test to get green (`CLAUDE.md` §Conventions).
 5. **No silent fallbacks.** Errors propagate with context; degraded paths stay loud (`CLAUDE.md` §Conventions, `AGENTS.md` §No silent fallbacks).
 6. **Build and test.** Commands live in `CLAUDE.md` §Build and test; cargo test/clippy/fmt are allowed as-is.
@@ -204,153 +162,62 @@ for the squash merge. A PR that does not merge cleanly is never merged.
 
 ## Finishing
 
-When the acceptance criteria pass locally, review the whole change before anyone
-else does. The automated reviewer surfaces one or two findings per pass and
-re-reviews every push, so each defect that reaches it costs a full round trip;
-the ones you catch here cost nothing.
+When implementation and required checks are ready:
 
-Dispatch a subagent with a fresh context and give it only the diff
-(`git diff origin/main...HEAD`), `AGENTS.md` (§Code Review Rules is what the
-reviewer applies), the issue text, and the spec sections the change touches. Ask
-it to review as that reviewer would: spec conformance, silent fallbacks, resource
-accounting on every exit path, tests as the contract, scope. Fix what it finds
-that is real and within the issue's scope; rerun the suite. One pass — do not
-loop on it, and do not widen the change to satisfy a suggestion outside the
-acceptance criteria.
+1. Commit, push, and create/reuse a draft PR with `Closes #{{ .issue.identifier }}`.
+   Use `gh pr create --draft` and `--body-file` for the prepared description.
+2. Mark the implementation ready with `gh pr ready`. CI runs both trusted
+   review skills in separate Claude Opus 5.5 high sessions after Linux/macOS
+   checks pass. Local skill reviews are optional early feedback; do not publish
+   author review receipts or claim they can satisfy the gate.
+3. Use `$BUSYBEE_SORTIE_TRUSTED/sortie/reviews.py handoff --repo OWNER/REPO
+   --pr NUMBER` to write `.sortie/scm.json` (including the pushed SHA and time)
+   and `.sortie/status`. Hand off immediately; do not wait in an agent session
+   for CI review. `needs-human-review` is Sortie's protocol name: CI supplies
+   the formal review and Sortie handles the resulting continuation or merge.
+4. On a findings continuation, fix valid scoped findings, rerun affected
+   checks, and push to the same PR. Explain declined findings in a PR comment
+   with concrete evidence; CI re-reviews that new disposition even without a
+   code change. Repeat the handoff. CI settles prior findings and reviews the
+   new delta; both final reports and required CI must cover the current head.
 
-Then:
+Do not change issue labels/state or merge the PR yourself. Do not request the
+external Codex review bot: these two skills provide this workflow's review.
+If a prerequisite or tool genuinely blocks progress, retain source and reports,
+write a specific reason to `.sortie/blocker.md`, set `.sortie/status` to
+`blocked`, and stop. Do not retry unchanged evidence or ask someone to operate
+the environment as a routine step.
 
-1. `git add -A && git commit` with a conventional message
-   (`feat(bzb-core): …`, `test(bzbd): …`, `docs: …`); reference the issue as
-   `Closes #{{ .issue.identifier }}` in the body.
-2. `git push -u origin HEAD`.
-3. `gh pr create --repo githappens/busybee --base main --title "<type>(<area>): <summary> (#{{ .issue.identifier }})" --body "<what, why, how tested; Closes #{{ .issue.identifier }}>"`.
-4. Write the PR details for the orchestrator:
-   ```sh
-   mkdir -p .sortie
-   printf '{"branch":"%s","pr_number":%s,"owner":"githappens","repo":"busybee"}\n' \
-     "$(git rev-parse --abbrev-ref HEAD)" "$(gh pr view --json number -q .number)" > .sortie/scm.json
-   echo needs-human-review > .sortie/status
-   ```
-5. Stop. An automated reviewer (Codex) reviews every push and its findings come
-   back to you as a continuation turn; the PR merges automatically once CI is
-   green and the head carries no P0/P1 finding and every P2/P3 finding has your
-   answer. Human review comments also come back as continuation turns.
-{{ if or .run.is_continuation .review_comments .bot_review_comments .merge_conflict .ci_failure }}
-
-## Continuation
-
-You are resuming this task. Do not start over: run `git status` and `git log
---oneline -5`, then continue from where the previous turn stopped. If a PR
-already exists, push to the same branch.
-{{ if .bot_review_comments }}
-Before running tests, first run the review-status predicate in the
-Automated review section below. If it ends the turn, do not run the suite.
-Otherwise run the suite before changing files.
-{{ else }}
-Run the test suite before continuing.
+{{ if .run.is_continuation }}
+This is a continuation. Inspect branch/PR state and prior reports first. Reuse
+completed work. Rerun checks when code changed or a reported failure requires
+them; an unchanged settled review does not require a new test run or push.
 {{ end }}
 {{ if .review_comments }}
-
-### Review feedback to address
-
-{{ range .review_comments }}- (comment id {{ .id }}) {{ .reviewer }}{{ if .file }} on `{{ .file }}`{{ if .start_line }}:{{ .start_line }}{{ end }}{{ end }}: {{ .body }}
+Review feedback:
+{{ range .review_comments }}- {{ .reviewer }}: {{ .body }}
 {{ end }}
-First react 👀 on each comment (`gh api -X POST repos/githappens/busybee/pulls/comments/<id>/reactions -f content=eyes`)
-so the reviewer sees you are on it. Address every point and reply on each thread
-with what changed. Push only if you changed files; threads you already answered in
-an earlier turn need no new push.
-{{ end }}
-{{ if .merge_conflict }}
-
-### Merge conflict to resolve
-
-PR #{{ .merge_conflict.pr_number }} (branch `{{ .merge_conflict.branch }}`, head
-`{{ .merge_conflict.head_sha }}`) no longer merges into `{{ .merge_conflict.base }}`.
-Rebase the branch onto the current `origin/{{ .merge_conflict.base }}`
-(`git fetch origin && git rebase origin/{{ .merge_conflict.base }}`), resolve every
-conflict so the result still satisfies the issue's acceptance criteria and the
-spec, rerun the full test suite, and `git push --force-with-lease`. Do not merge
-`{{ .merge_conflict.base }}` into the branch; history must stay linear for the
-squash merge. Keep the PR's scope unchanged.
+Address the scoped feedback, then repeat affected checks and the current-head
+review/handoff process. Explain declined findings with concrete reasons.
 {{ end }}
 {{ if .bot_review_comments }}
-
-### Automated review findings to address (Codex)
-
-{{ range .bot_review_comments }}- (comment id {{ .id }}) {{ if .file }}`{{ .file }}`{{ if .start_line }}:{{ .start_line }}{{ end }}: {{ end }}{{ .body }}
+CI skill review findings:
+{{ range .bot_review_comments }}- {{ .reviewer }}: {{ .body }}
 {{ end }}
-Before tests, acknowledgements or replies, run
-`sortie/review-status.sh -v <pr>`. Its one-line verdict is authoritative:
-
-- `approvable`: end the turn now. A new `@codex review` would replace the clean
-  signal with 👀 and throw away an approval that is about to land.
-- `waiting:<ids>`: answer only those P2/P3 threads.
-- `blocked:<ids>`: fix or decline only those P0/P1 or unbadged findings.
-- `unknown:<reason>`: do not change files. A review or re-review is in flight, the gate
-  still needs to classify Codex's freeform wording, or answered P2/P3 threads still
-  await the gate's reply-quality judgement (`unknown:judge-replies`).
-
-Acknowledge each `waiting` or `blocked` id with 👀:
-`gh api -X POST repos/githappens/busybee/pulls/comments/<id>/reactions -f content=eyes`.
-P0/P1 findings block until the reviewer clears the head. P2/P3 findings clear
-when their threads carry an author reply; fix one only when the fix is small and
-inside the acceptance criteria, otherwise defer it to a follow-up issue.
-<!-- Reply-contract twin: .github/workflows/codex-gate.yml (Decide prompt). -->
-A bare acknowledgement is not an answer: state the fix, or why it does not apply here.
-
-Reply with
-`gh api -X POST repos/githappens/busybee/pulls/<pr>/comments -F in_reply_to=<id> -f body='…'`.
-Write enough that a reader with only that thread understands the decision.
-
-**The scope of this turn is exactly the ids reported by the script — nothing
-else.** Do not hunt for defects or harden adjacent code. Push only when fixing a
-reported finding changed files; replies and declines alone get no commit, amend,
-rebase or push.
-
-After declining a blocking finding, rerun the script. If it remains `blocked`
-and the evidence shows no re-review request for this head, ask once:
-
-```sh
-gh api -X POST repos/githappens/busybee/issues/<pr>/comments -f body='@codex review
-
-<one line per declined finding: which thread it is, and why it does not apply>'
-```
-
-The script owns the once-per-head bookkeeping. If its evidence shows that the
-same finding was re-raised after that request, write `blocked` to `.sortie/status`
-with one line naming it and stop; a human settles it. A clean re-review appears as
-`approvable`.
-
-A new push triggers a fresh automated review. The PR merges automatically once
-CI is green and the review-status predicate is approvable.
+Read the latest formal CI review on this PR. Fix its scoped findings or explain
+declined findings with concrete evidence in a PR comment. Retain settled
+decisions. Push changes and hand off again; CI owns the follow-up reviews.
+Do not run an author receipt loop, reply to a clean approval, or make an empty
+commit to trigger review. Authentication/tool failures escalate through triage.
 {{ end }}
 {{ if .ci_failure }}
-
-### CI failure to fix
-
-{{ .ci_failure.failing_count }} check(s) on the PR head `{{ .ci_failure.ref }}` failed:
-{{ range .ci_failure.check_runs }}- {{ .name }}: {{ .conclusion }} ({{ .details_url }})
-{{ end }}
-Log excerpt from the first failing check:
-
-```
+CI failed on {{ .ci_failure.ref }}:
 {{ .ci_failure.log_excerpt }}
-```
-
-CI runs the suite on both Linux and macOS; you develop on one of them, so the
-usual cause is platform-specific behaviour (socket semantics, error kinds,
-signals, filesystem details). Reproduce from the log, fix the code or the test so
-it holds on both platforms (never gate a test on one OS to make it pass), rerun
-the full test suite, and push.
+Reproduce and fix the failure; never weaken a test to pass. Push to the same PR
+and hand off its new head for CI review.
 {{ end }}
+{{ if .merge_conflict }}
+PR #{{ .merge_conflict.pr_number }} conflicts with {{ .merge_conflict.base }}.
+Fetch and rebase only to resolve the actual conflict, preserve scope, run the
+required checks, push with `--force-with-lease`, and review the new head.
 {{ end }}
-{{ if and .attempt (not .run.is_continuation) (not .review_comments) (not .bot_review_comments) (not .merge_conflict) (not .ci_failure) }}
-
-## Retry (attempt {{ .attempt }})
-
-A previous attempt failed. Inspect the workspace and `.sortie/status` before
-choosing an approach; do not repeat the one that failed.
-{{ end }}
-
-Issue: {{ .issue.url }}

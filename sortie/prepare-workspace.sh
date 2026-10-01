@@ -4,14 +4,17 @@ set -euo pipefail
 trusted=${BUSYBEE_SORTIE_TRUSTED:?trusted controller directory required}
 issue=${SORTIE_ISSUE_IDENTIFIER:?issue number required}
 [[ "$issue" =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid issue number' >&2; exit 2; }
-python3 "$trusted/sortie/lab.py" check --issue "$issue"
+case "${BUSYBEE_SORTIE_PROFILE:?profile required}" in
+  lab) python3 "$trusted/sortie/lab.py" check --issue "$issue"; branch="sortie-lab/$issue" ;;
+  product) branch="sortie/$issue" ;;
+  *) echo 'Unsupported dispatch profile' >&2; exit 2 ;;
+esac
 
 # Fetch and push use the dispatcher's GitHub identity. Clear inherited helpers
 # in this checkout only; an unrelated cached account must not take precedence.
 git config --local --replace-all credential.helper ''
 git config --local --add credential.helper '!gh auth git-credential'
 git fetch -q origin main
-branch="sortie-lab/$issue"
 if git rev-parse -q --verify "$branch" >/dev/null; then
   git checkout -q "$branch"
 elif git rev-parse -q --verify "origin/$branch" >/dev/null; then
