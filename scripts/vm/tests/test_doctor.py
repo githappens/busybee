@@ -37,7 +37,8 @@ manifest = "templates/linux/manifest.json"
 
 def manifest(**overrides):
     value = {
-        "schema": contracts.TEMPLATE_SCHEMA, "name": "linux", "os": "linux", "arch": "arm64",
+        "schema": contracts.TEMPLATE_SCHEMA, "name": "linux", "candidate": "r-20261001T000000Z-abcdef",
+        "os": "linux", "arch": "arm64",
         "vm_id": "{11111111-2222-3333-4444-555555555555}",
         "snapshot_id": "{66666666-7777-8888-9999-000000000000}",
         "provisioning_revision": "0123456789abcdef0123456789abcdef01234567",
@@ -70,7 +71,8 @@ class RecordingRunner:
         if tool == "prlsrvctl" and rest == ["info", "--json"]:
             return json.dumps(self.server)
         if tool == "prlctl" and rest == ["list", "--all", "--json"]:
-            return json.dumps([{"uuid": vm, "status": "stopped", "name": "x"} for vm in self.vms])
+            # Real `prlctl list` prints bare UUIDs; manifests carry braces.
+            return json.dumps([{"uuid": vm.strip("{}"), "status": "stopped", "name": "x"} for vm in self.vms])
         if tool == "prlctl" and rest[:1] == ["snapshot-list"]:
             return json.dumps(self.snapshots.get(rest[1], {}))
         raise AssertionError(f"unexpected Parallels call {argv}")
@@ -325,8 +327,7 @@ class CliTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(self.SCRIPT), *args], capture_output=True, text=True)
 
     def test_controller_reports_unimplemented_operations(self):
-        for argv in (["template", "build", "linux"], ["template", "validate", "linux"],
-                     ["template", "promote", "linux"], ["worker", "create", "linux"],
+        for argv in (["worker", "create", "linux"],
                      ["worker", "reset", "w"], ["worker", "destroy", "w"], ["exec", "w", "--", "true"],
                      ["terminal", "open", "w"], ["terminal", "send", "w", "q"], ["terminal", "resize", "w"],
                      ["terminal", "capture", "w"], ["inspect", "w"], ["signal", "w", "TERM", "1"],
@@ -341,6 +342,15 @@ class CliTests(unittest.TestCase):
                 human = self.run_cli(*argv)
                 self.assertEqual(human.returncode, vmctl.EXIT_UNSUPPORTED)
                 self.assertIn("unsupported", human.stdout)
+
+    def test_template_operations_need_a_valid_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.run_cli("--json", "template", "build", "linux", "--arch", "aarch64",
+                               "--config", str(Path(tmp) / "absent.toml"))
+        self.assertEqual(out.returncode, vmctl.EXIT_FAILED, out.stderr)
+        result = json.loads(out.stdout)
+        self.assertEqual(result["status"], "environment_failure")
+        self.assertIn("config_missing", {f["code"] for f in result["findings"]})
 
     def test_an_unknown_operation_is_a_usage_error(self):
         self.assertEqual(self.run_cli("frobnicate").returncode, 2)

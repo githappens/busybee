@@ -17,6 +17,8 @@ import tomllib
 
 import contracts
 import parallels
+import registry
+import template
 
 REPO = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = contracts.STATE_ROOT / "local.toml"
@@ -26,7 +28,7 @@ EXIT_OK, EXIT_FAILED, EXIT_UNSUPPORTED = 0, 1, 3
 # config names no path. Reported as the source so the choice is visible.
 APP_BUNDLE = Path("/Applications/Parallels Desktop.app/Contents/MacOS")
 
-GROUPS = {"template": ("build", "validate", "promote"), "worker": ("create", "reset", "destroy"),
+GROUPS = {"worker": ("create", "reset", "destroy"),
           "terminal": ("open", "send", "resize", "capture"), "console": ("capture",)}
 SINGLE = ("exec", "inspect", "signal", "collect")
 
@@ -124,7 +126,7 @@ def check_parallels(adapter, findings):
         findings.append(contracts.finding("parallels_signed_out", "no Parallels account is signed in; "
                                           "unattended operations may stop at a sign-in prompt", "warning"))
     info = {"version": version, "license": license_state, "signed_in": signed_in, "vm_count": len(vms)}
-    return info, {vm.get("uuid") for vm in vms}
+    return info, {parallels.braced(vm["uuid"]) for vm in vms}
 
 
 def check_resources(repo, config, host, findings):
@@ -207,6 +209,31 @@ def doctor(repo, config_path, host, runner=parallels.run):
     return contracts.result("doctor", status, summary, findings, data)
 
 
+def template_operation(repo, args, host):
+    operation = f"template {args.action}"
+    findings = []
+    config = load_config(args.config, repo, findings)
+    if config and args.name not in config.get("templates", {}):
+        findings.append(contracts.finding("config_invalid", f"no [templates.{args.name}] in the local config"))
+    if findings:
+        return contracts.result(operation, "environment_failure", "cannot run without a valid config", findings)
+    state = contracts.state_dir(config, repo)
+    if args.action == "promote":
+        return template.promote(state, args.name, args.candidate)
+    if args.name != "linux":
+        return contracts.result(operation, "unsupported", f"{args.name} templates are not provisioned here", [
+            contracts.finding("template_unsupported", "only the linux template is provisioned by this controller")])
+    prlctl, _ = resolve_tool("prlctl", config, host, findings)
+    prlsrvctl, _ = resolve_tool("prlsrvctl", config, host, findings)
+    if findings:
+        return contracts.result(operation, "environment_failure", "Parallels tools are missing", findings)
+    reg = registry.Registry(state)
+    lab = template.Lab(repo, config, parallels.Parallels(prlctl, prlsrvctl, owned=reg), reg)
+    if args.action == "build":
+        return lab.build(args.name, args.arch)
+    return lab.validate(args.name, args.candidate)
+
+
 def unsupported(operation):
     return contracts.result(operation, "unsupported",
                             f"{operation} is not implemented in this controller revision", [
@@ -238,6 +265,16 @@ def parser():
     ops = root.add_subparsers(dest="operation", required=True)
     doc = ops.add_parser("doctor", help="read-only host and configuration preflight")
     doc.add_argument("--config", type=Path, default=REPO / DEFAULT_CONFIG)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("name")
+    common.add_argument("--config", type=Path, default=REPO / DEFAULT_CONFIG)
+    actions = ops.add_parser("template", help="build, validate and promote worker templates") \
+        .add_subparsers(dest="action", required=True)
+    actions.add_parser("build", parents=[common], help="provision a candidate from the pinned installer") \
+        .add_argument("--arch", required=True, help="guest architecture; must match the pinned installer")
+    for action in ("validate", "promote"):
+        actions.add_parser(action, parents=[common]) \
+            .add_argument("--candidate", required=True, help="run id printed by template build")
     for group, actions in GROUPS.items():
         sub = ops.add_parser(group).add_subparsers(dest="action", required=True)
         for action in actions:
@@ -251,6 +288,8 @@ def main(argv=None):
     args = parser().parse_args(argv)
     if args.operation == "doctor":
         outcome = doctor(REPO, args.config, Host())
+    elif args.operation == "template":
+        outcome = template_operation(REPO, args, Host())
     else:
         outcome = unsupported(" ".join(filter(None, (args.operation, getattr(args, "action", None)))))
     print(json.dumps(outcome, indent=2) if args.json else summary(outcome))

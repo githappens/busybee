@@ -5,8 +5,9 @@ disposable Parallels VMs. An agent must be able to reproduce an issue, change
 the code, inspect the running terminal UI, and verify the fix on Linux and
 macOS without asking a person to operate its development environment.
 
-**Status: design for implementation.** Only the read-only `doctor` preflight
-(`scripts/vm/vmctl.py`) has shipped; every other operation returns `unsupported`.
+**Status: design for implementation.** `doctor` and the Linux `template`
+operations (`scripts/vm/vmctl.py`) have shipped; every other operation returns
+`unsupported`.
 Until the rest lands, [CLAUDE.md](../../CLAUDE.md) and the
 [Sortie workflow](../../sortie/README.md) remain the operational instructions.
 
@@ -212,6 +213,23 @@ inside the project development shell, configured by ignored
 `build/vm/local.toml` (copied from `infra/vm/local.example.toml`). Result,
 template and worker schemas and exit codes are documented in
 `scripts/vm/vmctl.py` and `scripts/vm/contracts.py`.
+
+`doctor` and `template build`, `validate` and `promote` have shipped for the
+Linux template. `template build linux --arch aarch64` installs NixOS from the
+installer pinned in `infra/vm/linux/installer.json` into a dedicated candidate
+VM: a typed console command authorizes a run-scoped key on the installer, whose
+live environment then evaluates and builds `infra/vm/flake.nix`. The candidate
+is warmed, cleaned, shut down and snapshotted. `validate` clones that snapshot
+with the configured strategy and checks each capability on the clone;
+`promote` accepts only a validated candidate and keeps the baseline it
+replaces. Every VM the controller creates is claimed in
+`build/vm/registry.json` before it exists, and no Parallels call changes a VM
+that is not claimed there.
+
+The unit tests under `scripts/vm/tests` need no Parallels. The acceptance tests
+that build, validate and compare real candidates run against the local config
+when opted in: `BUSYBEE_VM_LAB=1 python3 -m unittest test_real_template` in
+that directory.
 
 Long commands return a run handle with status, elapsed time, last-output time,
 and artifact locations. Agents can await completion and read output from a byte
