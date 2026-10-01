@@ -18,8 +18,8 @@ GATE_MARKER = "busybee-agent-review-gate:v2 "
 REQUIRED_CHECKS = ("ubuntu-latest", "macos-latest")
 
 
-def command(argv):
-    result = subprocess.run(argv, text=True, capture_output=True, timeout=60)
+def command(argv, stdin=None):
+    result = subprocess.run(argv, input=stdin, text=True, capture_output=True, timeout=60)
     if result.returncode:
         raise RuntimeError(result.stderr.strip() or f"Command failed: {argv[0]}")
     return result.stdout
@@ -32,11 +32,7 @@ def api(path, method="GET", data=None, pages=False):
     if data is None:
         raw = command(args)
     else:
-        result = subprocess.run(args + ["--input", "-"], input=json.dumps(data),
-                                text=True, capture_output=True, timeout=60)
-        if result.returncode:
-            raise RuntimeError(result.stderr.strip())
-        raw = result.stdout
+        raw = command(args + ["--input", "-"], json.dumps(data))
     result = json.loads(raw) if raw.strip() else None
     return [entry for page in result for entry in page] if pages else result
 
@@ -69,7 +65,8 @@ def policy_hash():
 def human_comments(comments, author=None):
     return [{"id": c["id"], "author": c["user"]["login"], "body": c.get("body")}
             for c in comments if c.get("user", {}).get("type") != "Bot"
-            and (author is None or c["user"]["login"] == author)]
+            and (c["user"]["login"] == author if author else
+                 c.get("author_association") in ("OWNER", "MEMBER", "COLLABORATOR"))]
 
 
 def input_id(packet):
@@ -180,11 +177,11 @@ def check_issue(repo, pr):
 
 def collect_packet(repo, number, issue=None):
     pr = read_pr(repo, number)
-    metadata = json.loads(command(["gh", "pr", "view", str(number), "--repo", repo,
-                                   "--json", "closingIssuesReferences"]))
-    refs = metadata["closingIssuesReferences"]
     if issue:
         refs = [{"url": f"https://github.com/{repo}/issues/{issue}"}]
+    else:
+        refs = json.loads(command(["gh", "pr", "view", str(number), "--repo", repo,
+                                   "--json", "closingIssuesReferences"]))["closingIssuesReferences"]
     issues = []
     for ref in refs:
         match = re.fullmatch(r"https://github.com/([^/]+/[^/]+)/issues/([0-9]+)", ref["url"])
@@ -227,6 +224,8 @@ def publish_decision(packet, record, checks):
         return
     event = "APPROVE" if verdict == "READY" else "REQUEST_CHANGES"
     header = {"head": head, "input_id": input_id(packet), "verdict": verdict}
+    evidence = {"reviews": record.get("reviews") if isinstance(record, dict) else None, "reasons": reasons}
+    header["evidence_id"] = hashlib.sha256(json.dumps(evidence, sort_keys=True).encode()).hexdigest()
     lines = [GATE_MARKER + json.dumps(header, sort_keys=True), "", f"**{verdict}** — Opus 5.5, high effort."]
     if isinstance(record, dict) and isinstance(record.get("reviews"), dict):
         for skill, result in record["reviews"].items():
@@ -235,14 +234,14 @@ def publish_decision(packet, record, checks):
                 if isinstance(result.get("findings"), list):
                     lines += [f"- {f}" for f in result["findings"]]
         if record.get("run_url"):
-            lines += ["", f"[CI review evidence]({record['run_url']}) (artifact retained for 90 days)."]
+            lines += ["", f"[CI review run]({record['run_url']})"]
     if reasons and (verdict == "WAITING" or record_errors(packet, record)):
         lines += ["", "Gate: " + "; ".join(reasons)]
     body = "\n".join(lines)
     if len(body.encode()) > 60000:
         raise ValueError("Review report is too large for GitHub; no verdict posted")
     desired = "APPROVED" if event == "APPROVE" else "CHANGES_REQUESTED"
-    if latest.get("state") == desired and latest.get("body") == body:
+    if latest.get("state") == desired and latest.get("body", "").splitlines()[0] == lines[0]:
         return
     live = read_pr(repo, number)
     if live["head"]["sha"] != head or live.get("draft") or live["state"] != "open":

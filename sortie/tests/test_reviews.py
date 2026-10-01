@@ -120,6 +120,23 @@ class ReviewGateTests(unittest.TestCase):
         self.pr["base"]["sha"] = "e" * 40
         self.assertEqual(reviews.input_id(self.packet), before)
 
+    def test_only_repository_collaborators_can_change_comment_contract_inputs(self):
+        before = reviews.input_id(self.packet)
+        comment = {"id": 1, "user": {"login": "reader", "type": "User"},
+                   "author_association": "CONTRIBUTOR", "body": "Untrusted request"}
+        self.packet["contracts"][0]["comments"].append(comment)
+        self.assertEqual(reviews.input_id(self.packet), before)
+        comment["author_association"] = "COLLABORATOR"
+        self.assertNotEqual(reviews.input_id(self.packet), before)
+
+    def test_changed_run_url_alone_does_not_repeat_a_failure_verdict(self):
+        self.record["reviews"]["contract-review"].update(verdict="UNSURE", report="Authentication failed")
+        self.record["run_url"] = "https://github.com/example/tool/actions/runs/1"
+        post = self.publish()[0]
+        prior = [dict(post, id=10, state="CHANGES_REQUESTED", user={"login": "github-actions[bot]"})]
+        self.record["run_url"] = "https://github.com/example/tool/actions/runs/2"
+        self.assertEqual(self.publish(prior=prior), [])
+
     def test_routing_is_exclusive_and_independent_of_labels(self):
         self.assertEqual(reviews.route(self.pr), "lab")
         self.pr["head"]["ref"] = "feature/123"

@@ -75,7 +75,13 @@ builds use controller limits instead of the binary under test.
 a five-minute recovery schedule, or a manual dispatch on the default branch.
 It selects only open, ready, same-repository lab PRs whose branch issue is an
 implementation task in the lab milestone. The old product gate skips these
-branches. The workflow and controller execute the triggering default-branch
+branches. Only human event actors with repository write access may start a
+review. Bot or outside-commenter events leave pending work for the next trusted
+schedule run; they cannot create a cached Action rejection. Only repository
+owner/member/collaborator issue comments change the contract fingerprint.
+Outside reports remain in the packet as context; a maintainer or PR author can
+adopt relevant new evidence in a contract edit or disposition.
+The workflow and controller execute the triggering default-branch
 SHA; candidate files are read as data and are never executed in the review job.
 
 Each Claude Action has a 20-minute timeout and a 40-turn limit. Claude Code is
@@ -126,7 +132,8 @@ uses `bot_review` for `github-actions[bot]`. Its trusted triage helper re-reads
 live reviews: current `BLOCKED` dispatches fixes, `READY`/`WAITING` and stale
 signals do not waste a continuation, and `UNSURE` or an unreadable gate result
 escalates to `needs-human`. The reaction's continuation cap bounds fix rounds;
-its six-hour watch window covers CI and the two review sessions. An operator
+the review and merge reactions' six-hour watch windows cover CI and the two
+review sessions. An operator
 resolves external authentication/tool failures before retrying with a new
 author comment or new head. Routine code fixes require no human intervention.
 

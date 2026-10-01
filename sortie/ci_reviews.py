@@ -90,7 +90,21 @@ def bundle(packet, results):
             "run_url": f"https://github.com/{packet['repo']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"}
 
 
+def trigger_allowed(repo):
+    # The Action rejects bot/non-write actors before model execution. Do not
+    # turn unrelated public comments into cached failures or escalation. The
+    # next trusted schedule run still reviews any eligible pending PR.
+    actor = os.environ["GITHUB_ACTOR"]
+    if api(f"users/{actor}")["type"] != "User":
+        return False
+    return api(f"repos/{repo}/collaborators/{actor}/permission")["permission"] in ("admin", "write")
+
+
 def select(args):
+    if not trigger_allowed(args.repo):
+        print("::notice::Actor is not eligible for Claude review; leaving work for a trusted trigger")
+        output("prs", "[]")
+        return
     if args.pr:
         candidates = [read_pr(args.repo, args.pr)]
     else:

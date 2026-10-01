@@ -16,6 +16,20 @@ spec.loader.exec_module(ci)
 
 
 class CIReviewTests(unittest.TestCase):
+    def test_rejected_event_actors_cannot_create_cached_failures(self):
+        for kind, permission, allowed in (("Bot", "write", False), ("User", "read", False),
+                                           ("User", "none", False), ("User", "write", True),
+                                           ("User", "admin", True), ("User", "maintain", False)):
+            with patch.dict(ci.os.environ, {"GITHUB_ACTOR": "event-actor"}), \
+                    patch.object(ci, "api", side_effect=[{"type": kind}, {"permission": permission}]):
+                self.assertEqual(ci.trigger_allowed("example/tool"), allowed)
+        with patch.object(ci, "trigger_allowed", return_value=False), \
+                patch.object(ci, "output") as output, patch.object(ci, "read_pr") as read:
+            from types import SimpleNamespace
+            ci.select(SimpleNamespace(repo="example/tool", pr=123))
+            output.assert_called_once_with("prs", "[]")
+            read.assert_not_called()
+
     def test_only_default_branch_runs_of_the_trusted_workflow_supply_cache(self):
         run = {"path": ci.WORKFLOW, "head_branch": "main", "event": "schedule"}
         self.assertTrue(ci.trusted_run(run, "main"))

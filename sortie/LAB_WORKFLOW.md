@@ -96,6 +96,7 @@ reactions:
     require_ci: true
     delete_branch: true
     poll_interval_ms: 60000
+    watch_window_ms: 21600000
     max_retries: 2
     escalation: label
     escalation_label: needs-human

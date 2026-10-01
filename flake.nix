@@ -84,7 +84,7 @@
             # A missing jq makes the hook exit 127, which Claude Code does not
             # treat as a deny.
             pkgs.jq
-            # Agent review packets, receipt validation, and harness tests.
+            # Agent review packets and harness tests.
             pkgs.python3
           ];
         };
