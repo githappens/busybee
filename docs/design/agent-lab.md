@@ -104,12 +104,51 @@ Template preparation follows this sequence:
 
 Use linked clones where the guest and installed Parallels version support them.
 If that capability is unavailable, report it and require an explicit full-clone
-configuration; do not silently change the storage or reset strategy.
+configuration; do not silently change the storage or reset strategy. macOS
+guests do not support them: Parallels accepts `prlctl clone --linked`, but its
+macOS engine attaches only the clone's empty overlay disk and the guest does not
+boot. A macOS template manifest never lists `linked` in `clone_modes`.
 
 Nix generations describe guest system configuration. Parallels snapshots
 provide the reset of mutable files and runtime state. Updating packages alone
 does not establish a clean test environment. Snapshot restoration targets an
 explicit baseline identity rather than whichever snapshot happens to be latest.
+
+### macOS workers: one leased guest
+
+Apple's licence and its Virtualization framework allow at most two running
+macOS guests per host; starting another fails, and Parallels reports the reason
+only in that VM's log. Operators also run macOS VMs of their own, so the lab
+owns a single macOS slot: one long-lived guest, prepared from the validated
+macOS baseline, leased to one run at a time. macOS workers are not cloned per run.
+
+- **Lease.** `worker create` for macOS waits for the slot and grants it
+  exclusively. Exclusion is a lock held by the controller process for the
+  lease, so a holder that exits for any reason, including being killed, frees
+  the slot. Waiters are served in arrival order and see their queue position.
+  The lease carries the usual run ID, ownership record, and deadline.
+- **Reset before every grant.** Each holder starts from the recorded baseline
+  snapshot: stop, restore that snapshot, boot, and wait until command access
+  and the Nix store are ready. A guest that may have been changed since its
+  last reset, including after a holder that never released, is reset before
+  the next grant. Resetting eagerly on release is an allowed optimisation.
+- **Started on demand.** The guest may be stopped while idle, by an operator or
+  after a host restart. Granting a lease starts it when it is not running.
+  Holders do not shut it down; releasing the lease is enough.
+- **Mostly batch.** Platform verification transfers an explicit revision, runs
+  the checks, and collects evidence as a job under the lease. Interactive
+  access to the guest is for macOS-specific investigation and terminal
+  inspection.
+- **Independent of busybee.** The lease, its queue, and its deadlines are
+  controller functions. Busybee is not installed in the baseline and does not
+  schedule the lab's own work.
+
+The guest has no Parallels guest tools; SSH is its control channel, and its
+address comes from Parallels' DHCP leases for the VM's MAC address. A guest
+cannot run a macOS release newer than the host. Every reset discards what the
+previous holder downloaded, so the macOS baseline is snapshotted after the
+dependency-warming step above. A reset then costs about the boot time, roughly
+half a minute on current hardware.
 
 ## Run an issue from reproduction to review
 
@@ -117,7 +156,8 @@ explicit baseline identity rather than whichever snapshot happens to be latest.
    and relevant broker specification. Record the base revision and the required
    platform checks. Reuse an existing issue branch and PR when continuing work.
 2. **Allocate a worker.** Validate the selected template, reserve the configured
-   CPU and memory budget, create a clone, and transfer the checkout. Start with
+   CPU and memory budget, create a clone (macOS: lease the single guest, see
+   §macOS workers), and transfer the checkout. Start with
    one active worker; concurrency is a controller setting bounded by a total
    resource budget. Assign a run ID and an overall deadline before execution.
 3. **Reproduce the failure.** Build the workspace from the recorded source.
@@ -164,13 +204,13 @@ CLI usable by different agent runners.
 |---|---|
 | `doctor` | Check host prerequisites, local configuration, template eligibility, and available resource budget without changing host configuration. |
 | `template build`, `validate`, `promote` | Provision a candidate, prove its capabilities, and register its baseline version. |
-| `worker create` | Clone an explicit baseline, allocate a run ID, and return the worker identity and deadline. |
+| `worker create` | Clone an explicit baseline, allocate a run ID, and return the worker identity and deadline. For macOS, wait for and lease the single guest instead of cloning (§macOS workers). |
 | `exec` | Run argv in the guest with a working directory, environment, deadline, separate stdout/stderr, and exit status. |
 | `terminal open`, `send`, `resize`, `capture` | Operate a real PTY; expose input, dimensions, screen cells, images, and a timestamped terminal recording. |
 | `inspect`, `signal` | Read process and daemon state and signal processes belonging to the worker. |
 | `console capture` | Capture the VM display through Parallels, including when command access is unavailable. |
 | `collect` | Export source changes and evidence, then acknowledge which artifacts were saved durably. |
-| `worker reset`, `destroy` | Collect first, then restore the recorded baseline or remove the owned clone. |
+| `worker reset`, `destroy` | Collect first, then restore the recorded baseline or remove the owned clone. For the leased macOS guest, `destroy` releases the lease; the guest itself is kept. |
 
 The shipped entry point is `python3 scripts/vm/vmctl.py [--json] <operation>`
 inside the project development shell, configured by ignored
