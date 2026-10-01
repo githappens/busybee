@@ -218,7 +218,7 @@ template and worker schemas and exit codes are documented in
 `doctor` and `template build`, `validate` and `promote` have shipped for the
 Linux template. `template build linux --arch aarch64` installs NixOS from the
 installer pinned in `infra/vm/linux/installer.json` into a dedicated candidate
-VM: a typed console command authorizes a run-scoped key on the installer, whose
+VM with a 16 GiB expanding disk: a typed console command authorizes a run-scoped key on the installer, whose
 live environment then evaluates and builds `infra/vm/flake.nix`. The candidate
 is warmed, cleaned, shut down and snapshotted. `validate` clones that snapshot
 with the configured strategy and checks each capability on the clone;

@@ -26,6 +26,9 @@ import registry
 HOST_DEVICES = ("sound0", "usb", "serial0")
 CAPABILITIES = ("host_isolation", "boot", "command_access", "file_roundtrip", "terminal_transport", "console_capture",
                 "task_state", "shutdown", "snapshot_reset")
+# The guest disk, expanding. A built worker uses about 7.5 GiB, most of it the
+# dev shell in the Nix store; this leaves room for release builds and tests.
+DISK_MIB = 16 * 1024
 INFRA = Path("infra/vm")
 GUEST_CHECKOUT = "/root/busybee"
 INSTALLER_BOOT_S = 300
@@ -273,7 +276,7 @@ class Lab:
             self.reg.claim(vm, "candidate", name, run_id, expires)
             workers = self.state / "workers"
             workers.mkdir(parents=True, exist_ok=True)
-            self.prl.create(vm, workers)
+            self.prl.create(vm, workers, DISK_MIB)
             info = self.prl.info(vm)
             self.reg.bind(vm, info["vm_id"])
             budget = self.config["budget"]
