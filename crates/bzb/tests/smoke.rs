@@ -5,6 +5,7 @@
 mod common;
 
 use std::{
+    os::unix::fs::PermissionsExt,
     path::Path,
     process::{Command, Output, Stdio},
     time::{Duration, Instant},
@@ -250,7 +251,7 @@ fn a_nested_busybee_passes_through_instead_of_deadlocking() {
         return;
     };
     let bin = env!("CARGO_BIN_EXE_busybee");
-    let out = busybee.run_timed(&["--", bin, "--", "true"], PATIENCE);
+    let out = busybee.run_timed(&["--", bin, "--", "true"]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(
         stdout(&out).contains("nested under lease"),
@@ -273,7 +274,7 @@ fn a_gated_shell_string_that_gates_again_completes() {
     };
     let bin = env!("CARGO_BIN_EXE_busybee");
     let inner = format!("{bin:?} -- true");
-    let out = busybee.run_timed(&["--", "sh", "-c", &inner], PATIENCE);
+    let out = busybee.run_timed(&["--", "sh", "-c", &inner]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(
         stdout(&out).contains("nested under lease"),
@@ -297,15 +298,9 @@ fn a_self_gating_script_runs_under_an_outer_wrapper() {
         format!("#!/bin/sh\nexec {bin:?} -- printf hello\n"),
     )
     .expect("write build.sh");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&script).expect("stat").permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).expect("chmod");
-    }
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
-    let out = busybee.run_timed(&["--", script.to_str().expect("utf-8 path")], PATIENCE);
+    let out = busybee.run_timed(&["--", script.to_str().expect("utf-8 path")]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(
         stdout(&out).contains("hello"),
@@ -328,7 +323,7 @@ fn a_nested_command_s_exit_code_is_the_outer_client_s() {
         return;
     };
     let bin = env!("CARGO_BIN_EXE_busybee");
-    let out = busybee.run_timed(&["--", bin, "--", "sh", "-c", "exit 42"], PATIENCE);
+    let out = busybee.run_timed(&["--", bin, "--", "sh", "-c", "exit 42"]);
     assert_eq!(out.status.code(), Some(42), "stderr: {}", stderr(&out));
 }
 
@@ -361,6 +356,48 @@ fn a_nested_command_does_not_take_a_second_lease() {
 
     let _ = outer.kill();
     let _ = outer.wait();
+}
+
+/// `docs/design/bzbd.md` §Failure and recovery, row "bzbd dies": the task
+/// keeps running under pueued and the next client restarts bzbd, which adopts
+/// the lease as `orphaned`. A nested call made after that must still find its
+/// parent, not take the dead socket for "no parent" and queue behind it.
+#[test]
+#[serial_test::serial]
+fn a_nested_busybee_under_an_orphaned_parent_passes_through() {
+    let Some(busybee) = Busybee::start() else {
+        return;
+    };
+    let bin = env!("CARGO_BIN_EXE_busybee");
+    let go = busybee.tmp.path().join("go");
+    let done = busybee.tmp.path().join("done");
+    // The outer client dies with the daemon, so the nested call reports
+    // through a file rather than through the outer client's stdout.
+    let script = format!("while [ ! -e {go:?} ]; do sleep 0.1; done; {bin:?} -- touch {done:?}");
+    let mut outer = busybee
+        .cmd(&["--", "sh", "-c", &script])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the outer client");
+    busybee.wait_for_a_running_task();
+
+    let pid = std::fs::read_to_string(busybee.state_dir().join("bzbd.pid"))
+        .expect("read the daemon's pid file");
+    let pid: i32 = pid.trim().parse().expect("a pid");
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let _ = outer.wait();
+    std::fs::write(&go, "").expect("release the task");
+
+    let deadline = Instant::now() + PATIENCE;
+    while !done.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the nested call never ran; bzbd holds {:?}",
+            busybee.status().map(|s| s.leases)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Exporting a lease id that is not live must not disable gating: that
@@ -399,15 +436,12 @@ fn a_nested_detach_still_queues_its_own_lease() {
         return;
     };
     let bin = env!("CARGO_BIN_EXE_busybee");
-    let out = busybee.run_timed(
-        &[
-            "--",
-            "sh",
-            "-c",
-            &format!("{bin:?} --detach -- true; printf after"),
-        ],
-        PATIENCE,
-    );
+    let out = busybee.run_timed(&[
+        "--",
+        "sh",
+        "-c",
+        &format!("{bin:?} --detach -- true; printf after"),
+    ]);
     assert!(out.status.success(), "stderr: {}", stderr(&out));
     assert!(
         stdout(&out).contains("after"),
