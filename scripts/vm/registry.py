@@ -34,9 +34,6 @@ class Registry:
     def get(self, name):
         return self._load()["vms"].get(name)
 
-    def all(self):
-        return self._load()["vms"]
-
     def owns(self, name):
         return name in self._load()["vms"]
 

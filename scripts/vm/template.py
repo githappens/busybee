@@ -115,11 +115,8 @@ def promote(state, name, run_id):
 
 
 def _sha256(path):
-    digest = hashlib.sha256()
     with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
+        return hashlib.file_digest(f, "sha256").hexdigest()
 
 
 class Lab:
@@ -165,7 +162,16 @@ class Lab:
         notes = []
         if self.reg.get(vm) is None:
             return notes
-        if self.reg.get(vm)["vm_id"]:
+        if not self.reg.get(vm)["vm_id"]:
+            # Claimed, but the run failed before recording the VM's identity:
+            # it may or may not exist. Delete by the claimed name; only an
+            # answered delete releases the claim.
+            try:
+                self.prl.delete(vm)
+            except parallels.ParallelsError as err:
+                notes.append(f"{vm} may exist without a recorded identity; its claim stays: {err}")
+                return notes
+        else:
             try:
                 # Parallels can only capture a running display.
                 running = self.prl.info(vm)["state"] != "stopped"
@@ -232,10 +238,10 @@ class Lab:
             workers = self.state / "workers"
             workers.mkdir(parents=True, exist_ok=True)
             self.prl.create(vm, workers)
-            budget = self.config["budget"]
-            self.prl.configure(vm, budget["cpus"], budget["memory_mib"], iso)
             info = self.prl.info(vm)
             self.reg.bind(vm, info["vm_id"])
+            budget = self.config["budget"]
+            self.prl.configure(vm, budget["cpus"], budget["memory_mib"], iso)
             self.prl.start(vm)
 
             ip = guest.wait_for_lease(info["mac"], self._until(INSTALLER_BOOT_S))
@@ -338,6 +344,7 @@ class Lab:
         vdir.mkdir(parents=True)
         expires = self._start()
         checks = {}
+        timed_out = False
         try:
             self.reg.claim(vm, "validation", name, val_id, expires)
             self.prl.clone(record["vm"], vm, manifest["snapshot_id"], self.state / "workers", strategy == "linked")
@@ -345,6 +352,7 @@ class Lab:
             self.reg.bind(vm, info["vm_id"])
             self._run_checks(vm, info, cdir, vdir, checks)
         except Exception as err:  # recorded against the check that was running
+            timed_out = isinstance(err, DeadlineExceeded)
             pending = next(c for c in CAPABILITIES if checks.get(c, {}).get("status") != "pass")
             checks.setdefault(pending, {"status": "fail", "reason": str(err)})
         finally:
@@ -362,7 +370,8 @@ class Lab:
             manifest.update(clone_modes=[strategy], validated_at=_now().strftime(contracts.TIMESTAMP))
         _write_json(cdir / "candidate.json", record)
         if reasons:
-            return contracts.result("template validate", "environment_failure", f"candidate {run_id} is not eligible",
+            status = "timeout" if timed_out else "environment_failure"
+            return contracts.result("template validate", status, f"candidate {run_id} is not eligible",
                                     [contracts.finding("capability_failed", r) for r in reasons], report)
         return contracts.result("template validate", "success", f"candidate {run_id} is eligible", data=report)
 
@@ -387,7 +396,7 @@ class Lab:
 
         payload = secrets.token_bytes(1 << 20)
         g.run("cat > /root/roundtrip", self._bound("command"), stdin=payload)
-        back = g.fetch("cat /root/roundtrip && rm /root/roundtrip", self._bound("command"))
+        back = g.run("cat /root/roundtrip && rm /root/roundtrip", self._bound("command"), raw=True)[1]
         if back != payload:
             raise RuntimeError("file round-trip returned different bytes")
         passed("file_roundtrip", bytes=len(payload))

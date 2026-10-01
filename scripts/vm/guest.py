@@ -61,27 +61,19 @@ class Guest:
                 "-o", f"ConnectTimeout={SSH_CONNECT_S}", "-o", "ServerAliveInterval=15", *extra,
                 f"root@{self.ip}"]
 
-    def run(self, command, timeout, stdin=None, tty=False, check=True):
-        """Run a shell command in the guest; returns (exit status, stdout, stderr)."""
+    def run(self, command, timeout, stdin=None, tty=False, check=True, raw=False):
+        """Run a shell command in the guest; returns (exit status, stdout, stderr).
+        `raw` keeps stdout as bytes, for content that must round-trip exactly."""
         argv = self._ssh(["-tt"] if tty else []) + [command]
         try:
             done = subprocess.run(argv, input=stdin, capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired as err:
             raise GuestError(f"`{command}` exceeded its {timeout}s deadline") from err
-        out, err = done.stdout.decode(errors="replace"), done.stderr.decode(errors="replace")
+        out = done.stdout if raw else done.stdout.decode(errors="replace")
+        err = done.stderr.decode(errors="replace")
         if check and done.returncode != 0:
-            raise GuestError(f"`{command}` exited {done.returncode}: {(err or out).strip()[-500:]}")
+            raise GuestError(f"`{command}` exited {done.returncode}: {err.strip()[-500:]}")
         return done.returncode, out, err
-
-    def fetch(self, command, timeout):
-        """stdout of a guest command as bytes, for content that must round-trip exactly."""
-        try:
-            done = subprocess.run(self._ssh() + [command], capture_output=True, timeout=timeout)
-        except subprocess.TimeoutExpired as err:
-            raise GuestError(f"`{command}` exceeded its {timeout}s deadline") from err
-        if done.returncode != 0:
-            raise GuestError(f"`{command}` exited {done.returncode}")
-        return done.stdout
 
     def wait(self, deadline):
         """Until the guest accepts a command, or the deadline passes."""

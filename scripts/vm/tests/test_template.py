@@ -35,7 +35,7 @@ class OwnershipTests(unittest.TestCase):
         self.prl = parallels.Parallels("prlctl", "prlsrvctl", self.runner, owned=registry.Registry(self.state))
 
     def test_mutations_refuse_a_vm_the_controller_does_not_own(self):
-        for call in (lambda: self.prl.start("adobe-workstation"), lambda: self.prl.delete("busybee-lab-x"),
+        for call in (lambda: self.prl.start("unrelated-vm"), lambda: self.prl.delete("busybee-lab-x"),
                      lambda: self.prl.stop("someone-else", kill=True),
                      lambda: self.prl.create("busybee-lab-unclaimed", self.state)):
             with self.assertRaises(parallels.ParallelsError):
@@ -45,7 +45,7 @@ class OwnershipTests(unittest.TestCase):
     def test_a_claim_must_carry_the_lab_prefix(self):
         reg = registry.Registry(self.state)
         with self.assertRaises(ValueError):
-            reg.claim("adobe-workstation", "candidate", "linux", contracts.new_run_id(), "2026-10-01T00:00:00Z")
+            reg.claim("unrelated-vm", "candidate", "linux", contracts.new_run_id(), "2026-10-01T00:00:00Z")
 
     def test_claimed_vms_can_be_operated(self):
         reg = registry.Registry(self.state)
@@ -72,6 +72,48 @@ class OwnershipTests(unittest.TestCase):
             again.claim("busybee-lab-a", "candidate", "linux", run_id, "2026-10-01T00:00:00Z")
         again.release("busybee-lab-a")
         self.assertIsNone(registry.Registry(self.state).get("busybee-lab-a"))
+
+
+class FailingPrl:
+    """Records VM-changing calls; `delete` fails when told to."""
+
+    def __init__(self, delete_fails=False):
+        self.calls, self.delete_fails = [], delete_fails
+
+    def delete(self, name):
+        self.calls.append(("delete", name))
+        if self.delete_fails:
+            raise parallels.ParallelsError("prlctl delete exited 255")
+
+    def info(self, name):
+        return {"state": "stopped"}
+
+
+class CleanupTests(unittest.TestCase):
+    """A run can fail after Parallels created a VM but before its identity was
+    recorded; the claim must not be dropped while that VM may still exist."""
+
+    def setUp(self):
+        self.state = State(self).root
+        self.reg = registry.Registry(self.state)
+        self.reg.claim("busybee-lab-tpl-linux-x", "candidate", "linux", contracts.new_run_id(),
+                       "2026-10-01T00:00:00Z")
+
+    def lab(self, prl):
+        config = {"state_dir": "build/vm", "deadlines": {"command": 60, "scenario": 60, "run": 60, "cleanup": 60}}
+        return template.Lab(self.state, config, prl, self.reg)
+
+    def test_an_unbound_vm_is_deleted_before_its_claim_is_released(self):
+        prl = FailingPrl()
+        self.assertEqual(self.lab(prl)._dispose("busybee-lab-tpl-linux-x", self.state / "console.png"), [])
+        self.assertEqual(prl.calls, [("delete", "busybee-lab-tpl-linux-x")])
+        self.assertIsNone(self.reg.get("busybee-lab-tpl-linux-x"))
+
+    def test_an_unanswered_delete_keeps_the_claim(self):
+        notes = self.lab(FailingPrl(delete_fails=True))._dispose("busybee-lab-tpl-linux-x",
+                                                                 self.state / "console.png")
+        self.assertTrue(notes)
+        self.assertIsNotNone(self.reg.get("busybee-lab-tpl-linux-x"))
 
 
 class ConsoleTests(unittest.TestCase):

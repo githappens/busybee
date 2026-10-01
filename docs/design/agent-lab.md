@@ -5,8 +5,9 @@ disposable Parallels VMs. An agent must be able to reproduce an issue, change
 the code, inspect the running terminal UI, and verify the fix on Linux and
 macOS without asking a person to operate its development environment.
 
-**Status: design for implementation.** Only the read-only `doctor` preflight
-(`scripts/vm/vmctl.py`) has shipped; every other operation returns `unsupported`.
+**Status: design for implementation.** `doctor` and the Linux `template`
+operations (`scripts/vm/vmctl.py`) have shipped; every other operation returns
+`unsupported`.
 Until the rest lands, [CLAUDE.md](../../CLAUDE.md) and the
 [Sortie workflow](../../sortie/README.md) remain the operational instructions.
 
