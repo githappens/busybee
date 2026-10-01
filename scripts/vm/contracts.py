@@ -10,7 +10,7 @@ import re
 import secrets
 
 CONFIG_SCHEMA = 1
-TEMPLATE_SCHEMA = "busybee.vm.template/v1"
+TEMPLATE_SCHEMA = "busybee.vm.template/v2"
 WORKER_SCHEMA = "busybee.vm.worker/v1"
 RESULT_SCHEMA = "busybee.vm.result/v1"
 
@@ -111,8 +111,8 @@ def config_errors(config, repo):
 
 def manifest_errors(manifest):
     """Problems with a template manifest recorded by template validation."""
-    fields = {"schema", "name", "os", "arch", "vm_id", "snapshot_id", "provisioning_revision", "lock_hashes",
-              "tools", "parallels_version", "clone_modes", "validated_at"}
+    fields = {"schema", "name", "candidate", "os", "arch", "vm_id", "snapshot_id", "provisioning_revision",
+              "lock_hashes", "tools", "parallels_version", "clone_modes", "validated_at"}
     if not isinstance(manifest, dict):
         return ["manifest must be an object"]
     errors = [f"unknown field {k!r}" for k in sorted(set(manifest) - fields)]
@@ -126,6 +126,8 @@ def manifest_errors(manifest):
     for key in ("vm_id", "snapshot_id"):
         if not isinstance(manifest[key], str) or not UUID.match(manifest[key]):
             errors.append(f"{key} must be a Parallels UUID")
+    if not valid_run_id(manifest["candidate"]):
+        errors.append("candidate must be the run id of the build that produced it")
     modes = manifest["clone_modes"]
     if not isinstance(modes, list) or not modes or not set(modes) <= set(CLONE_STRATEGIES):
         errors.append(f"clone_modes must be a non-empty subset of {', '.join(CLONE_STRATEGIES)}")

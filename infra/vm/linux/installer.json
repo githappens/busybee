@@ -1,0 +1,6 @@
+{
+  "url": "https://releases.nixos.org/nixos/26.05/nixos-26.05.10927.78e9c786dc08/nixos-minimal-26.05.10927.78e9c786dc08-aarch64-linux.iso",
+  "sha256": "2771031e4e7be471fcee7d945441c911acc90fbff0b4de47f990bd1b1e093aac",
+  "arch": "aarch64",
+  "configuration": "linux-aarch64"
+}
