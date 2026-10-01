@@ -57,6 +57,8 @@ jobs:
     if: needs.select.outputs.prs != '[]'
     runs-on: ubuntu-latest
     timeout-minutes: 50
+    env:
+      NODE_VERSION: '24'
     permissions:
       contents: read
       pull-requests: read
@@ -94,10 +96,9 @@ jobs:
         if: steps.prepare.outputs.needed == 'true'
         continue-on-error: true
         timeout-minutes: 20
-        uses: anthropics/claude-code-action@12dd8d74c712f5f3669365b2369b558c495b1104 # v1
+        uses: anthropics/claude-code-action/base-action@12dd8d74c712f5f3669365b2369b558c495b1104 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ github.token }}
           path_to_claude_code_executable: ${{ runner.temp }}/claude-review/node_modules/.bin/claude
           claude_args: ${{ steps.prepare.outputs.claude_args }}
           prompt: |
@@ -116,10 +117,9 @@ jobs:
         if: ${{ !cancelled() && steps.prepare.outputs.needed == 'true' }}
         continue-on-error: true
         timeout-minutes: 20
-        uses: anthropics/claude-code-action@12dd8d74c712f5f3669365b2369b558c495b1104 # v1
+        uses: anthropics/claude-code-action/base-action@12dd8d74c712f5f3669365b2369b558c495b1104 # v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          github_token: ${{ github.token }}
           path_to_claude_code_executable: ${{ runner.temp }}/claude-review/node_modules/.bin/claude
           claude_args: ${{ steps.prepare.outputs.claude_args }}
           prompt: |
@@ -137,10 +137,10 @@ jobs:
         if: ${{ !cancelled() && steps.prepare.outputs.needed == 'true' }}
         env:
           PR: ${{ matrix.pr }}
-          CONTRACT_OUTCOME: ${{ steps.contract.outcome }}
+          CONTRACT_OUTCOME: ${{ steps.contract.outputs.conclusion == 'success' && steps.contract.outcome || 'failure' }}
           CONTRACT_RESULT: ${{ steps.contract.outputs.structured_output }}
           CONTRACT_SESSION: ${{ steps.contract.outputs.session_id }}
-          PONYTAIL_OUTCOME: ${{ steps.ponytail.outcome }}
+          PONYTAIL_OUTCOME: ${{ steps.ponytail.outputs.conclusion == 'success' && steps.ponytail.outcome || 'failure' }}
           PONYTAIL_RESULT: ${{ steps.ponytail.outputs.structured_output }}
           PONYTAIL_SESSION: ${{ steps.ponytail.outputs.session_id }}
         run: python3 sortie/ci_reviews.py collect --pr "$PR"

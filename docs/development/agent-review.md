@@ -89,7 +89,10 @@ adopt relevant new evidence in a contract edit or disposition.
 The workflow and controller execute the triggering default-branch
 SHA; candidate files are read as data and are never executed in the review job.
 
-Each Claude Action has a 20-minute timeout and a 40-turn limit. Claude Code is
+The official Claude Code `base-action` handles model execution, without the
+top-level action's event-specific GitHub automation. Our controller selects
+eligible actors/PRs and the separate publisher owns GitHub writes. Each Claude
+Action has a 20-minute timeout and a 40-turn limit. Claude Code is
 pinned to 2.1.280 with explicit model and effort flags. Restricted mode,
 read/search-only tools, and disabled candidate settings/skills prevent the
 review session from running candidate hooks, tests, or shell commands. Normal
@@ -146,8 +149,9 @@ author comment or new head. Routine code fixes require no human intervention.
 
 Configure repository secret `CLAUDE_CODE_OAUTH_TOKEN` using `claude setup-token`
 from an eligible Claude subscription. Reviews consume that subscription's
-allowance. The Action receives the workflow's `github.token`, so this setup
-does not require installing the Claude GitHub App. Repository Actions settings
+allowance. Only the controller and publisher receive the workflow's GitHub
+token; the model Action needs only the Claude token. This setup does not
+require installing the Claude GitHub App. Repository Actions settings
 must permit GitHub Actions to create/approve PR reviews. Keep the existing
 required approval and stale-review dismissal rules.
 

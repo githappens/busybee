@@ -91,9 +91,9 @@ def bundle(packet, results):
 
 
 def trigger_allowed(repo):
-    # The Action rejects bot/non-write actors before model execution. Do not
-    # turn unrelated public comments into cached failures or escalation. The
-    # next trusted schedule run still reviews any eligible pending PR.
+    # Public comments and bot events must not spend subscription allowance or
+    # create failure evidence. The next trusted schedule run still reviews any
+    # eligible pending PR. The base Action handles only model execution.
     actor = os.environ["GITHUB_ACTOR"]
     if api(f"users/{actor}")["type"] != "User":
         return False
