@@ -1,9 +1,81 @@
 # Running sortie against this repository
 
 [sortie](https://docs.sortie-ai.com) turns labelled GitHub issues into autonomous
-Claude Code sessions. `WORKFLOW.md` is the configuration; `run.sh` launches it;
-`agent.sh` is the per-issue agent launcher. One sortie process serves one
-workflow, so this directory is specific to this repository.
+agent sessions. The lab profile uses `LAB_WORKFLOW.md` and `run-lab.sh`; the
+legacy product profile uses `WORKFLOW.md`, `run.sh`, and `agent.sh`. Each process
+owns one workflow and separate state.
+
+The planned move to disposable Parallels workers is described in
+[`docs/design/agent-lab.md`](../docs/design/agent-lab.md). That design separates
+VM lifecycle and verification from issue dispatch and review. The review and
+dispatch bootstrap below is implemented; the VM controller is not yet present.
+
+## Lab milestone and portable reviews
+
+Read [the review contract](../docs/development/agent-review.md). The loop is:
+implementation → draft PR → contract-review and ponytail-review in separate
+contexts → scoped fixes, tests, push → both reports on the final head → CI →
+gate approval → Sortie automerge. Neither an external review bot nor a model
+that rejudges review wording is required for lab PRs.
+
+The repository's optional Nix shell pins Sortie 1.24.1 and validation tools:
+
+```sh
+sortie/run-lab.sh --agent claude --validate
+sortie/run-lab.sh --agent codex --validate
+sortie/run-lab.sh --agent cursor --validate
+sortie/run-lab.sh --agent codex --dry-run
+```
+
+`--validate` checks configuration without authentication or dispatch.
+`--dry-run` reads GitHub eligibility without modifying labels or starting
+agents. It does not prove authenticated tool execution. Codex is the default
+for host bootstrap. Sortie 1.24 requires Claude's `bypassPermissions` mode, so
+that profile is limited to an allocated worker (`BUSYBEE_SORTIE_WORKER=1`, set
+inside the guest by its launcher). The current VM integration is still planned;
+the review skills remain usable from any runner's normal authorized session.
+Cursor uses `agent
+acp`; qualify its session, authorized tool use, cancellation, and permissions
+in the disposable environment before dispatch. ACP permission prompts are
+refused by Sortie. If required, supply an already-qualified command through
+`BUSYBEE_CURSOR_COMMAND`; do not silently bypass host protections.
+
+After the bootstrap is merged, authenticate the selected CLI and `gh`, mark
+the intended implementation issues `sortie:ready`, and launch:
+
+```sh
+sortie/run-lab.sh --agent codex
+```
+
+The lab milestone is `agent lab: autonomous VM development`. Its tracker is
+never dispatched. `lab.py release` adds the `sortie` marker only after every
+blocker has a merged closing PR on main; closing a blocker as not planned does
+not qualify. `prepare-lab.sh` checks this again immediately before work.
+The default concurrency is one. Work remains opt-in through `sortie:ready`.
+
+The launcher snapshots `origin/main` into ignored
+`build/sortie-lab/trusted/<commit>/` and executes that copy outside issue
+workspaces. `BUSYBEE_SORTIE_TRUSTED_REF` can name an explicitly selected trusted
+commit; branch edits cannot change the supervising copy. State, locks, and
+workspaces live under `build/sortie-lab/`. The default dashboard port is 7679;
+`BUSYBEE_SORTIE_PORT` and `BUSYBEE_SORTIE_CLONE_URL` are local overrides.
+There is no host Nix activation, global install, or private configuration import.
+
+Lab branches use `sortie-lab/<issue>`. A shared routing predicate keeps the two
+GitHub gates disjoint. The new gate runs only default-branch policy, reads PR
+data without executing candidate code, and approves matching reports only once
+both CI platform jobs pass. Existing approval requirements remain in force.
+The first bootstrap PR must land through the currently active review policy;
+the candidate cannot activate its own approval gate.
+
+Run the harness checks with `nix develop -c python3 -m unittest discover -s
+sortie/tests`, plus the three existing shell test scripts. CI runs them on both
+platforms. `nix develop .#agent -c actionlint` validates workflow syntax.
+
+## Legacy product profile
+
+The remaining instructions describe the existing broker milestone. They do not
+select lab issues or supply the lab's review gate.
 
 ## Preflight (verify every time after a break)
 

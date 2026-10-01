@@ -108,6 +108,12 @@ jobs:
           fi
           picked=()
           for PR in $prs; do
+            # Lab branches have one separate skill-report gate. Never let this
+            # legacy wording judge reinterpret that gate's bot approval.
+            if [ "$(python3 sortie/reviews.py route --repo "$REPO" --pr "$PR")" = lab ]; then
+              echo "PR #$PR: handled by agent-review-gate"
+              continue
+            fi
             # A harness PR is never eligible for an automated verdict. Check both
             # names so renaming a protected file is covered as well as editing,
             # adding or deleting one.

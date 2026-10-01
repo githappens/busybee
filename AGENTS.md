@@ -4,6 +4,22 @@ Build, test and layout conventions live in `CLAUDE.md`. The design specification
 for the broker work is `docs/design/bzbd.md`; task issues carry scope and
 acceptance criteria, the specification carries semantics.
 
+## Agent review workflow
+
+Repository skills live in `skills/contract-review/SKILL.md` and
+`skills/ponytail-review/SKILL.md`. Use these exact files for PR review, regardless
+of the agent runner or identically named personal skills. The implementing
+agent runs both reviews in distinct fresh contexts, fixes valid scoped
+findings, tests and pushes, and obtains reports for the final PR head.
+Reviewers remain read-only; the implementing agent owns fixes and publication.
+The completion record and Sortie handoff are defined in
+[`docs/development/agent-review.md`](docs/development/agent-review.md).
+
+For VM infrastructure, also read `docs/design/agent-lab.md`. Infrastructure
+issues may change the controller and runner files explicitly in their scope;
+an ordinary product task must not change dispatch or merge policy. The running
+controller and gate use a trusted revision outside the candidate branch.
+
 ## Code Review Rules
 
 ### Conform to the specification

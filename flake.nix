@@ -84,6 +84,19 @@
             # A missing jq makes the hook exit 127, which Claude Code does not
             # treat as a deny.
             pkgs.jq
+            # Agent review packets, receipt validation, and harness tests.
+            pkgs.python3
+          ];
+        };
+
+        # Optional orchestrator tools; no host profile or service activation.
+        devShells.agent = pkgs.mkShell {
+          inputsFrom = [ self.devShells.${system}.default ];
+          packages = [
+            (import ./sortie/runtime.nix { inherit pkgs; })
+            pkgs.gh
+            pkgs.actionlint
+            (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
           ];
         };
       });
