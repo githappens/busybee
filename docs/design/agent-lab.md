@@ -135,10 +135,6 @@ macOS baseline, leased to one run at a time. macOS workers are not cloned per ru
 - **Started on demand.** The guest may be stopped while idle, by an operator or
   after a host restart. Granting a lease starts it when it is not running.
   Holders do not shut it down; releasing the lease is enough.
-- **Mostly batch.** Platform verification transfers an explicit revision, runs
-  the checks, and collects evidence as a job under the lease. Interactive
-  access to the guest is for macOS-specific investigation and terminal
-  inspection.
 - **Independent of busybee.** The lease, its queue, and its deadlines are
   controller functions. Busybee is not installed in the baseline and does not
   schedule the lab's own work.
@@ -147,8 +143,7 @@ The guest has no Parallels guest tools; SSH is its control channel, and its
 address comes from Parallels' DHCP leases for the VM's MAC address. A guest
 cannot run a macOS release newer than the host. Every reset discards what the
 previous holder downloaded, so the macOS baseline is snapshotted after the
-dependency-warming step above. A reset then costs about the boot time, roughly
-half a minute on current hardware.
+dependency-warming step above. A reset then costs about the boot time.
 
 ## Run an issue from reproduction to review
 
