@@ -37,7 +37,7 @@ class OwnershipTests(unittest.TestCase):
     def test_mutations_refuse_a_vm_the_controller_does_not_own(self):
         for call in (lambda: self.prl.start("unrelated-vm"), lambda: self.prl.delete("busybee-lab-x"),
                      lambda: self.prl.stop("someone-else", kill=True),
-                     lambda: self.prl.create("busybee-lab-unclaimed", self.state)):
+                     lambda: self.prl.create("busybee-lab-unclaimed", self.state, template.DISK_MIB)):
             with self.assertRaises(parallels.ParallelsError):
                 call()
         self.assertEqual(self.runner.calls, [])
@@ -50,9 +50,9 @@ class OwnershipTests(unittest.TestCase):
     def test_claimed_vms_can_be_operated(self):
         reg = registry.Registry(self.state)
         reg.claim("busybee-lab-tpl-linux-x", "candidate", "linux", contracts.new_run_id(), "2026-10-01T00:00:00Z")
-        self.prl.create("busybee-lab-tpl-linux-x", self.state)
+        self.prl.create("busybee-lab-tpl-linux-x", self.state, template.DISK_MIB)
         self.prl.start("busybee-lab-tpl-linux-x")
-        self.assertEqual([c[0][1] for c in self.runner.calls], ["create", "start"])
+        self.assertEqual([c[0][1] for c in self.runner.calls], ["create", "set", "start"])
 
     def test_an_installed_candidate_loses_its_host_devices(self):
         reg = registry.Registry(self.state)
@@ -61,6 +61,14 @@ class OwnershipTests(unittest.TestCase):
         self.prl.boot_from_disk("busybee-lab-tpl-linux-x")
         removed = [argv[argv.index("--device-del") + 1] for argv, _ in self.runner.calls if "--device-del" in argv]
         self.assertEqual(sorted(removed), sorted(template.HOST_DEVICES))
+
+    def test_a_candidate_gets_an_explicitly_sized_disk(self):
+        reg = registry.Registry(self.state)
+        reg.claim("busybee-lab-tpl-linux-x", "candidate", "linux", contracts.new_run_id(), "2026-10-01T00:00:00Z")
+        self.prl.create("busybee-lab-tpl-linux-x", self.state, template.DISK_MIB)
+        create, add = (argv for argv, _ in self.runner.calls)
+        self.assertIn("--no-hdd", create)
+        self.assertEqual(add[add.index("--device-add") + 1:], ["hdd", "--type", "expand", "--size", "16384"])
 
     def test_the_registry_survives_a_new_controller(self):
         run_id = contracts.new_run_id()

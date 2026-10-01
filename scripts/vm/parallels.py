@@ -95,8 +95,10 @@ class Parallels:
             raise ParallelsError(f"refusing to operate on {name!r}: the controller does not own it")
         return self.runner([self.tools["prlctl"], args[0], name, *args[1:]], timeout=timeout, stdin=stdin)
 
-    def create(self, name, dst):
-        self._owned(name, ["create", "--distribution", "linux", "--dst", str(dst)])
+    def create(self, name, dst, disk_mib):
+        # The default Linux disk is 64 GiB; the template sizes its own.
+        self._owned(name, ["create", "--distribution", "linux", "--no-hdd", "--dst", str(dst)])
+        self._owned(name, ["set", "--device-add", "hdd", "--type", "expand", "--size", str(disk_mib)])
 
     def configure(self, name, cpus, memory_mib, iso):
         self.allocate(name, cpus, memory_mib)
