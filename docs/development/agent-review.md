@@ -92,7 +92,7 @@ SHA; candidate files are read as data and are never executed in the review job.
 The official Claude Code `base-action` handles model execution, without the
 top-level action's event-specific GitHub automation. Our controller selects
 eligible actors/PRs and the separate publisher owns GitHub writes. Each Claude
-Action has a 20-minute timeout and a 40-turn limit. Claude Code is
+Action has a 20-minute timeout and a 100-turn limit. Claude Code is
 pinned to 2.1.280 with explicit model and effort flags. Restricted mode,
 read/search-only tools, and disabled candidate settings/skills prevent the
 review session from running candidate hooks, tests, or shell commands. Normal
