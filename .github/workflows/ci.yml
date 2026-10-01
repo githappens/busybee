@@ -105,6 +105,12 @@ jobs:
 
       - run: cargo fmt --all --check
 
+      - name: Check agent harness
+        run: |
+          python3 -m unittest discover -s sortie/tests
+          bash sortie/test-machine-safety-hook.sh
+          bash sortie/test-harness-docs.sh
+
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
       - run: cargo test --workspace

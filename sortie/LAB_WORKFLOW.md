@@ -1,11 +1,11 @@
 ---
-# Launch with run.sh. It selects a native adapter, pins the executing
+# Launch with run-lab.sh. It selects a native adapter, pins the executing
 # scripts outside issue workspaces, and uses the repo-owned agent dev shell.
 tracker:
   kind: github
   project: githappens/busybee
   api_key: $GITHUB_TOKEN
-  query_filter: 'label:sortie milestone:"bzbd: shared CPU token pool"'
+  query_filter: 'label:sortie milestone:"agent lab: autonomous VM development"'
   active_states: [sortie:ready, sortie:working]
   in_progress_state: sortie:working
   handoff_state: sortie:review
@@ -13,7 +13,7 @@ tracker:
   handoff_evidence: strict
 
 workspace:
-  root: $BUSYBEE_SORTIE_STATE/sortie-workspaces
+  root: $BUSYBEE_SORTIE_STATE/workspaces
 db_path: $BUSYBEE_SORTIE_STATE/sortie.db
 
 polling:
@@ -31,7 +31,7 @@ agent:
   # overrides. These fields do not expand arbitrary environment variables.
   kind: codex
   command: codex app-server
-  max_concurrent_agents: 4
+  max_concurrent_agents: 1
   max_turns: 20
   max_sessions: 20
   turn_timeout_ms: 7200000
@@ -109,58 +109,30 @@ reactions:
     escalation_label: needs-human
 ---
 
-You are working on **busybee**, a Rust CLI + daemon that gates resource-heavy
-commands across parallel developer sessions. You receive one GitHub issue and
-deliver one pull request for it.
+Implement one busybee issue and deliver its PR through the repository's review
+and verification loop. You may be running in any supported agent runtime.
 
-## Task
-
-**#{{ .issue.identifier }}: {{ .issue.title }}**
-{{ if .issue.description }}
-
+Issue #{{ .issue.identifier }}: {{ .issue.title }}
 {{ .issue.description }}
-{{ end }}
-{{ if .issue.blocked_by }}
+Issue URL: {{ .issue.url }}
 
-Blocked-by issues (all must already be merged on `main`): {{ range $i, $b := .issue.blocked_by }}{{ if $i }}, {{ end }}#{{ $b.display_id }}{{ end }}. Read their merged code before starting; build on it, do not duplicate it.
-{{ end }}
+Read `AGENTS.md`, `CLAUDE.md`, the issue's specification sections, and the
+trusted `docs/development/agent-review.md` under `$BUSYBEE_SORTIE_TRUSTED`.
+The executing policy is outside this workspace. Edits to a candidate policy
+are reviewed code; they do not replace the policy supervising this task.
 
-## Ground rules
+Use the existing `sortie-lab/{{ .issue.identifier }}` branch and its PR across
+attempts. Do not reset it to main or create a duplicate PR. Read the merged
+prerequisite code. Respect the issue's scope and named tests. Infrastructure
+issues may change only the controller/runner files their scope requires;
+product fixes may not change orchestration or approval policy.
 
-1. **Read first.** `CLAUDE.md` (build/test/layout) and `docs/design/bzbd.md` (the specification; `AGENTS.md` §Conform to the specification). If the spec and the task conflict, the task wins for scope and the spec wins for semantics; say so in the PR body.
-2. **Scope.** The issue's Scope and Acceptance criteria are the whole scope (`AGENTS.md` §Stay within the issue's scope). If something outside that blocks you, or the criteria cannot be made to pass and remaining moves are low-confidence, write `blocked` to `.sortie/status` with one line of reasoning and stop; that is a successful escalation, not a failed attempt.
-3. **Review skills.** The repository skills and CI handoff are defined in `docs/development/agent-review.md`; use the trusted copy under `$BUSYBEE_SORTIE_TRUSTED`. Local reviews are optional early feedback. CI runs both independent skill reviews.
-4. **TDD.** Failing test first; never weaken, skip, or delete an existing test to get green (`CLAUDE.md` §Conventions).
-5. **No silent fallbacks.** Errors propagate with context; degraded paths stay loud (`CLAUDE.md` §Conventions, `AGENTS.md` §No silent fallbacks).
-6. **Build and test.** Commands live in `CLAUDE.md` §Build and test; cargo test/clippy/fmt are allowed as-is.
-   Wrap Busy Bee / Pueue in `.claude/isolated.sh` so they cannot see the user's
-   daemons: `.claude/isolated.sh busybee -- cargo test --workspace`,
-   `.claude/isolated.sh bzb -- xcodebuild ...`, `.claude/isolated.sh bzb -- cmake --build ...`.
-   Cargo output goes to `build/`; do not change `.cargo/config.toml`. Never
-   install or replace the machine's global `busybee`/`bzb`/`bzbd`/`pueued`.
-7. **Isolation.** Integration tests spawn their own `pueued`/`bzbd` (`CLAUDE.md` §Integration tests). Direct `bzb`/`busybee`/`bzbd`/`pueued`/`pueue` Bash is denied; use `.claude/isolated.sh`. The PreToolUse hook is a guard for cooperative agents, not a same-UID sandbox.
-8. **Public repo hygiene.** Generic examples only; no machine names, user names, local paths, or other projects (`AGENTS.md` §Public repository hygiene). No AI co-author trailers in commits.
-
-## Prohibitions
-
-- Do not edit issue labels or state.
-- Do not change files under `sortie/` or `.github/workflows/`.
-- Do not touch any other PR or branch.
-- Do not merge the PR.
-
-## Keep the branch mergeable
-
-Before finishing, and at the start of every continuation, run `git fetch origin`
-and check the PR's mergeability (`gh pr view --json mergeable -q .mergeable`, or
-`git merge-tree --write-tree origin/main HEAD` before the PR exists). Rebase onto
-`origin/main` **only when it actually conflicts**: resolve the conflicts so the
-result still satisfies the issue and the spec, rerun the full test suite, and
-`git push --force-with-lease`. Do not rebase merely because `main` moved — every
-push discards the current automated review and restarts the cycle, and CI already
-tests the merge result. Never merge `main` into the branch; history stays linear
-for the squash merge. A PR that does not merge cleanly is never merged.
-
-## Finishing
+Host configuration and global installations are outside scope. All project Nix,
+provisioning, and tests belong in the repo. Only operate explicitly owned lab
+VMs. Product tests use private Pueue/bzbd state. Never use a developer's daemon.
+The legacy `.claude/isolated.sh` wrapper has a tracked config-file defect until
+#71 is merged; do not mistake it for a validated fixture or work around a cold
+startup bug by preparing its runtime directories.
 
 When implementation and required checks are ready:
 

@@ -1,163 +1,127 @@
-# Running sortie against this repository
+# Running Sortie against this repository
 
-[sortie](https://docs.sortie-ai.com) turns labelled GitHub issues into autonomous
-Claude Code sessions. `WORKFLOW.md` is the configuration; `run.sh` launches it;
-`agent.sh` is the per-issue agent launcher. One sortie process serves one
-workflow, so this directory is specific to this repository.
+[Sortie](https://docs.sortie-ai.com) dispatches labelled issues, resumes their
+existing PRs for fixes, and merges after formal approval and green CI. Both
+profiles use the repository-owned Sortie 1.24.1 runtime in `nix develop .#agent`.
+No global installation or host configuration change is needed.
 
-## Preflight (verify every time after a break)
+| Profile | Launcher | Issue milestone | State and workspaces | Dashboard |
+|---|---|---|---|---|
+| Product | `sortie/run.sh` | `bzbd: shared CPU token pool` | `build/sortie.db`, `build/sortie-workspaces/` | 7678 |
+| Lab | `sortie/run-lab.sh` | `agent lab: autonomous VM development` | `build/sortie-lab/` | 7679 |
 
-| check | command | expect |
-|---|---|---|
-| sortie on PATH | `sortie --version` | 1.21 or newer |
-| gh authenticated, scopes | `gh auth status` | scopes include `repo` (and `project` for board admin) |
-| ssh alias for workspaces | `ssh -T git@github.com-sortie` | `Hi githappens/busybee! You've successfully authenticated` |
-| deploy key still registered | `gh repo deploy-key list --repo githappens/busybee` | the automation key, `read-write` |
-| board sync secret present | `gh secret list --repo githappens/busybee` | `PROJECT_TOKEN` (classic PAT, `project` scope; **expires** — check the date) |
-| labels exist | `gh label list --repo githappens/busybee` | `sortie`, `sortie:ready/working/review/done`, `needs-human`, `epic`, `later`, `model:fable` |
-| nothing already running | `pgrep -fl "sortie .*WORKFLOW"` | no output |
-| one poll, no side effects | `sortie/run.sh --dry-run` | `candidates_fetched=N would_dispatch=M` |
+The [VM lab design](../docs/design/agent-lab.md) describes planned disposable
+workers, observation, and bounded scenarios. This bootstrap supplies dispatch
+and review; it does not claim that those VM capabilities already exist.
 
-The ssh alias `github.com-sortie` lives in the local ssh config: a dedicated,
-passphrase-less key registered as a **write deploy key on this repository
-only**, with `IdentityAgent none` so unattended sessions never touch a hardware
-key or an agent prompt. If the alias is missing on a new machine, recreate the
-key, add it as a deploy key, and add the alias; then re-run the check above.
+## Start and validate
 
-## Launch
+Authenticate `gh` and the chosen implementation agent first. The launcher uses
+`gh` credentials for tracker access and HTTPS task checkouts. It does not need
+a private SSH alias. Validation needs no account or credentials:
 
 ```sh
-sortie/run.sh            # foreground; Ctrl-C stops dispatching (running sessions are reconciled on restart)
-sortie/run.sh --dry-run  # one poll cycle, nothing dispatched, nothing written
+sortie/run.sh --agent codex --validate
+sortie/run-lab.sh --agent claude --validate
+sortie/run-lab.sh --agent cursor --validate
+sortie/run-lab.sh --agent codex --dry-run
+sortie/run-lab.sh --agent codex
 ```
 
-`run.sh` pins the HTTP/metrics port (7678), reuses `gh auth token` as
-`GITHUB_TOKEN`, verifies the ssh alias, refuses to start if the port is busy,
-and runs inside `nix develop` so agents inherit cargo, pueued, make, ninja and jq.
+Both launchers accept `--agent claude|codex|cursor`; Codex is the default.
+They share `launch.sh`, with independent profile state and locks. Stop an old
+controller before starting the replacement. Existing product workspaces and
+database paths are preserved; per-issue `model:` labels from the old Claude
+wrapper are no longer consumed. Select the implementation runner at launch;
+CI review always uses Opus 5.5 high.
 
-First launch after a long gap: set `agent.max_concurrent_agents: 1` in
-`WORKFLOW.md`, watch one issue reach a PR, then raise it. That key hot-reloads.
+Claude's native adapter in Sortie 1.24 requires `bypassPermissions`, so the
+launcher permits Claude only inside an allocated worker with
+`BUSYBEE_SORTIE_WORKER=1`. Do not set that flag on a shared host. Cursor uses
+`agent acp`; `BUSYBEE_CURSOR_COMMAND` can select another compatible ACP command.
+Its unattended tools and permissions still require worker qualification.
+Codex uses `codex app-server` with a workspace sandbox and noninteractive
+approval policy. See [runner qualification](../docs/development/agent-review.md#runner-support).
 
-Each workspace gets a PreToolUse hook on `before_run` (sources in `sortie/`,
-runtime copies in `.claude/`). It denies global Busy Bee installs, writes to
-`.cargo/config.toml`, and any `bzb`/`busybee`/`bzbd`/`pueued`/`pueue` launch
-that is not `.claude/isolated.sh <tool> ...`. It is a guard for cooperative
-agents, not a same-UID sandbox. `sortie/test-machine-safety-hook.sh` covers
-the invariants.
+A running process snapshots committed controller scripts, skills, and policy
+from `origin/main` outside the task checkouts. Fetch `main` before launch.
+`BUSYBEE_SORTIE_TRUSTED_REF` may select a deliberately reviewed bootstrap
+commit; it must never point to an automatically chosen candidate branch.
+Candidate edits cannot replace the policy supervising that session.
+`BUSYBEE_SORTIE_CLONE_URL` and `BUSYBEE_SORTIE_PORT` override the public clone
+URL and the selected profile's dashboard port when needed.
 
-Watch a session read-only: `sortie/peek.sh <issue>` (last events from the agent's
-transcript plus the workspace's git state; `-f` follows).
+## Dispatch and handoff
 
-Dashboard: http://127.0.0.1:7678 (local only). Metrics: `/metrics` on the same
-port. Run history and cost: `sortie stats --since 24h` (reads `build/sortie.db`).
+Issue states are `sortie:ready`, `sortie:working`, `sortie:review`, and
+`sortie:done`; the `sortie` marker enables dispatch. Sortie owns state changes.
+The lab controller rejects tracking/parked issues and requires prerequisites
+to be completed by a merged PR into `main`, not merely closed. Its dependency
+release sidecar runs once per minute. The product profile retains its existing
+`unblock.sh` dependency release behavior. Inspect lab eligibility manually with:
 
-## How an issue moves
-
-Only issues with the `sortie` label **and** the milestone in `query_filter` are
-candidates. Labels are the state machine; sortie is the only writer:
-
+```sh
+nix develop .#agent -c python3 sortie/lab.py check --issue NUMBER
+nix develop .#agent -c python3 sortie/lab.py release --dry-run
 ```
-sortie:ready ──dispatch──▶ sortie:working ──PR opened──▶ sortie:review ──auto-merged──▶ sortie:done (closed)
-                                                              │  ▲
-                                                Codex findings └──┘ continuation turn
-                                  │
-                                  └─ agent writes `blocked` ──▶ parked (needs-human)
+
+`prepare-workspace.sh` preserves `sortie/<issue>` or `sortie-lab/<issue>` across
+continuations, including unfinished work and remotely existing branches. It
+sets credentials only inside the disposable checkout. Product tests must own
+private Pueue/bzbd state. The Claude machine-safety hook is a cooperative guard,
+not a security boundary; the isolated wrapper's cold-start defect remains #71.
+
+## One review loop
+
+The [shared review contract](../docs/development/agent-review.md) is authoritative
+for all same-repository PRs, regardless of branch name or implementation runner:
+
+1. Implement and test the issue, then push a draft PR with its closing issue.
+2. Mark it ready and use the trusted `reviews.py handoff` helper immediately.
+   The helper records the pushed SHA and time in `.sortie/scm.json` and writes
+   `needs-human-review` to `.sortie/status`.
+3. Linux/macOS CI passes, then `agent-review-gate.yml` runs independent contract
+   and ponytail reviews with Claude Opus 5.5 high.
+4. A separate publisher posts a formal `APPROVE` or `REQUEST_CHANGES` as
+   `github-actions[bot]`, tied to the exact reviewed head.
+5. Sortie's trusted triage resumes scoped fixes for `BLOCKED`, ignores settled
+   `READY`/`WAITING` evidence, and escalates `UNSURE` to `needs-human`. Fixes and
+   concrete author dispositions trigger follow-up reviews on the same PR.
+6. Sortie squash-merges only with GitHub approval and green CI, respecting the
+   repository rules. Agents do not merge or bypass protections.
+
+`WORKFLOW.md` and `LAB_WORKFLOW.md` own the runtime bounds; in particular,
+`reactions.bot_review.max_continuation_turns` controls review fix rounds.
+Review and merge watch windows cover the bounded CI sessions. There is no
+separate wording judge, review-reaction polling script, or gate timer sidecar.
+The workflow runs after CI, on comments, on a recovery schedule, and by manual
+dispatch. A maintainer can request reevaluation with:
+
+```sh
+gh workflow run agent-review-gate.yml --ref main -f pr=NUMBER
 ```
 
-Dependencies use GitHub's native *blocked by* relationships. **sortie 1.21 does
-not honour them** (its GitHub adapter only loads blockers for single-issue
-fetches, not for the candidate list), so the `sortie` marker label is the
-readiness gate: blocked issues carry `sortie:ready` for the board but no
-marker, and `sortie/unblock.sh` adds the marker once every blocker is closed.
-`run.sh` runs it every 60 s as a sidecar; it can also be run by hand after a merge. Ordering is by creation date.
+Unchanged evidence is reused. To retry a retained authentication/tool failure,
+first resolve the cause, then add an author disposition explaining the fix.
+A new head or disposition produces new review inputs; an empty commit is not
+needed. A new push dismisses the old approval, so rebase only for actual conflicts.
 
-The board (Projects → "busybee · bzbd", Kanban view) mirrors these labels through
-`.github/workflows/project-sync.yml`, using the `PROJECT_TOKEN` secret.
+## Operations and checks
 
-## Common operations
+Use the selected dashboard and `sortie/peek.sh` for product session inspection.
+An existing launcher lock requires checking the previous process before
+removing it. Preserve workspaces and reports when escalating; remove
+`needs-human` and re-enable an issue only after its blocker is resolved.
+Restart a stopped controller to adopt a newly merged policy snapshot.
 
-- **Release dependents after a merge**: `sortie/unblock.sh` (idempotent;
-  `VERBOSE=1` shows what each issue still waits on).
-- **Re-run an issue** (failed, parked, or you want another attempt): fix whatever
-  blocked it, remove `needs-human` if present, set the label back to
-  `sortie:ready`. The existing workspace and branch are reused.
-- **Bump the model for one issue**: add the label `model:fable` before it is
-  dispatched. The `before_run` hook writes `.sortie/model`, and `agent.sh` runs
-  Claude with that model; without the label the default in `agent.sh` applies.
-  Retries and continuation turns follow the label.
-- **Automated review and merge** (no human in the loop by default):
-  1. Codex reviews every push (ChatGPT → Codex → Code review settings: auto
-     review on, trigger "on every push"; rules in `AGENTS.md` → *Code Review
-     Rules*). It posts a comment-only review as `chatgpt-codex-connector[bot]`.
-  2. `.github/workflows/codex-gate.yml` (every 5 min and on PR events) selects PRs
-     with new Codex activity on their head commit, has Claude Haiku read that
-     material and decide APPROVE / REQUEST_CHANGES / UNSURE, and posts the verdict
-     as `github-actions[bot]` (UNSURE posts nothing; the PR waits). Severity
-     decides what blocks: a P0/P1 finding blocks, and that block lifts only on a
-     later clean Codex signal for the head — a re-review requested on the same
-     head (`@codex review`, which the agent posts after declining a P0/P1) or a
-     review of a new head. P2/P3 findings do not block: the gate approves the head
-     once the author has answered every such thread with a reason (out of scope,
-     not applicable, follow-up issue); until then it posts REQUEST_CHANGES naming
-     the waiting threads, and an author reply re-triggers the judgement. The
-     policy comes from an audit of 49 findings over four PRs: every
-     would-have-shipped bug was a round-1/2 P1, the P2 tail was one cascade or
-     edge case per round. The `main` ruleset requires one approval and dismisses
-     it on push, so the review decision tracks the latest verdict. Needs the repo setting "Allow GitHub Actions to
-     create and approve pull requests" and the `CLAUDE_CODE_OAUTH_TOKEN` secret
-     (from `claude setup-token`; tied to the Max subscription, so it expires with
-     it and shares its rate window).
-  3. `reactions.bot_review` routes Codex's comments to the agent as a continuation
-     turn (`reactions.bot_review.max_continuation_turns` in `WORKFLOW.md`, then `needs-human`).
-  4. `reactions.auto_merge` squash-merges once the decision is APPROVED and CI is
-     green; `reactions.merge_completion` sets `sortie:done` and closes the issue;
-     the unblock sidecar releases dependents.
-  If Codex never reviews (rate limit reached with credits off), the PR simply
-  waits: the gate only acts on an existing Codex review for the head commit.
-- **Human review**: request changes on the PR; sortie dispatches a continuation
-  turn with your comments (`reactions.review_comments`). Your approval counts
-  like the gate's.
-- **Stop everything**: Ctrl-C `run.sh`. Sessions already running finish their
-  turn; on the next start sortie reconciles against tracker state. Signal the
-  `sortie` process, not the `run.sh` wrapper — the wrapper is the parent, so a
-  signal sent to it alone does not reach the daemon. Prefer stopping when
-  `sortie_sessions_running` is 0: killing an agent mid-rebase leaves its
-  workspace with an unfinished rebase, which makes `before_run` fail on every
-  later dispatch for that issue (see the stall table).
-- **Change concurrency, polling, model**: edit `WORKFLOW.md`; most `agent.*`
-  and `polling.*` keys hot-reload, reactions need a restart (`sortie validate`
-  tells you if the file is malformed).
+```sh
+nix develop .#agent -c python3 -m unittest discover -s sortie/tests
+nix develop .#agent -c bash sortie/test-machine-safety-hook.sh
+bash sortie/test-harness-docs.sh
+```
 
-## Stall signatures (and the fix for each)
-
-| what you see | cause | fix |
-|---|---|---|
-| issue is `sortie:working`, `sortie_sessions_running 0`, last log line for it is `worker exiting exit_kind=normal` with no `handoff transition succeeded` after it | sortie skipped the handoff; reactions only run for issues in `sortie:review` | relabel the issue `sortie:review`; if nothing dispatches within two polls, restart `run.sh` (the startup scan re-detects pending Codex comments) |
-| `effort budget exhausted, blocking re-dispatch count=N max_sessions=N` | every continuation turn, including no-op review rounds, counts toward `agent.max_sessions` | raise it in `WORKFLOW.md` (hot-reloads), then restart `run.sh` — the blocked dispatch is not retried on its own |
-| `bot review continuation turns exhausted, escalating` → `needs-human` | `reactions.bot_review.max_continuation_turns` reached; each push costs two rounds (findings, then the post-verdict no-op) | raise it (needs a restart), remove `needs-human`; the counter resets per restart |
-| `no available orchestrator slots, rescheduling retry` repeating every 5 min for one issue | review-fix retries lose the slot race to fresh dispatches; each lost retry still increments `attempt` | raise `agent.max_concurrent_agents` by one (hot-reloads) |
-| a PR has a clean Codex 👍 for 20+ minutes and no gate approval | the 👍 raises no workflow event and the cron trigger is throttled on quiet repositories | `gh workflow run codex-gate.yml` (the `run.sh` sidecar does this every 10 min) |
-| approved PR, `mergeStateStatus UNSTABLE`, `auto_merge` idle | a check failed on the head (typically Linux-only behaviour; agents develop on macOS) | `reactions.ci_failure` hands the log excerpt to the agent; if it is missing from `WORKFLOW.md`, add it and restart |
-| a PR keeps getting new findings on code added for earlier findings | review scope creep on a large PR | `AGENTS.md` → *Stay within the issue's scope*; only branches containing that rule are reviewed under it |
-| PR blocked at `CHANGES_REQUESTED`, head unchanged for 10+ min, every finding carries an agent reply and no push | a declined P0/P1: a reply alone never clears that, only a Codex re-review does. (Declined P2/P3 findings approve on the reply; if the verdict still says it is waiting, the reply gave no reason — a bare acknowledgement does not count) | the prompt has the agent post `@codex review` on the same head after a P0/P1 decline; if the branch predates that, post the comment yourself, and if Codex re-raises a declined finding decide it by hand (the gate will not) |
-| retry attempt climbing for one issue with no agent activity, error `worker exited: workspace preparation: hook run: exit_code=1` | the issue's workspace is mid-rebase, so `before_run`'s `git checkout sortie/<n>` cannot run; every dispatch dies before the agent starts. Stopping `run.sh` while an agent is rebasing leaves it this way | `cd build/sortie-workspaces/<n> && git status` shows a detached HEAD, `.git/rebase-merge` and `UU` paths; `git rebase --abort` restores the branch and the next dispatch succeeds. Check the reflog before assuming commits are lost — an agent that resets onto a new main and recommits has squashed them, not dropped them. Deleting the workspace also works; `after_create` re-clones |
-
-Restart `run.sh` when `sortie_sessions_running` is 0 (`/metrics`): a restart cancels in-flight turns, and they resume as retries. Reactions (`reactions.*`) load only at startup; `agent.*`, `polling.*` and the prompt body hot-reload. GitHub's reviews and comments endpoints page at 30 and agent replies count as reviews, so always `--paginate` when inspecting a long-lived PR.
-
-## Where state lives (all under the gitignored `build/`)
-
-| path | what | safe to delete? |
-|---|---|---|
-| `build/sortie.db` | run history, sessions, cost | yes, loses `sortie stats` history |
-| `build/sortie-workspaces/<issue>/` | one clone per issue, branch `sortie/<issue>` | yes once the PR is merged; sortie removes it on terminal state |
-| `build/sortie-workspaces/CLAUDE.md` | optional machine-local instructions inherited by every workspace (not in the repo) | keep |
-| `<workspace>/.sortie/` | per-run protocol files (`status`, `scm.json`, `model`, `mcp.json`) | managed by sortie |
-
-## Things that expire or rot
-
-- `PROJECT_TOKEN` (classic PAT): board sync fails silently-in-the-board when it
-  expires — Actions show red runs. Rotate with `gh secret set PROJECT_TOKEN`.
-- Deploy key: never expires, but revoke it if the machine is retired.
-- sortie itself moves fast (minor every few weeks); re-run `sortie validate
-  WORKFLOW.md` after upgrading and read the changelog for renamed keys.
-- `agent.sh`'s default model alias: update when the model line-up changes.
+The ordinary Linux/macOS workflow also runs these harness checks. See the
+review contract for the OAuth secret, Actions approval setting, evidence
+artifacts, and the pinned one-PR bootstrap procedure. Each review run retains
+separate contract/ponytail transcript artifacts for seven days, including
+failed sessions that produced a transcript; download them from the run to debug.

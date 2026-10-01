@@ -7,6 +7,14 @@ build`) so only one runs at a time across parallel dev sessions. Today it wraps
 specification**. Conform to it rather than redesigning. The README is for users;
 this file is for people changing the code.
 
+The intended development workflow using disposable Parallels workers is in
+[`docs/design/agent-lab.md`](docs/design/agent-lab.md). It describes planned
+tooling; the build and test commands below remain the current instructions.
+
+PR review uses the repository's `skills/contract-review/SKILL.md` and
+`skills/ponytail-review/SKILL.md`, with the same process for every agent runner.
+See [the review and handoff contract](docs/development/agent-review.md).
+
 ## Build and test
 
 Everything runs inside the nix dev shell, which supplies cargo, rustc, clippy,

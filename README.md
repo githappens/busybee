@@ -243,6 +243,11 @@ an unrecognised command among them.
 
 ## Not yet
 
+The proposed contributor workflow for autonomous fixes in disposable Linux and
+macOS workers is described in [the agent lab design](docs/design/agent-lab.md).
+Its Parallels templates and controller are planned development tooling; they are
+not required to use busybee or run the existing test suite.
+
 - [#15](https://github.com/githappens/busybee/issues/15) ambient mode: a global
   `MAKEFLAGS` so builds you did not wrap join the pool too.
 - [#16](https://github.com/githappens/busybee/issues/16) RAM-aware admission,
