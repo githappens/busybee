@@ -131,7 +131,7 @@ def prepare(args):
     (args.directory / "packet.json").write_text(json.dumps(packet, indent=2) + "\n")
     (args.directory / "record.json").write_text(json.dumps(record, indent=2) + "\n")
     needed = record is None and not ci_errors(packet["head"], checks) and reviewable(packet["metadata"])
-    flags = ["--model", MODEL, "--effort", EFFORT, "--max-turns", "40", "--restricted",
+    flags = ["--model", MODEL, "--effort", EFFORT, "--max-turns", "100", "--restricted",
              "--tools", "Read,Glob,Grep", "--allowedTools", "Read,Glob,Grep", "--permission-mode", "dontAsk",
              "--setting-sources", "user", "--disable-slash-commands", "--strict-mcp-config",
              "--json-schema", json.dumps(SCHEMA, separators=(",", ":"))]
