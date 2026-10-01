@@ -10,12 +10,8 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        # Resolve the repo root from the flake's own source tree.
-        # self.outPath is the path to the flake source in the nix store, but
-        # build/ is gitignored so it won't be there. Instead we use the
-        # BUSYBEE_REPO env var (set by scripts/buildanddeploy.sh) so that
-        # builtins.path can find the binary in the working tree. Requires
-        # `--impure` or BUSYBEE_REPO to be set.
+        # build/ is gitignored, so it is not in self.outPath; BUSYBEE_REPO (set
+        # by scripts/buildanddeploy.sh, needs --impure) points at the worktree.
         repoRoot = builtins.getEnv "BUSYBEE_REPO";
         binaryStorePath = builtins.path {
           path = "${repoRoot}/build/release/busybee";
@@ -31,15 +27,9 @@
         };
       in
       {
-        # Binary-only derivation: copies the pre-built release binary from
-        # `build/release/busybee` into the nix store. Non-hermetic by design
-        # — see scripts/buildanddeploy.sh for the end-to-end flow.
-        #
-        # Why: cargo's build-script-build executables are blocked by the
-        # user's local binary-execution policy, so we can't run cargo
-        # inside the nix sandbox. We build under `nix develop` (where
-        # compiled artifacts land in `./build/release/`) and then have nix
-        # package the resulting binary.
+        # Binary-only, non-hermetic: packages binaries already built under
+        # `nix develop` into build/release/ (see scripts/buildanddeploy.sh), so
+        # cargo build scripts never have to run inside the nix sandbox.
         packages.default = pkgs.stdenv.mkDerivation {
           pname = "busybee";
           version = "0.1.0";
@@ -96,7 +86,6 @@
             (import ./sortie/runtime.nix { inherit pkgs; })
             pkgs.gh
             pkgs.actionlint
-            (pkgs.python3.withPackages (ps: [ ps.pyyaml ]))
           ];
         };
       });

@@ -1,19 +1,13 @@
 # busybee — notes for agents and contributors
 
 busybee is a Rust CLI that gates resource-heavy commands (`busybee -- cargo
-build`) so only one runs at a time across parallel dev sessions. Today it wraps
-`pueued`; the design for the `bzbd` broker that replaces the scheduling half is
-[`docs/design/bzbd.md`](docs/design/bzbd.md) — **that document is the
-specification**. Conform to it rather than redesigning. The README is for users;
-this file is for people changing the code.
-
-The intended development workflow using disposable Parallels workers is in
-[`docs/design/agent-lab.md`](docs/design/agent-lab.md). It describes planned
-tooling; the build and test commands below remain the current instructions.
-
-PR review uses the repository's `skills/contract-review/SKILL.md` and
-`skills/ponytail-review/SKILL.md`, with the same process for every agent runner.
-See [the review and handoff contract](docs/development/agent-review.md).
+build`) across parallel dev sessions. The `bzbd` broker admits work against a
+shared CPU token pool and submits it to `pueued`, which spawns and logs it.
+[`docs/design/bzbd.md`](docs/design/bzbd.md) **is the specification**: conform
+to it rather than redesigning. The README is for users; this file is for people
+changing the code. Review rules and the agent workflow are in
+[`AGENTS.md`](AGENTS.md); the planned VM lab is
+[`docs/design/agent-lab.md`](docs/design/agent-lab.md).
 
 ## Build and test
 
@@ -42,9 +36,6 @@ setting and do not commit `build/` — it is gitignored.
 CI gates fmt, clippy and the tests on Linux and macOS. Format the files you
 touch; do not reformat the workspace as a side effect of something else.
 
-The dev shell gains `gnumake` and `ninja` when the jobserver work lands — add
-them to `flake.nix` in that change, not ahead of it.
-
 The VM lab controller (`docs/design/agent-lab.md`) is Python under
 `scripts/vm/`, outside the Cargo workspace. Its preflight and tests need no
 Parallels; `doctor` reads the host's Parallels when one is installed:
@@ -56,45 +47,17 @@ nix develop -c python3 -m unittest discover -s scripts/vm/tests
 
 ## Crate layout
 
-```
-crates/bzb-core/   library: pueue-lib wrapper plus pure helpers
-crates/bzb/        binaries `busybee` and `bzb` (same entry point), monitor TUI
-crates/bzbd/       the broker daemon; module layout fixed by the spec
-crates/bzb-test-support/  fixtures shared by the crates' integration tests
-```
-
-`crates/bzb-core/src/`:
-
-| module          | purpose |
-|-----------------|---------|
-| `client.rs`     | connect to `pueued`, spawning it if the socket is unreachable |
-| `group.rs`      | create/re-enforce the `busybee` group at `parallel_tasks = 0` |
-| `enqueue.rs`    | `TaskSpec` → pueue `AddRequest`; returns the new task id; shell-escaping join |
-| `kill.rs`       | one signal to a running task; the caller owns the escalation |
-| `wait.rs`       | pure state machine turning task-status polls into `WaitEvent`s |
-| `classify.rs`   | pure argv → `Plan`: admission class plus the env/argv edits |
-| `status.rs`     | `QueueSnapshot` — running/queued view of the group, plus `count_ahead` |
-| `log.rs`        | fetch and decompress a task's log from a byte offset |
-| `exit_code.rs`  | pueue `TaskResult` → process exit code |
-| `env.rs`        | force colour env vars onto the child's environment |
-| `errors.rs`     | `BusybeeError` and its error → exit-code recommendation |
-| `config.rs`     | `config.toml`: parse, validate, layer `[overrides]` onto the classification table |
-| `nest.rs`       | pure: env marker + live leases → pass through or queue |
-
-`crates/bzb/src/`: `cli.rs` (clap), `enqueue.rs` (blocking mode: enqueue, wait,
-stream, relay exit code), `detach.rs` (`--detach`), `signals.rs` (SIGINT
-escalation), `config.rs` (`config show` / `config reload`), `monitor/` (ratatui
-TUI plus per-OS CPU sampling), `version_parse.rs` (shared with `build.rs`).
-
-`crates/bzbd/src/`: `lib.rs` (state directory, socket server, lifecycle),
-`leases.rs` (the actor owning the scheduler, the token pool, the live leases
-and the poll of pueue), `inject.rs` (pure: a `Plan` plus the fifo path and
-core count → the task's env and argv), `recovery.rs` (startup: `leases.json`
-cross-checked against pueue, stale fifos swept, the pool seeded short of what
-adopted leases hold), `submit.rs` (the connection to pueued, reconnected on
-demand). The pool size, the drain deadline and the override table all come from
-the config file; the integration tests write one of their own
-(`Fixture::start_on`) to run a daemon on a small, deterministic pool.
+- `crates/bzb-core/`: shared library. Pure logic (`classify`, `scheduler`,
+  `wait`, `nest`, `exit_code`, `config`), the bzbd wire `protocol` and client
+  side (`daemon`), the fifo `jobserver`, and thin pueue-lib wrappers (`client`,
+  `group`, `enqueue`, `kill`, `log`).
+- `crates/bzb/`: the `busybee` and `bzb` binaries (one entry point): clap CLI,
+  blocking `enqueue`, `detach`/`cancel`, `status`, `config`, and the ratatui
+  `monitor`.
+- `crates/bzbd/`: the broker daemon (state dir and socket in `lib`, the lease
+  actor in `leases`, startup `recovery`, pure `inject`, pueued `submit`);
+  module layout fixed by the spec.
+- `crates/bzb-test-support/`: fixtures shared by the integration tests.
 
 ## Integration tests
 
@@ -134,10 +97,7 @@ nix develop -c cargo test -p bzb --test smoke
   be loud — logged and visible in the result — never the quiet default. The
   design document applies this to the daemon too: if it cannot create its fifo
   or socket it refuses to start rather than running the command ungoverned.
-  Pre-broker code does not all obey it: `monitor/app.rs` turns a failed poll
-  into `None` and redraws the stale snapshot; `monitor/app.rs` also drops the
-  reply to its own `ensure_busybee_group`. Those are examples, not an audit —
-  assume more exist. New code propagates.
+  Older code may not obey it; new code propagates.
 - **Pure state machines, IO at the edges.** `wait.rs` is the model: it takes a
   status snapshot and returns events, with no sockets or clocks inside, so it
   is testable without a daemon. New scheduling and classification logic follows
@@ -154,12 +114,9 @@ nix develop -c cargo test -p bzb --test smoke
 
 ## Versioning and release
 
-`crates/bzb/build.rs` derives `BUSYBEE_VERSION` at compile time and exposes it
-via `cargo:rustc-env`; `cli.rs` reads it for `--version`. The scheme is
-`MAJOR.MINOR.<PATCH+N>` from the nearest semver-shaped git tag plus commits
-since, falling back to `0.0.<commit-count>` with no tag and to
-`CARGO_PKG_VERSION` with no `.git`. Parsing lives in `version_parse.rs`, shared
-between the build script and the test harness.
+`crates/bzb/build.rs` derives `--version` from `git describe`
+(`MAJOR.MINOR.<PATCH+N>` from the nearest semver tag); parsing lives in
+`version_parse.rs`, shared with the tests.
 
 `scripts/buildanddeploy.sh` is the release pipeline: it builds release binaries
 under `nix develop`, checks `build/release/{busybee,bzb}` exist, then installs
@@ -171,7 +128,6 @@ gitignored). Deliberately non-hermetic; do not change it in unrelated work.
 
 - Do not introduce new external daemons or require system-level configuration.
   The broker described in the design document is the only planned daemon.
-- Do not commit `build/`.
 - Do not widen the `busybee` pueue group's semantics beyond the design. That
   means one group at `parallel_tasks = 0`, re-enforced on every invocation:
   pueue's dispatcher is bypassed and bzbd decides what runs, submitting

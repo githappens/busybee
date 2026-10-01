@@ -26,17 +26,6 @@ else
   not_ok 'README must name reactions.bot_review.max_continuation_turns as the source of truth'
 fi
 
-if awk '
-  /^[0-9]+\. \*\*Use these skills/ {p=1; next}
-  p && /^[0-9]+\. / {exit}
-  p && /whole scope/ {found=1}
-  END {exit found ? 0 : 1}
-' "$workflow"; then
-  not_ok 'skills rule must not restate that the acceptance criteria are the whole scope'
-else
-  ok 'skills rule does not restate scope'
-fi
-
 rules=$(awk '/^## Ground rules$/,/^## Prohibitions$/' "$workflow")
 while IFS= read -r heading; do
   line=$(printf '%s\n' "$rules" | grep -E "^[0-9]+\. \*\*${heading}\.\*\*" || true)

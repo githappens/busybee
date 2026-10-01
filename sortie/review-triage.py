@@ -6,16 +6,13 @@ from pathlib import Path
 import subprocess
 import sys
 
-from reviews import GATE_MARKER, api, read_pr
+from reviews import GATE_MARKER, api, latest_gate_review, read_pr
 
 
 def disposition(reviews, head):
-    matching = [r for r in reviews if r.get("commit_id") == head
-                and r.get("user", {}).get("login") == "github-actions[bot]"
-                and (r.get("body") or "").startswith(GATE_MARKER)]
-    if not matching:
+    latest = latest_gate_review(reviews, head)
+    if latest is None:
         return "handled"
-    latest = max(matching, key=lambda r: r["id"])
     try:
         header = json.loads(latest["body"].splitlines()[0][len(GATE_MARKER):])
         if header["head"] != head:

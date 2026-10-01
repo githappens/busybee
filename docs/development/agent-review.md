@@ -6,12 +6,6 @@ skills and publishes the formal approval or request for changes. Implementation
 may use Claude, Codex, or Cursor; CI reviewers use **Claude Opus 5.5, high effort**
 (`claude-opus-5-5`, `--effort high`).
 
-This is the standard repository review workflow and the bootstrap for the
-[VM lab](../design/agent-lab.md); it does not yet
-provide its worker controller, visual scenarios, or artifact matrix enforcement.
-Project Nix and configuration stay in this repository. No host activation or
-private configuration import is required.
-
 ## Shared skills
 
 The canonical, runner-neutral instructions are:
@@ -73,34 +67,27 @@ builds use controller limits instead of the binary under test.
 
 ## CI authority, evidence, and bounds
 
-`.github/workflows/agent-review-gate.yml` runs on completed CI, issue comments,
-a five-minute recovery schedule, or a manual dispatch on the default branch.
-It selects all open, ready, same-repository PRs, including manually created
-feature branches and changes to CI or orchestration. Linked closing issues
-provide the acceptance criteria; a PR without linked issues uses its description
-as the explicit scope. Fork PRs require maintainer review. Issue eligibility and
-milestone constraints belong to dispatch, not review. Only human event actors
-with repository write access may start a
-review. Bot or outside-commenter events leave pending work for the next trusted
-schedule run; they cannot create a cached Action rejection. Only repository
-owner/member/collaborator issue comments change the contract fingerprint.
-Outside reports remain in the packet as context; a maintainer or PR author can
-adopt relevant new evidence in a contract edit or disposition.
-The workflow and controller execute the triggering default-branch
-SHA; candidate files are read as data and are never executed in the review job.
+`.github/workflows/agent-review-gate.yml` reviews every open, ready,
+same-repository PR. Fork PRs require maintainer review. Linked closing issues
+provide the contract; a PR without one uses its description as the scope.
 
-The official Claude Code `base-action` handles model execution, without the
-top-level action's event-specific GitHub automation. Our controller selects
-eligible actors/PRs and the separate publisher owns GitHub writes. Each Claude
-Action has a 20-minute timeout and a 100-turn limit. Claude Code is
-pinned to 2.1.280 with explicit model and effort flags. Restricted mode,
-read/search-only tools, and disabled candidate settings/skills prevent the
-review session from running candidate hooks, tests, or shell commands. Normal
-CI builds the candidate separately. Review jobs have read-only GitHub tokens;
-only a separate deterministic publisher has permission to submit reviews.
-There is no extra model deciding whether another model's prose sounds clean.
+Trust model:
 
-The model returns only:
+- The workflow, controller (`sortie/ci_reviews.py`), and skills run from the
+  default-branch SHA. Candidate files are read as data, never executed.
+- Only human actors with write access can trigger a review; only
+  owner/member/collaborator comments change the contract fingerprint. Other
+  events wait for the next scheduled run.
+- Review sessions use restricted, read/search-only tools with candidate
+  settings and skills disabled, and a read-only GitHub token. Only the separate
+  deterministic publisher can submit reviews.
+- Each session runs the official Claude Code `base-action` (pinned 2.1.280, explicit
+  model and effort) with a 20-minute timeout and a 100-turn limit.
+- The publisher rechecks live inputs, head, and both platform jobs. Stale,
+  missing, malformed, or `UNSURE` results never approve, and an earlier
+  approval is revoked when its evidence is invalidated or CI fails on that head.
+
+Each model session returns only:
 
 ```json
 {
@@ -111,45 +98,23 @@ The model returns only:
 }
 ```
 
-`BLOCKED` requires concrete findings. `READY` requires no unresolved findings.
-`UNSURE` must explain missing evidence. The controller adds repository/PR/issue
-identity, the merge-base, trusted skill digests, actual Action session IDs,
-model/effort, input fingerprint, and the run URL. The two session IDs must be
-present and distinct. Author comments and invented model session IDs cannot
-supply review authority.
+`BLOCKED` requires concrete findings, `READY` requires none unresolved, and
+`UNSURE` must explain the missing evidence. The controller adds PR/issue
+identity, merge-base, skill digests, the two distinct Action session IDs,
+model/effort, input fingerprint, and run URL.
 
-The sanitized bundle is retained as an Actions artifact for 90 days. Formal
-reviews include both reports, findings, and the run link. Each Action execution
-transcript is uploaded separately as `claude-transcript-PR-HEAD-SKILL-ATTEMPT`
-with **seven-day retention**, including failed sessions when the Action emits
-an execution file. Upload happens immediately after each session because the
-Action reuses its output path. Logs keep the Action's concise default output;
-download the transcript artifact when debugging. Failure before session startup
-or a hard termination may produce no transcript; the run logs remain available.
-Transcripts are diagnostic data, never approval evidence. Reuse is allowed only from this
-workflow's default-branch runs and only for the same head, merge-base, contract,
-PR description, author dispositions, and trusted policy/skills. Bot chatter and
-unrelated advances of the base do not create a fresh review. Expired evidence
-requires a new review. Corrupt newest evidence never falls back to an older
-clean report. Failed model attempts are retained too, preventing an unchanged
-authentication or model failure from becoming a subscription-spending loop.
+Retention: the sanitized bundle is an Actions artifact kept 90 days; each
+session transcript (`claude-transcript-PR-HEAD-SKILL-ATTEMPT`) is kept seven
+days and is diagnostic only, never approval evidence. Results, including
+failed attempts, are reused only for the same head, merge-base, contract,
+description, author dispositions, and trusted policy, so an unchanged failure
+does not loop. Corrupt newest evidence never falls back to an older report.
 
-The publisher rechecks live inputs, head, and both platform jobs. Stale results
-cannot approve a newer head. Missing, malformed, incomplete, or uncertain
-results cannot earn approval. An earlier approval is revoked when the gate
-observes invalidated evidence or failing CI on that head. GitHub's stale-review
-dismissal protects new pushes. VM artifact and full scenario-matrix enforcement
-are delivered by #80; this bootstrap does not imply those checks already exist.
-
-Sortie's human `review_comments` handler excludes bots, so both profiles
-use `bot_review` for `github-actions[bot]`. Their trusted triage helper re-reads
-live reviews: current `BLOCKED` dispatches fixes, `READY`/`WAITING` and stale
-signals do not waste a continuation, and `UNSURE` or an unreadable gate result
-escalates to `needs-human`. The reaction's continuation cap bounds fix rounds;
-the review and merge reactions' six-hour watch windows cover CI and the two
-review sessions. An operator
-resolves external authentication/tool failures before retrying with a new
-author comment or new head. Routine code fixes require no human intervention.
+Sortie's `bot_review` reaction picks up `github-actions[bot]` reviews; the
+trusted triage helper dispatches fixes only for a current `BLOCKED` and
+escalates `UNSURE` or an unreadable result to `needs-human`. An operator
+resolves external authentication or tool failures, then retries with an author
+comment or a new head.
 
 ## Authentication and activation
 

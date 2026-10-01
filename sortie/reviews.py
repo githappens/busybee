@@ -195,6 +195,13 @@ def checks_for(repo, head):
     return paged_objects(f"repos/{repo}/commits/{head}/check-runs?per_page=100", "check_runs")
 
 
+def latest_gate_review(reviews, head):
+    """The gate's newest review of `head`, or None."""
+    ours = [r for r in reviews if r.get("user", {}).get("login") == "github-actions[bot]"
+            and r.get("commit_id") == head and (r.get("body") or "").startswith(GATE_MARKER)]
+    return max(ours, key=lambda r: r["id"]) if ours else None
+
+
 def publish_decision(packet, record, checks):
     repo, number, head = packet["repo"], packet["pr"], packet["head"]
     verdict, reasons = evaluate(packet, record, checks)
@@ -202,9 +209,7 @@ def publish_decision(packet, record, checks):
     if not reviewable(pr):
         return
     existing = api(f"repos/{repo}/pulls/{number}/reviews?per_page=100", pages=True)
-    ours = [r for r in existing if r.get("user", {}).get("login") == "github-actions[bot]"
-            and r.get("commit_id") == head and (r.get("body") or "").startswith(GATE_MARKER)]
-    latest = max(ours, key=lambda r: r["id"]) if ours else {}
+    latest = latest_gate_review(existing, head) or {}
     # Waiting is not a code defect. Only publish it to revoke an earlier approval.
     if verdict == "WAITING" and latest.get("state") != "APPROVED":
         return

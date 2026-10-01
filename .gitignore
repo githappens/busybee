@@ -3,3 +3,5 @@
 *.swp
 .DS_Store
 __pycache__/
+/.claude/*.local.json
+/.claude/scheduled_tasks.lock

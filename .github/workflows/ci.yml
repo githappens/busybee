@@ -1,6 +1,4 @@
-# Format, lint and test on the two platforms busybee targets. Both jobs are
-# meant to be required checks; neither needs secrets or non-default
-# repository settings.
+# Format, lint and test on both target platforms; both jobs are required checks.
 name: CI
 
 on:
@@ -8,23 +6,16 @@ on:
   push:
     branches: [main]
 
-# A newer push to the same branch makes the older run pointless. macOS
-# runners are limited to 5 concurrent jobs on the free plan, so don't sit on
-# one for a superseded commit.
+# A newer push supersedes the older run.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
-  # pueue 4.x is the daemon protocol pueue-lib 0.31 speaks. Taken as a
-  # release binary rather than `cargo install pueue --locked`: the daemon is
-  # a test fixture, not a dependency we build, and downloading it costs
-  # seconds instead of a multi-minute compile plus its own cache.
+  # pueue-lib 0.31 speaks the 4.x protocol; a release binary avoids compiling a test fixture.
   PUEUE_VERSION: "4.0.4"
-  # The jobserver tests need GNU make's fifo jobserver, which landed in 4.4.
-  # Neither runner image is new enough (Ubuntu 24.04 ships 4.3, macOS ships
-  # 3.81), so make is installed below instead of taken from the image.
+  # The jobserver tests need make >= 4.4's fifo jobserver; neither runner image ships it.
   MAKE_VERSION: "4.4.1"
 
 jobs:
@@ -43,8 +34,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Show the active toolchain
-        # rustup resolves rust-toolchain.toml here, installing the pinned
-        # channel and its components if the image doesn't already have them.
+        # rustup installs the rust-toolchain.toml channel if missing.
         run: |
           rustup show active-toolchain
           cargo --version
@@ -70,9 +60,7 @@ jobs:
           key: gnumake-${{ env.MAKE_VERSION }}-${{ matrix.os }}
 
       - name: Install GNU make ${{ env.MAKE_VERSION }}
-        # Built from source on both platforms: there is no distro or
-        # Homebrew package that pins the version, and one code path beats
-        # two. Roughly a minute on a cold cache, skipped entirely on a hit.
+        # From source: no package pins the version on both platforms.
         run: |
           set -euo pipefail
           prefix="$HOME/.local/gnumake"
@@ -87,9 +75,7 @@ jobs:
           echo "$prefix/bin" >> "$GITHUB_PATH"
 
       - name: Assert tool versions
-        # ninja comes from the runner image. Assert every version the tests
-        # depend on so an image or package downgrade fails here, loudly,
-        # instead of silently skipping the tests that need them.
+        # Fail loudly on a downgrade instead of silently skipping tests (ninja is from the image).
         run: |
           set -euo pipefail
           atleast() { # atleast <tool> <minimum> <actual>

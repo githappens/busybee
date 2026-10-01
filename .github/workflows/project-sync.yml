@@ -1,12 +1,8 @@
-# Mirror sortie's label-driven issue states onto the project board's Status
-# column. Sortie (the agent orchestrator) moves issues through
-# sortie:ready -> sortie:working -> sortie:review -> sortie:done by label;
-# GitHub Projects can only show columns from a single-select field, so this
-# workflow keeps the two in step.
+# Mirror sortie's issue state labels onto the project board's Status field.
 #
-# Requires a repository secret PROJECT_TOKEN: a fine-grained PAT with
-# "Projects: read and write" on the project owner (the default GITHUB_TOKEN
-# cannot access user-owned Projects v2).
+# Requires repository secret PROJECT_TOKEN: a classic PAT with the `project`
+# scope, created by the project's owner (queries go through `viewer`; the
+# default GITHUB_TOKEN cannot access user-owned Projects v2).
 name: project-sync
 
 on:
@@ -17,7 +13,6 @@ permissions:
   issues: read
 
 env:
-  PROJECT_OWNER: githappens
   PROJECT_NUMBER: 2
 
 concurrency:
@@ -41,8 +36,7 @@ jobs:
           set -euo pipefail
           has() { case ",$LABELS," in *",$1,"*) return 0;; *) return 1;; esac; }
           if   has needs-human;     then status=Blocked
-          elif has sortie:done;     then status=Done
-          elif [ "$STATE" = closed ]; then status=Done
+          elif has sortie:done || [ "$STATE" = closed ]; then status=Done
           elif has sortie:review;   then status=Review
           elif has sortie:working;  then status=Working
           elif has sortie:ready;    then status=Ready
@@ -50,8 +44,7 @@ jobs:
           fi
           echo "target status: $status"
 
-          # All GraphQL via `viewer` (the token's own user): a classic PAT with
-          # only the `project` scope is enough, and no owner-type lookup is needed.
+          # Via `viewer`, so no owner-type lookup is needed.
           meta=$(gh api graphql -F n="$PROJECT_NUMBER" -f query='
             query($n: Int!) { viewer { projectV2(number: $n) { id
               field(name: "Status") { ... on ProjectV2SingleSelectField { id options { id name } } } } } }')

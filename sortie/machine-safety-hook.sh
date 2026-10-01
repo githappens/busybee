@@ -46,10 +46,7 @@ mentions_stateful() {
 # Compound-command markers. Enough to keep `cat …; pueued` from counting as
 # a reader or an isolated launch. Not a Bash parser.
 has_shell_operator() {
-  local c=$1
-  [[ $c == *';'* || $c == *'&&'* || $c == *'||'* || $c == *'|'* ]] && return 0
-  [[ $c == *'&'* ]] && return 0
-  return 1
+  [[ $1 == *[';&|']* ]]
 }
 
 # The whole command must be a reader: no list/pipe operators and no redirects.
@@ -68,18 +65,8 @@ is_workspace_isolated_script() {
   p=${p#\'}
   p=${p%\'}
   case "$p" in
-    .claude/isolated.sh|./.claude/isolated.sh)
-      return 0
-      ;;
-    \$CLAUDE_PROJECT_DIR/.claude/isolated.sh|\$\{CLAUDE_PROJECT_DIR\}/.claude/isolated.sh)
-      return 0
-      ;;
-    "$project_dir"/.claude/isolated.sh)
-      return 0
-      ;;
-    *)
-      return 1
-      ;;
+    .claude/isolated.sh|./.claude/isolated.sh|\$CLAUDE_PROJECT_DIR/.claude/isolated.sh|\$\{CLAUDE_PROJECT_DIR\}/.claude/isolated.sh|"$project_dir"/.claude/isolated.sh) return 0 ;;
+    *) return 1 ;;
   esac
 }
 
@@ -121,12 +108,12 @@ is_isolated_launch() {
 # `nix develop -c`. cargo run is not in this list.
 is_safe_cargo() {
   local c=$1 cd_re nix_re cargo_re
-  [[ $c == *';'* || $c == *'||'* || $c == *'|'* ]] && return 1
+  # The cd prefix cannot contain an operator other than its own `&&`.
   cd_re='^[[:space:]]*cd[[:space:]]+[^[:space:];&|]+[[:space:]]+&&[[:space:]]+(.*)$'
   if [[ $c =~ $cd_re ]]; then
     c=${BASH_REMATCH[1]}
   fi
-  [[ $c == *'&&'* || $c == *'&'* ]] && return 1
+  has_shell_operator "$c" && return 1
   nix_re='^[[:space:]]*nix[[:space:]]+develop[[:space:]]+-c[[:space:]]+(.*)$'
   if [[ $c =~ $nix_re ]]; then
     c=${BASH_REMATCH[1]}
