@@ -3,6 +3,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -241,7 +242,7 @@ class ConfigTests(unittest.TestCase):
         self.addCleanup(self.repo.tmp.cleanup)
 
     def errors(self, text):
-        return contracts.config_errors(contracts.parse_config(text), self.repo.root)
+        return contracts.config_errors(tomllib.loads(text), self.repo.root)
 
     def test_the_example_config_is_valid(self):
         example = Path(__file__).resolve().parents[3] / "infra" / "vm" / "local.example.toml"

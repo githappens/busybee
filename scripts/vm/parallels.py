@@ -16,7 +16,6 @@ READ_ONLY = (
     ("prlsrvctl", ("info", "--json")),
     ("prlctl", ("list", "--all", "--json")),
 )
-SNAPSHOT_LIST = ("prlctl", "snapshot-list")
 
 QUERY_TIMEOUT_S = 30
 
@@ -30,7 +29,7 @@ def is_read_only(argv):
     if (tool, rest) in READ_ONLY:
         return True
     # `prlctl snapshot-list <vm> --json` and nothing else.
-    return (tool, rest[:1]) == (SNAPSHOT_LIST[0], SNAPSHOT_LIST[1:]) and len(rest) == 3 and rest[2] == "--json"
+    return tool == "prlctl" and len(rest) == 3 and rest[0] == "snapshot-list" and rest[2] == "--json"
 
 
 def run(argv):

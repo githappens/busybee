@@ -81,7 +81,7 @@ def load_config(path, repo, findings):
                                           "start from infra/vm/local.example.toml"))
         return None
     try:
-        config = contracts.parse_config(path.read_text())
+        config = tomllib.loads(path.read_text())
     except tomllib.TOMLDecodeError as err:
         findings.append(contracts.finding("config_invalid", f"{display(path, repo)} is not valid TOML: {err}"))
         return None
@@ -155,7 +155,9 @@ def check_template(repo, name, entry, config, adapter, vms, findings):
         return {"state": "invalid"}
     summary = {"os": manifest["os"], "arch": manifest["arch"], "clone_modes": manifest["clone_modes"],
                "provisioning_revision": manifest["provisioning_revision"]}
-    if config["clone_strategy"] not in manifest["clone_modes"]:
+    # Present, but not for the configured clone strategy: not a worker source.
+    eligible = config["clone_strategy"] in manifest["clone_modes"]
+    if not eligible:
         findings.append(contracts.finding("clone_mode_unsupported", f"clone_strategy {config['clone_strategy']} "
                                           f"was not validated for the {name} baseline ({', '.join(manifest['clone_modes'])})"))
     if vms is None:
@@ -171,8 +173,6 @@ def check_template(repo, name, entry, config, adapter, vms, findings):
         findings.append(contracts.finding("baseline_missing", f"the recorded {name} baseline VM or snapshot "
                                           "no longer exists in Parallels"))
         return {**summary, "state": "missing"}
-    # Present, but not for the configured clone strategy: not a worker source.
-    eligible = config["clone_strategy"] in manifest["clone_modes"]
     return {**summary, "state": "ready" if eligible else "ineligible"}
 
 

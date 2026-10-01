@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 import secrets
-import tomllib
 
 CONFIG_SCHEMA = 1
 TEMPLATE_SCHEMA = "busybee.vm.template/v1"
@@ -34,10 +33,6 @@ RUN_ID = re.compile(r"^r-\d{8}T\d{6}Z-[0-9a-f]{6}$")
 TIMESTAMP = "%Y-%m-%dT%H:%M:%SZ"
 
 
-def parse_config(text):
-    return tomllib.loads(text)
-
-
 def _integer(value):
     # bool is an int in Python; a budget of `true` is a typo, not 1.
     return isinstance(value, int) and not isinstance(value, bool)
@@ -57,14 +52,6 @@ def _bounded(section, values, bounds, errors):
             errors.append(("config_invalid", f"[{section}] {key} must be an integer"))
         elif not low <= value <= high:
             errors.append(("config_invalid", f"[{section}] {key} = {value} is outside {low}..{high}"))
-
-
-def _inside(path, root):
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
 
 
 def state_dir(config, repo):
@@ -87,7 +74,7 @@ def config_errors(config, repo):
     else:
         # Resolved, so `..` and symlinks cannot carry state out of the ignored tree.
         state = (repo / raw_state).resolve()
-        if not _inside(state, (repo / STATE_ROOT).resolve()) or not _inside(state, repo.resolve()):
+        if not state.is_relative_to((repo / STATE_ROOT).resolve()) or not state.is_relative_to(repo.resolve()):
             errors.append(("config_invalid", f"state_dir must stay inside {STATE_ROOT}/"))
             state = None
 
@@ -117,7 +104,7 @@ def config_errors(config, repo):
                 or not isinstance(entry["manifest"], str):
             errors.append(("config_invalid", f"[templates.{name}] needs exactly a manifest path, "
                                              f"and the name must be one of {', '.join(GUEST_OS)}"))
-        elif state and not _inside((state / entry["manifest"]).resolve(), state):
+        elif state and not (state / entry["manifest"]).resolve().is_relative_to(state):
             errors.append(("config_invalid", f"[templates.{name}] manifest must stay inside state_dir"))
     return errors
 
