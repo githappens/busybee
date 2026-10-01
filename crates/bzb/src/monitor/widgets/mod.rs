@@ -9,8 +9,7 @@ pub mod tests {
     use ratatui::layout::Rect;
     use ratatui::Terminal;
 
-    /// Draws `widget` onto a `width` × `height` test terminal and returns what
-    /// each row of it says.
+    /// Renders `widget` on a test terminal and returns its rows as text.
     pub fn render(width: u16, height: u16, widget: impl FnOnce(Rect, &mut Buffer)) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         terminal

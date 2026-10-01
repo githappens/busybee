@@ -1,32 +1,6 @@
-//! The headline, end to end: **one task alone gets the whole machine, N tasks
-//! share it, and nothing is ever over-subscribed** (`docs/design/bzbd.md`
-//! §Problem).
-//!
-//! Everything else in the suite tests a part. This file spawns the real
-//! `busybee` binary against daemons of its own and watches real GNU make
-//! builds take, share and give back a six-token pool, so it doubles as the
-//! worked example the README points at.
-//!
-//! How the concurrency is measured: each build target drops a marker file,
-//! sleeps, records how many markers exist, and removes its marker — see
-//! [`bzb_test_support::counter`]. The largest count any job saw is the peak
-//! concurrency the tool actually reached, and each sample's mtime says when it
-//! was read, which is what lets [`a_static_task_drains_the_pool_and_hands_it_back`]
-//! ask what the build was doing *while* the static task held its cores.
-//!
-//! Two notes on what is asserted, and how hard:
-//!
-//! * Concurrency bounds are exact. They come from the jobs' own counts, not
-//!   from a sampler outside the build that could miss a peak.
-//! * Durations are given at least 2× slack, since a loaded CI runner is
-//!   slower than a developer's machine and a tight deadline here would fail
-//!   for reasons that have nothing to do with the pool.
-//!
-//! The builds are run as `busybee -- make run`, with no `-j` of their own.
-//! `busybee -- make -j16 run` would be a different test: a user-supplied
-//! parallelism flag defeats the injected jobserver by design and only earns a
-//! notice (`docs/design/bzbd.md` §Decisions log), so that build would ignore
-//! the pool rather than share it.
+//! Real GNU make builds taking, sharing and giving back a six-token pool. Peak
+//! concurrency comes from the jobs' own counts ([`bzb_test_support::counter`]).
+//! Builds run without `-j`: a user `-j` bypasses the injected jobserver.
 
 mod common;
 
@@ -42,36 +16,21 @@ use bzb_test_support::counter;
 use common::{stderr, stdout, Busybee};
 use regex::Regex;
 
-/// Six tokens and at most four tasks admitted at once, so every number below
-/// is fixed rather than a function of whatever machine runs the tests.
-///
-/// The drain deadline is five times the shipped default because a static
-/// drain has to take its tokens off a build that wants them back: make
-/// returns a token when a job ends and reads one again immediately, so each
-/// token is a race the daemon has to win. Measured against the build in
-/// [`a_static_task_drains_the_pool_and_hands_it_back`], a drain of three
-/// tokens came up short in 6 of 25 attempts at the 2 s default and in 0 of 25
-/// at this one, the slowest taking about 3 s. It costs nothing when the drain
-/// is quick, which is the usual case; it stops a slow one being read as a pool
-/// that does not work.
+/// The drain deadline is 5x the default: make re-reads a token as soon as it
+/// returns one, so draining off a busy build is a race. At 2 s a 3-token drain
+/// fell short 6/25 times; at 10 s, 0/25 (slowest ~3 s).
 const CONFIG: &str = "pool_size = 6\nmax_concurrent = 4\ndrain_deadline_ms = 10000\n";
 const POOL: u32 = 6;
 
-/// One build's ceiling: the pool, plus the one job every jobserver participant
-/// runs without a token (`docs/design/bzbd.md` §Admission policy rule 1).
+/// The pool plus the one job a jobserver build runs without a token.
 const CEILING: u32 = POOL + 1;
 
-/// Two builds' ceiling: one implicit job each, on the same pool.
 const SHARED_CEILING: u32 = POOL + 2;
 
-/// What is left for a jobserver build while a static task holds three of the
-/// six tokens: three tokens plus its own implicit job.
+/// While a static task holds three tokens.
 const THROTTLED_CEILING: u32 = POOL - 3 + 1;
 
-/// The daemons and the tool every test here needs, or `None` with the reason
-/// on stderr: `pueued` off `PATH`, or a `make` too old for the fifo jobserver,
-/// is how these tests skip themselves outside the dev shell (see
-/// `crates/bzb-core/tests/README.md`).
+/// `None` (self-skip) without `pueued` or a fifo-jobserver `make`.
 fn fixture() -> Option<Busybee> {
     if !counter::available("make", (4, 4)) {
         return None;
@@ -79,8 +38,6 @@ fn fixture() -> Option<Busybee> {
     Busybee::start_on(CONFIG)
 }
 
-/// A build alone on the pool takes all of it: six tokens plus its implicit
-/// job, and no ceremony beyond `busybee --`.
 #[test]
 #[serial_test::serial]
 fn one_build_alone_gets_the_whole_pool() {
@@ -113,18 +70,13 @@ fn one_build_alone_gets_the_whole_pool() {
     );
 }
 
-/// Two builds on one pool interleave token by token. Neither is throttled to
-/// nothing and the two together never exceed the pool plus their two implicit
-/// jobs — no daemon decision is involved in the rebalancing
-/// (`docs/design/bzbd.md` §Key insight).
 #[test]
 #[serial_test::serial]
 fn two_builds_share_the_pool_and_neither_starves() {
     let Some(busybee) = fixture() else {
         return;
     };
-    // One directory, so the two builds' markers count against each other and
-    // every sample carries the combined total as well as the build's own.
+    // One directory, so each sample carries the combined total too.
     let build = busybee.tmp.path().join("shared");
     counter::make_build(&build, 24, "0.4");
 
@@ -164,10 +116,7 @@ fn two_builds_share_the_pool_and_neither_starves() {
         combined <= SHARED_CEILING,
         "combined peak concurrency {combined}, expected at most {SHARED_CEILING}"
     );
-    // Both halves in one sample on purpose. A build seen with two jobs — its
-    // implicit one plus a token — at some point, and the two builds seen
-    // overlapping at some other point, is also what taking turns looks like:
-    // sharing means each build holds a token *while* the other is running.
+    // Both conditions in one sample: otherwise taking turns would also pass.
     for name in ["a", "b"] {
         assert!(
             samples
@@ -179,20 +128,13 @@ fn two_builds_share_the_pool_and_neither_starves() {
     }
 }
 
-/// A static task cannot speak the jobserver protocol, so bzbd pulls its cores
-/// out of the same fifo and holds them (`docs/design/bzbd.md` §Key insight).
-/// The running build is throttled to what is left for as long as that lasts,
-/// is told nothing about it, and gets the pool back afterwards.
 #[test]
 #[serial_test::serial]
 fn a_static_task_drains_the_pool_and_hands_it_back() {
     let Some(busybee) = fixture() else {
         return;
     };
-    // Long enough that the two-second static task lands well inside the build
-    // even when the drain ahead of it uses its whole ten-second deadline. A
-    // build that ended first would leave the window below empty rather than
-    // throttled, which is a different failure and a confusing one.
+    // Outlasts a full 10 s drain plus the 2 s static task.
     const TARGETS: u32 = 200;
     let build = busybee.tmp.path().join("drained");
     counter::make_build(&build, TARGETS, "0.5");
@@ -206,8 +148,6 @@ fn a_static_task_drains_the_pool_and_hands_it_back() {
         .expect("start the build");
     busybee.wait_for_a_running_task();
 
-    // The task marks when it had its cores and when it gave them up; both are
-    // silent, so its stdout stays its own.
     let held = busybee.tmp.path().join("held");
     let handed_back = busybee.tmp.path().join("handed-back");
     let out = busybee
@@ -236,18 +176,13 @@ fn a_static_task_drains_the_pool_and_hands_it_back() {
     );
     assert_preamble(
         &out,
-        // A shell string is opaque to the classifier, so the tool it names is
-        // `<shell>` rather than anything inside the quotes.
         &running(
             "<shell>",
             &format!(r"static, holding 3/{POOL} cores \(1 other task active\)"),
         ),
     );
 
-    // Both markers and every sample are files in the same temporary tree, so
-    // this assumes the filesystem timestamps them finely enough to tell apart
-    // events a second or two apart — true of APFS and ext4, which is what the
-    // suite runs on.
+    // Relies on sub-second mtimes (APFS, ext4).
     let (from, to) = (mtime(&held), mtime(&handed_back));
     let during: Vec<u32> = counter::samples(&build)
         .iter()
@@ -278,15 +213,9 @@ fn a_static_task_drains_the_pool_and_hands_it_back() {
         THROTTLED_CEILING + 1
     );
 
-    // Everything is back: the drained cores were released and the build's
-    // tokens went back to the fifo.
     assert_pool_idle(&busybee);
 }
 
-/// An unrecognised command is `none`: exclusive, and admitted only once
-/// nothing else is (`docs/design/bzbd.md` §Admission policy). So it waits for
-/// the build to finish rather than sharing with it, and the queue position it
-/// was given says so.
 #[test]
 #[serial_test::serial]
 fn an_unrecognised_command_waits_for_the_pool_then_has_it_alone() {
@@ -346,9 +275,6 @@ fn an_unrecognised_command_waits_for_the_pool_then_has_it_alone() {
     );
 }
 
-/// Ctrl-C on a queued client is exit 130 and the lease goes with the
-/// connection (`docs/design/bzbd.md` §Lease model). Nothing about that reaches
-/// the build already on the machine.
 #[test]
 #[serial_test::serial]
 fn interrupting_a_queued_client_leaves_the_running_build_alone() {
@@ -356,8 +282,6 @@ fn interrupting_a_queued_client_leaves_the_running_build_alone() {
         return;
     };
     let build = busybee.tmp.path().join("interrupted");
-    // Long enough that the interruption is done well before the build is, so
-    // the window that matters — everything after it — is most of the run.
     counter::make_build(&build, 40, "0.5");
 
     let make = busybee
@@ -377,8 +301,7 @@ fn interrupting_a_queued_client_leaves_the_running_build_alone() {
         .expect("start the client that queues behind it");
     busybee.wait_for_leases(2);
 
-    // SAFETY: kill has no preconditions beyond a pid, and this one is a child
-    // of the test that has not been reaped.
+    // SAFETY: an unreaped child's pid.
     unsafe { libc::kill(queued.id() as i32, libc::SIGINT) };
     let status = queued.wait().expect("wait for the interrupted client");
     assert_eq!(
@@ -392,12 +315,8 @@ fn interrupting_a_queued_client_leaves_the_running_build_alone() {
         status.leases.len() == 1 && status.leases[0].tool == "make"
     });
 
-    // The instant the interrupted lease was gone, in the same clock the samples
-    // are stamped in. The peak over the whole build would prove nothing: the
-    // build reaches the pool before the second client even queues, so a lease
-    // that took tokens with it would leave that early peak standing and the
-    // build throttled for the rest of the run. Only the samples after this
-    // point can tell the two apart.
+    // Only samples after the lease is gone can show tokens leaked with it;
+    // the whole-build peak predates the interruption.
     let gone = busybee.tmp.path().join("gone");
     fs::write(&gone, "").expect("mark when the interrupted lease was gone");
     let gone = mtime(&gone);
@@ -417,8 +336,7 @@ fn interrupting_a_queued_client_leaves_the_running_build_alone() {
          going for this to mean anything",
         after.len()
     );
-    // Two-sided on purpose: the interrupted lease taking tokens with it would
-    // leave the build running under its share rather than over it.
+    // Two-sided: leaked tokens would show as running under its share.
     let peak = after.iter().copied().max().expect("samples after the wait");
     assert!(
         (5..=CEILING).contains(&peak),
@@ -426,34 +344,22 @@ fn interrupting_a_queued_client_leaves_the_running_build_alone() {
          the build kept the whole pool across it"
     );
 
-    // The peak is a lower bound on what the build could reach, so a single
-    // token lost with the interrupted lease can hide inside it. The count the
-    // daemon keeps cannot: every token is back in the fifo or it is not.
+    // One lost token can hide inside the peak, but not in the free count.
     assert_pool_idle(&busybee);
 }
 
-/// The lines busybee is allowed to write about itself, quoted from
-/// `docs/design/bzbd.md` §Client output contract. The admission line is
-/// [`running`]'s, since what it says depends on the class the lease was
-/// admitted under.
+/// Line shapes from bzbd.md §Client output contract; admission is [`running`].
 const QUEUED: &str = r"^busybee: queued \(\d+ ahead\)$";
 const MOVED: &str = r"^busybee: (?:\d+ ahead…|still queued \(\d+ ahead\))$";
 const NOTE: &str = r"^busybee: note: .+$";
 const EXITED: &str = r"^busybee: command exited -?\d+ \(elapsed (?:\d+s|\d+m\d\ds|\d+h\d\dm)\)$";
 
-/// The admission line for `tool`, whose `tail` is the class-specific half.
 fn running(tool: &str, tail: &str) -> String {
     format!("^busybee: running — {}, {tail}$", regex::escape(tool))
 }
 
-/// Checks everything the client said about itself: every line is one the
-/// output contract allows, the first announces the queue, exactly one reports
-/// the admission `running` describes, and the last is the exit code.
-///
-/// None of the invocations in this file gives busybee anything to complain
-/// about — no `-j` defeating the pool, no `--cores` on a jobserver lease, no
-/// drain that came up short — so a notice is a failure here even though the
-/// contract has a shape for one.
+/// Every stderr line fits the contract: queued first, one `running`, exit last.
+/// Nothing here warrants a notice, so one is a failure.
 fn assert_preamble(out: &Output, running: &str) {
     let text = stderr(out);
     let lines: Vec<&str> = text.lines().collect();
@@ -495,9 +401,7 @@ fn assert_preamble(out: &Output, running: &str) {
     );
 }
 
-/// Asserts the pool is whole again: no lease holds anything and all [`POOL`]
-/// tokens are back in the fifo. Waits on the leases alone, so that the free
-/// count is the command's answer and not the wait's condition.
+/// Waits on the leases only, so the free count is checked, not waited for.
 fn assert_pool_idle(busybee: &Busybee) {
     busybee.wait_for("an idle pool", |status| status.leases.is_empty());
     let status = busybee.run(&["status", "--json"]);

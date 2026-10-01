@@ -1,5 +1,7 @@
+use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Color;
+use ratatui::style::{Color, Style};
+use ratatui::widgets::Widget;
 
 /// A size variant for a single CPU gauge cell (excluding 1-char padding).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,17 +16,11 @@ pub const SIZES: &[SizeVariant] = &[
     SizeVariant { cols: 5, rows: 3 }, // Mini (min width to render "100")
 ];
 
-/// Pick the largest variant whose cell grid holds `n` cells inside `area`.
-/// Padding of 1 char on each side of every cell is accounted for.
+/// The largest variant whose grid (with 1-char padding) fits `n` cells.
 pub fn pick_size(area: Rect, n: u16) -> SizeVariant {
     for sz in SIZES {
-        let cw = sz.cols + 1;
-        let rh = sz.rows + 1;
-        if cw > area.width || rh > area.height {
-            continue;
-        }
-        let cols = area.width / cw;
-        let rows = area.height / rh;
+        let cols = area.width / (sz.cols + 1);
+        let rows = area.height / (sz.rows + 1);
         if cols > 0 && rows > 0 && cols * rows >= n {
             return *sz;
         }
@@ -32,30 +28,24 @@ pub fn pick_size(area: Rect, n: u16) -> SizeVariant {
     *SIZES.last().unwrap()
 }
 
-/// Compute the clockwise perimeter walk for a size variant, starting at
-/// bottom-center gap and proceeding: bottom-left half → left → top → right
-/// → bottom-right half. Returns (col, row) positions inside the cell.
+/// Clockwise (col, row) perimeter walk from the bottom-centre gap: bottom-left
+/// half, left, top, right, bottom-right half.
 pub fn perimeter(sz: SizeVariant) -> Vec<(u16, u16)> {
     let mut p = Vec::new();
     let center_col = sz.cols / 2;
     let bottom_row = sz.rows - 1;
-    // Bottom edge left of gap, going left.
     for c in (1..center_col).rev() {
         p.push((c, bottom_row));
     }
-    // Left edge going up.
     for r in (0..sz.rows).rev() {
         p.push((0, r));
     }
-    // Top edge going right.
     for c in 1..sz.cols {
         p.push((c, 0));
     }
-    // Right edge going down.
     for r in 1..sz.rows {
         p.push((sz.cols - 1, r));
     }
-    // Bottom edge right of gap, going left toward gap.
     for c in (center_col + 1..sz.cols - 1).rev() {
         p.push((c, bottom_row));
     }
@@ -81,14 +71,12 @@ pub fn shade_for_distance(distance_from_edge: i32) -> char {
     }
 }
 
-use ratatui::buffer::Buffer;
-use ratatui::style::Style;
-use ratatui::widgets::Widget;
+/// Colour of the unfilled part of the perimeter.
+const SKELETON: Color = Color::DarkGray;
 
-/// Usage data for the gauge grid: one 0–100 value per core.
+/// One 0–100 usage value per core.
 pub struct CompactGauge<'a> {
     pub usages: &'a [u8],
-    pub skeleton: Color,
 }
 
 impl<'a> Widget for CompactGauge<'a> {
@@ -109,10 +97,7 @@ impl<'a> Widget for CompactGauge<'a> {
             let col = i as u16 % cols_per_row;
             let x0 = area.x + col * cell_w + 1; // 1-char padding
             let y0 = area.y + row * cell_h;
-            if x0 + sz.cols > area.x + area.width {
-                break;
-            }
-            if y0 + sz.rows > area.y + area.height {
+            if x0 + sz.cols > area.right() || y0 + sz.rows > area.bottom() {
                 break;
             }
 
@@ -127,14 +112,13 @@ impl<'a> Widget for CompactGauge<'a> {
                     let dist = filled - 1 - idx as i32;
                     (shade_for_distance(dist), fg)
                 } else {
-                    ('░', self.skeleton)
+                    ('░', SKELETON)
                 };
                 let cell = buf.get_mut(px, py);
                 cell.set_char(ch);
                 cell.set_style(Style::default().fg(color));
             }
 
-            // Centered percentage on the middle row.
             let val = format!("{usage:>3}");
             let text_col = x0 + (sz.cols - 3) / 2;
             let text_row = y0 + sz.rows / 2;
@@ -150,19 +134,12 @@ impl<'a> Widget for CompactGauge<'a> {
 #[cfg(test)]
 mod render_tests {
     use super::*;
-    use ratatui::buffer::Buffer;
-    use ratatui::layout::Rect;
 
     #[test]
     fn renders_zero_usage_as_all_skeleton() {
         let area = Rect::new(0, 0, 9, 6);
         let mut buf = Buffer::empty(area);
-        CompactGauge {
-            usages: &[0],
-            skeleton: Color::DarkGray,
-        }
-        .render(area, &mut buf);
-        // At 0% the entire perimeter should be '░'.
+        CompactGauge { usages: &[0] }.render(area, &mut buf);
         let mut has_skeleton = false;
         for y in 0..area.height {
             for x in 0..area.width {
@@ -178,12 +155,7 @@ mod render_tests {
     fn renders_centered_percent_text() {
         let area = Rect::new(0, 0, 9, 6);
         let mut buf = Buffer::empty(area);
-        CompactGauge {
-            usages: &[42],
-            skeleton: Color::DarkGray,
-        }
-        .render(area, &mut buf);
-        // Pick up whichever row has "42" — size 7x5 centers text on middle row.
+        CompactGauge { usages: &[42] }.render(area, &mut buf);
         let mut found = false;
         for y in 0..area.height {
             let row: String = (0..area.width)
@@ -201,13 +173,9 @@ mod render_tests {
     fn full_usage_fills_entire_perimeter_with_fg_color() {
         let area = Rect::new(0, 0, 9, 6);
         let mut buf = Buffer::empty(area);
-        CompactGauge {
-            usages: &[100],
-            skeleton: Color::DarkGray,
-        }
-        .render(area, &mut buf);
+        CompactGauge { usages: &[100] }.render(area, &mut buf);
         let perim = perimeter(SizeVariant { cols: 7, rows: 5 });
-        let fg = usage_color(100); // Red
+        let fg = usage_color(100);
         for (cx, cy) in perim {
             let cell = buf.get(1 + cx, cy);
             let fg_actual = cell.fg;
@@ -226,11 +194,8 @@ mod tests {
     #[test]
     fn perimeter_normal_size_starts_at_bottom_center_and_closes_clockwise() {
         let p = perimeter(SizeVariant { cols: 7, rows: 5 });
-        // Should start just left of center on the bottom row (col 2, row 4)
         assert_eq!(p.first(), Some(&(2, 4)));
-        // Should end just right of center on the bottom row (col 4, row 4)
         assert_eq!(p.last(), Some(&(4, 4)));
-        // No duplicates.
         let mut sorted = p.clone();
         sorted.sort();
         sorted.dedup();
@@ -239,7 +204,6 @@ mod tests {
 
     #[test]
     fn pick_size_prefers_largest_that_fits_n() {
-        // Plenty of room for 4 large cells: 4 * (7+1) = 32 wide.
         let sz = pick_size(Rect::new(0, 0, 40, 10), 4);
         assert_eq!(sz, SIZES[0]);
     }

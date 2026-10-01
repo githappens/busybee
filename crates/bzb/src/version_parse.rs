@@ -1,11 +1,6 @@
-//! Parse `git describe --long` output for the dynamic version number.
-//!
-//! Shared source between the crate's test harness (`mod version_parse` in
-//! `lib.rs`) and `build.rs` (via `#[path = "src/version_parse.rs"]`).
+//! Parses `git describe --long`; shared with `build.rs` via `#[path]`.
 
-/// Parse `<TAG>-<N>-g<SHA>` where TAG is `MAJOR.MINOR.PATCH` with an
-/// optional leading `v`. Returns `MAJOR.MINOR.<PATCH+N>`, e.g. `0.1.0` + 5
-/// commits → `0.1.5`.
+/// `[v]MAJOR.MINOR.PATCH-N-gSHA` → `MAJOR.MINOR.<PATCH+N>`.
 pub fn parse_describe(s: &str) -> Option<String> {
     let mut parts = s.rsplitn(3, '-');
     let _sha = parts.next()?;

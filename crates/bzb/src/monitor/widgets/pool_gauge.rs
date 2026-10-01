@@ -1,8 +1,4 @@
 //! The token pool as one horizontal bar plus a legend.
-//!
-//! `docs/design/bzbd.md` §Observability: the monitor shows the same data
-//! `busybee status` prints. The in-use figure is `pool − free − held`, an
-//! estimate the daemon never schedules on, so it is written `~N` here too.
 
 use std::time::Duration;
 
@@ -13,21 +9,19 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 
-/// What the monitor knows about the pool.
+use crate::status::approx_in_use;
+
 pub enum PoolView<'a> {
-    /// The daemon's most recent reply. `stale` is how old that reply is once a
-    /// later poll has failed to replace it, and `None` while it is current.
     Known {
         reply: &'a StatusReply,
+        /// Age of `reply` once a later poll has failed; `None` while current.
         stale: Option<Duration>,
     },
-    /// A poll is out and none has come back yet, so nothing is known about the
-    /// pool — including whether there is one.
+    /// No poll has come back yet.
     Pending,
-    /// Nothing is listening on bzbd's socket: no daemon, so no pool.
+    /// No daemon, so no pool.
     Absent,
-    /// A daemon is there and is not answering, and none has answered yet — so
-    /// there is no last-known pool to show instead.
+    /// No reply to show, and the daemon is not answering.
     Unreachable(&'a str),
 }
 
@@ -35,11 +29,8 @@ pub struct PoolGauge<'a> {
     pub view: &'a PoolView<'a>,
 }
 
-/// A token a static lease drained: it is out of the pool until that lease ends.
 const HELD: char = '█';
-/// A token the jobserver tasks are estimated to be holding right now.
 const IN_USE: char = '▓';
-/// A token in the fifo, there for the taking.
 const FREE: char = '░';
 
 impl Widget for PoolGauge<'_> {
@@ -47,8 +38,6 @@ impl Widget for PoolGauge<'_> {
         let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
         let (reply, stale) = match self.view {
             PoolView::Known { reply, stale } => (*reply, *stale),
-            // None of these are degraded renderings of a pool: say which one it
-            // is and draw no bar, because there is no pool to draw.
             PoolView::Pending => {
                 Paragraph::new("pool unknown (waiting for bzbd)").render(rows[0], buf);
                 return;
@@ -85,30 +74,15 @@ fn bar(cell: char, count: u64, colour: Color) -> Span<'static> {
     )
 }
 
-/// Tokens neither free nor held by a static lease, so approximately what the
-/// jobserver tasks are using. Clamped at 0 for the same reason `busybee status`
-/// clamps it: the pool and the fifo are sampled separately, so a sum over the
-/// boundary is drift, not a negative count.
-fn approx_in_use(reply: &StatusReply) -> u32 {
-    reply
-        .pool_size
-        .saturating_sub(reply.free)
-        .saturating_sub(reply.held)
-}
-
-/// How many cells of a `width`-wide bar each segment gets: held, in use, free.
-///
-/// One cell is one token while the bar fits, and the pool is scaled into the
-/// width when it does not — a bar cut off at the edge would hide exactly the
-/// free tokens the operator is looking for.
+/// Cells per segment (held, in use, free): one per token, scaled down to fit
+/// `width` rather than clipping the free end.
 fn segments(reply: &StatusReply, width: u64) -> (u64, u64, u64) {
     let pool = reply.pool_size as u64;
     if pool == 0 || width == 0 {
         return (0, 0, 0);
     }
     let cells = pool.min(width);
-    // Segments are cut at scaled cumulative boundaries, rounded down, so a
-    // segment can never round itself into the next one's cells.
+    // Cumulative boundaries, rounded down, so segments never overlap.
     let boundary = |tokens: u64| (tokens * cells / pool).min(cells);
     let held = reply.held as u64;
     let in_use = approx_in_use(reply) as u64;
@@ -116,11 +90,7 @@ fn segments(reply: &StatusReply, width: u64) -> (u64, u64, u64) {
     let in_use_end = boundary(held + in_use);
     let mut bar = [held_end, in_use_end - held_end, cells - in_use_end];
 
-    // Rounding down still scales a small segment away, and each of the three
-    // is the one an operator might be reading the bar for: held capacity a
-    // static lease took, work in flight, tokens there for the taking. Give
-    // every segment that holds tokens a cell, borrowed from the widest one,
-    // as long as the bar is wide enough to spare it.
+    // Every non-empty segment gets at least one cell, borrowed from the widest.
     for (i, tokens) in [held, in_use, reply.free as u64].into_iter().enumerate() {
         if tokens == 0 || bar[i] > 0 {
             continue;
@@ -135,10 +105,7 @@ fn segments(reply: &StatusReply, width: u64) -> (u64, u64, u64) {
 }
 
 fn legend(reply: &StatusReply, stale: Option<Duration>) -> String {
-    // The counts are the last ones bzbd sent, and a poll has failed since: say
-    // how old they are rather than let them read as current. The marker leads
-    // because the counts are variable-length and the line is clipped from the
-    // right, so a trailing marker is the first thing a narrow terminal drops.
+    // The stale marker leads: the line is clipped from the right.
     let mut legend = match stale {
         Some(age) => format!("(stale {}s) · ", age.as_secs()),
         None => String::new(),
@@ -222,7 +189,6 @@ mod tests {
         );
     }
 
-    /// The estimate is an estimate wherever it appears.
     #[test]
     fn the_in_use_figure_is_marked_approximate() {
         let reply = busy();
@@ -236,8 +202,6 @@ mod tests {
         assert!(lines[1].contains("~3 in use"), "legend was {:?}", lines[1]);
     }
 
-    /// A bar wider than the terminal would be cut off at the right edge, which
-    /// is where the free tokens are.
     #[test]
     fn a_pool_wider_than_the_terminal_is_scaled_into_it() {
         let reply = busy();
@@ -272,9 +236,6 @@ mod tests {
         );
     }
 
-    /// The counts are variable-length, so a marker after them is the first
-    /// thing a narrow terminal clips — and clipping it turns a degraded poll
-    /// into numbers that read as current.
     #[test]
     fn a_narrow_terminal_clips_the_counts_before_the_stale_marker() {
         let reply = busy();
@@ -288,9 +249,6 @@ mod tests {
         assert!(lines[1].contains("stale 3s"), "legend was {:?}", lines[1]);
     }
 
-    /// Before the first poll comes back the monitor has not asked anyone
-    /// anything yet, and "idle" would be a claim about a pool it has not looked
-    /// at.
     #[test]
     fn a_pool_that_has_not_answered_yet_is_not_reported_as_idle() {
         let lines = draw(&PoolView::Pending, 60);
@@ -305,8 +263,6 @@ mod tests {
         assert_eq!(lines[1].trim_end(), "");
     }
 
-    /// A daemon that is there and silent is not an idle pool, and saying so
-    /// would be the silent fallback the design rules out.
     #[test]
     fn a_daemon_that_does_not_answer_is_not_reported_as_idle() {
         let lines = draw(&PoolView::Unreachable("connection reset"), 60);
@@ -338,9 +294,6 @@ mod tests {
         }
     }
 
-    /// Scaling the pool into a narrower bar must not round the free tokens
-    /// away: a bar that says the machine is full when six tokens are there for
-    /// the taking is the one reading the operator acts on.
     #[test]
     fn scaling_never_rounds_a_free_segment_to_nothing() {
         let reply = StatusReply {
@@ -354,9 +307,6 @@ mod tests {
         assert!(free > 0, "bar was {held}/{in_use}/{free}");
     }
 
-    /// The same holds for a single held token: a static lease keeping capacity
-    /// out of the pool is the reason the machine feels slow, and a bar that
-    /// scales it away leaves nothing on screen that says so.
     #[test]
     fn scaling_never_rounds_a_held_segment_to_nothing() {
         let reply = StatusReply {
@@ -371,8 +321,6 @@ mod tests {
         assert!(free > 0, "bar was {held}/{in_use}/{free}");
     }
 
-    /// bzbd reports the fifo and the leases from separate samples, so the two
-    /// can cross; a wrapped subtraction would ask for four billion cells.
     #[test]
     fn drifted_counts_do_not_overflow_the_bar() {
         let drifted = StatusReply {

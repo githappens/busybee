@@ -159,15 +159,12 @@ mod tests {
         assert_eq!(cli.cmd, vec!["xcodebuild"]);
     }
 
-    /// The class vocabulary is closed, so a typo is refused rather than
-    /// silently ignored on the way to the daemon.
     #[test]
     fn an_unknown_class_is_refused() {
         let parsed = Cli::try_parse_from(["busybee", "--class", "statik", "--", "make"]);
         assert!(parsed.is_err(), "an unknown class was accepted");
     }
 
-    /// Neither flag is required: `busybee -- <cmd>` stays the whole API.
     #[test]
     fn class_and_cores_default_to_unset() {
         let cli = parse(&["--", "make"]);

@@ -1,11 +1,5 @@
-//! Compute the binary's displayed version from git state and expose it as
-//! the `BUSYBEE_VERSION` compile-time env var.
-//!
-//! Scheme: `MAJOR.MINOR.<PATCH+N>` where `MAJOR.MINOR.PATCH` is the nearest
-//! semver-shaped tag reachable from HEAD and `N` is commits since that tag.
-//! No tag yet → `0.0.<total-commit-count>`.
-//! No `.git` (source tarball, crates.io, etc.) → fall back to
-//! `CARGO_PKG_VERSION`.
+//! Sets `BUSYBEE_VERSION` from git: nearest semver tag plus commits since,
+//! `0.0.<commits>` with no tag, `CARGO_PKG_VERSION` with no `.git`.
 
 use std::path::Path;
 use std::process::Command;
@@ -17,8 +11,7 @@ fn main() {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let repo = Path::new(&manifest_dir).join("../..");
 
-    // Rebuild when refs or tags change. Missing paths cause Cargo to always
-    // rerun — acceptable since this script is cheap.
+    // A missing path makes Cargo always rerun; the script is cheap.
     for rel in [
         ".git/HEAD",
         ".git/refs/heads",
@@ -52,7 +45,6 @@ fn git_version(repo: &Path) -> Option<String> {
         return version_parse::parse_describe(s);
     }
 
-    // No matching tag reachable from HEAD: patch = total commit count.
     let count = Command::new("git")
         .current_dir(repo)
         .args(["rev-list", "--count", "HEAD"])

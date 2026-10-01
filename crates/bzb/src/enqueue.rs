@@ -1,16 +1,5 @@
-//! Blocking mode: take a lease from bzbd, stream the task's output, mirror
-//! its exit code.
-//!
-//! The connection is the lease (`docs/design/bzbd.md` §Lease model), so it is
-//! held open for the command's whole life and closing it is how Ctrl-C
-//! cancels. The task's own output is not on that connection: bzbd hands back
-//! the pueue task id, and the log is read straight from pueued, which is the
-//! one thing the client still talks to directly — read-only, and over the same
-//! pueue configuration the daemon used to start the task
-//! (`docs/design/bzbd.md` §Components).
-//!
-//! Everything busybee says goes to stderr; stdout carries the task's output
-//! and nothing else.
+//! Blocking mode: take a lease from bzbd, stream the task's output, mirror its
+//! exit code. The connection is the lease (bzbd.md §Lease model).
 
 use std::{
     collections::BTreeMap,
@@ -19,6 +8,7 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
+use bzb_core::client::Client;
 use bzb_core::{
     classify::{classify, default_table, Class, Overrides},
     client,
@@ -28,21 +18,16 @@ use bzb_core::{
     protocol::{LeaseEvent, LeaseRequest, Request, Response},
     wait::QueueLines,
 };
-use pueue_lib::Client;
 use tokio::{
     io::{AsyncWriteExt, Stdout},
+    signal::unix::{signal, SignalKind},
     sync::mpsc,
     time::interval,
 };
 
-use crate::signals::{self, SignalEvent};
-
-/// How often the task's log is swept while it runs, and the tick the queue
-/// heartbeat counts in.
+/// Log sweep interval, and the tick the queue heartbeat counts in.
 const POLL: Duration = Duration::from_secs(1);
 
-/// What the client asks bzbd for. `detached` decides whether the lease
-/// outlives this process.
 pub fn lease_request(
     cmd: Vec<String>,
     name: Option<String>,
@@ -53,8 +38,7 @@ pub fn lease_request(
     Ok(LeaseRequest {
         argv: cmd,
         cwd: std::env::current_dir().context("cannot read the working directory")?,
-        // The daemon runs the task, so it needs the environment the caller
-        // would have run it in. Colour variables are added on that side.
+        // The daemon runs the task, so it needs the caller's environment.
         env: std::env::vars().collect::<BTreeMap<_, _>>(),
         label: name,
         class_override: class,
@@ -70,15 +54,12 @@ pub async fn run(
     cores: Option<u32>,
 ) -> Result<()> {
     if let Some(id) = live_parent_lease().await? {
-        // The parent already holds the machine. Queueing would deadlock
-        // (`docs/design/bzbd.md` §Nesting). stderr first, then exec so the
-        // command's own exit code is this process's.
+        // Queueing under a live parent lease would deadlock (bzbd.md §Nesting).
         eprintln!("{}", nest::passthrough_line(id));
         exec_command(&cmd)?;
     }
     let request = lease_request(cmd, name, class, cores, false)?;
-    // Only for the running line: the class the task is admitted under is the
-    // daemon's to decide and comes back in the event.
+    // Only for the running line; the admitted class comes back from bzbd.
     let tool = classify(
         &request.argv,
         &Overrides { class, cores: None },
@@ -88,15 +69,14 @@ pub async fn run(
 
     let mut conn = connect_or_spawn_bzbd().await?;
     conn.send(Request::Submit(request)).await?;
-    // The socket is read on its own task: `read_line` buffers, so cancelling
-    // it in a `select!` would lose half a message and break the framing. A
-    // channel receive is cancel-safe; this one also gives Ctrl-C a way to
-    // close the connection, by dropping the task that owns it.
+    // `read_line` is not cancel-safe in `select!`, so the socket is read on
+    // its own task; aborting that task is also how Ctrl-C closes the lease.
     let (events, mut incoming) = mpsc::unbounded_channel();
     let mut reader = tokio::spawn(async move {
         loop {
             let event = conn.events().next().await;
-            let last = !matches!(event, Ok(Some(ref event)) if !finished(event));
+            let last =
+                !matches!(event, Ok(Some(ref e)) if !matches!(e, LeaseEvent::Finished { .. }));
             if events.send(event).is_err() || last {
                 return;
             }
@@ -104,7 +84,8 @@ pub async fn run(
     });
 
     let mut queue = QueueLines::new();
-    let mut signals = signals::install();
+    let mut sigint = signal(SignalKind::interrupt())?;
+    let mut sigterm = signal(SignalKind::terminate())?;
     let mut ticker = interval(POLL);
     let mut stdout = tokio::io::stdout();
     let mut task: Option<Task> = None;
@@ -126,12 +107,8 @@ pub async fn run(
                     eprintln!("busybee: {}", running_line(&tool, &class, cores, pool_size, peers));
                     started_at = Some(Instant::now());
                     task = Some(Task {
-                        // pueued is already up: bzbd needed it to start the
-                        // task we were just told about. Not being able to
-                        // reach it means this process's pueue configuration
-                        // points somewhere else, which is worth hearing —
-                        // spawning a daemon of our own would only give us an
-                        // empty queue to look the task up in.
+                        // Connect, never spawn: a pueued of our own would
+                        // have an empty queue.
                         pueue: client::connect().await.context(
                             "cannot read the task's log: bzbd started it on a pueued this \
                              client cannot reach (check PUEUE_CONFIG_PATH)",
@@ -159,34 +136,22 @@ pub async fn run(
                     },
                 }
             }
-            signal = signals.recv() => match signal {
-                // Connection = lease: dropping the reader closes the socket,
-                // which is what tells bzbd to drop the lease and kill the task.
-                // Whatever the task wrote since the last sweep stays in
-                // `pueue log`; waiting for it here is what the second Ctrl-C
-                // would be for.
-                Some(SignalEvent::SoftCancel) => {
-                    eprintln!("busybee: cancelling…");
-                    reader.abort();
-                    let _ = (&mut reader).await;
-                    eprintln!("{}", exit_line(CANCELLED, started_at.map(|t| t.elapsed())));
-                    std::process::exit(CANCELLED);
-                }
-                Some(SignalEvent::HardKill) => std::process::exit(CANCELLED),
-                None => {}
-            },
+            _ = sigint.recv() => break,
+            _ = sigterm.recv() => break,
         }
     }
+
+    // Closing the socket is what tells bzbd to drop the lease and kill the task.
+    eprintln!("busybee: cancelling…");
+    reader.abort();
+    let _ = (&mut reader).await;
+    eprintln!("{}", exit_line(CANCELLED, started_at.map(|t| t.elapsed())));
+    std::process::exit(CANCELLED);
 }
 
-/// The exit code of a command its caller cancelled, by convention SIGINT's.
+/// SIGINT's conventional exit code.
 const CANCELLED: i32 = 130;
 
-fn finished(event: &LeaseEvent) -> bool {
-    matches!(event, LeaseEvent::Finished { .. })
-}
-
-/// The running task's log, as far as the client has read it.
 struct Task {
     pueue: Client,
     id: usize,
@@ -194,7 +159,6 @@ struct Task {
 }
 
 impl Task {
-    /// Writes whatever the task has produced since the last sweep.
     async fn sweep(&mut self, stdout: &mut Stdout) -> Result<()> {
         let (bytes, offset) = fetch_log_chunk(&mut self.pueue, self.id, self.log_offset).await?;
         self.log_offset = offset;
@@ -206,12 +170,7 @@ impl Task {
     }
 }
 
-/// The line the client prints when its lease is admitted
-/// (`docs/design/bzbd.md` §Client output contract). A jobserver task holds no
-/// tokens of its own — it shares the pool at compile-job granularity — so
-/// there is no held count to report for it. A `none` task is exclusive: it has
-/// the whole pool because nothing else is admitted beside it, and a held count
-/// would read as a share of something it is not sharing.
+/// See bzbd.md §Client output contract.
 fn running_line(tool: &str, class: &str, cores: u32, pool_size: u32, peers: usize) -> String {
     if class == Class::Jobserver.as_str() {
         format!(
@@ -256,16 +215,12 @@ fn format_elapsed(d: Duration) -> String {
     }
 }
 
-/// A live parent lease this process is running under, if any. Talks to bzbd
-/// only when the marker is present, so the common un-nested path does not
-/// grow a status round-trip. A stale export must not disable gating: only a
-/// lease the daemon still holds counts.
+/// The parent lease this process runs under, if bzbd still holds it: a stale
+/// marker must not disable gating.
 async fn live_parent_lease() -> Result<Option<u64>> {
     let Ok(marker) = std::env::var(LEASE_ENV) else {
         return Ok(None);
     };
-    // Reached the same way as the submit path, so a daemon that died under
-    // the parent is restarted and has re-adopted it before we ask.
     let mut conn = connect_or_spawn_bzbd().await?;
     conn.send(Request::Status).await?;
     match conn.recv().await? {
@@ -277,7 +232,7 @@ async fn live_parent_lease() -> Result<Option<u64>> {
     }
 }
 
-/// Replaces this process with `cmd`. Returns only if the exec itself failed.
+/// Returns only if the exec itself failed.
 fn exec_command(cmd: &[String]) -> Result<()> {
     anyhow::ensure!(!cmd.is_empty(), "no command given");
     let err = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
@@ -316,8 +271,6 @@ mod tests {
         assert_eq!(exit_line(130, None), "busybee: command exited 130");
     }
 
-    /// Both shapes are quoted from `docs/design/bzbd.md` §Client output
-    /// contract.
     #[test]
     fn the_running_line_matches_the_output_contract() {
         assert_eq!(
@@ -330,8 +283,6 @@ mod tests {
         );
     }
 
-    /// The one running task has no peers, and the line still has to read like
-    /// a sentence.
     #[test]
     fn a_task_running_alone_reports_no_peers() {
         assert_eq!(
@@ -340,9 +291,6 @@ mod tests {
         );
     }
 
-    /// A `none` lease blocks every other task, so it has the machine whatever
-    /// its token count says. Reporting a held count would read as a share of a
-    /// pool it is in fact not sharing.
     #[test]
     fn an_exclusive_lease_reports_the_whole_machine() {
         assert_eq!(
