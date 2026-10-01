@@ -1,0 +1,39 @@
+# Local configuration for the VM lab controller (scripts/vm/vmctl.py).
+# Copy to build/vm/local.toml (ignored) and adjust. Machine-specific values,
+# VM and snapshot identities belong there, never in this file.
+schema = 1
+
+# Controller state, worker registry and run evidence. Must stay inside build/vm/.
+state_dir = "build/vm"
+
+# How workers are cloned from a baseline snapshot: "linked" or "full". There is
+# no automatic switch; doctor reports a mode the baseline did not validate.
+clone_strategy = "linked"
+
+# Optional absolute tool paths. Without them the controller uses PATH, then the
+# Parallels Desktop app bundle, and reports which one it chose.
+[parallels]
+# prlctl = "/path/to/prlctl"
+# prlsrvctl = "/path/to/prlsrvctl"
+
+# Seconds. Finite and nested: command <= scenario <= run. Cleanup is the
+# separate window for collecting diagnostics after a timeout or cancellation.
+[deadlines]
+command = 1800
+scenario = 3600
+run = 14400
+cleanup = 300
+
+# Total resources all active workers may use.
+[budget]
+cpus = 4
+memory_mib = 8192
+storage_gib = 64
+
+# Baselines, by guest OS. Each manifest path is relative to state_dir and is
+# written by template validation (busybee.vm.template/v1).
+[templates.linux]
+manifest = "templates/linux/manifest.json"
+
+[templates.macos]
+manifest = "templates/macos/manifest.json"
