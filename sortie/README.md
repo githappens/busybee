@@ -13,10 +13,11 @@ dispatch bootstrap below is implemented; the VM controller is not yet present.
 ## Lab milestone and portable reviews
 
 Read [the review contract](../docs/development/agent-review.md). The loop is:
-implementation → draft PR → contract-review and ponytail-review in separate
-contexts → scoped fixes, tests, push → both reports on the final head → CI →
-gate approval → Sortie automerge. Neither an external review bot nor a model
-that rejudges review wording is required for lab PRs.
+implementation → draft PR → mark ready and hand off → Linux/macOS CI → two
+independent Claude Opus 5.5 high skill reviews in Actions → formal GitHub review
+→ Sortie fixes continuation or automerge. `bot_review` triage routes scoped
+findings back to any implementing runner and ignores clean/waiting feedback.
+Unchanged CI evidence is reused; author review receipts are not required.
 
 The repository's optional Nix shell pins Sortie 1.24.1 and validation tools:
 
@@ -63,8 +64,10 @@ There is no host Nix activation, global install, or private configuration import
 
 Lab branches use `sortie-lab/<issue>`. A shared routing predicate keeps the two
 GitHub gates disjoint. The new gate runs only default-branch policy, reads PR
-data without executing candidate code, and approves matching reports only once
-both CI platform jobs pass. Existing approval requirements remain in force.
+data without executing candidate code, and approves CI-owned reports only once
+both CI platform jobs pass. Configure `CLAUDE_CODE_OAUTH_TOKEN` from a Claude
+subscription and allow Actions to approve PRs. Existing approval requirements
+remain in force; authentication failures escalate instead of approving.
 The first bootstrap PR must land through the currently active review policy;
 the candidate cannot activate its own approval gate.
 

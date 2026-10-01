@@ -88,7 +88,9 @@ For each finding include priority, path and diff line/side, violated requirement
 causal chain, and the narrow required outcome. Keep genuinely pre-existing
 observations separate and nonblocking; do not turn them into additional work.
 
-For autonomous handoff, return the review record described in
-`docs/development/agent-review.md`, including the exact reviewed head, skill
-digest, a distinct reviewer session ID, and your report. The parent agent fixes
-accepted findings, tests, pushes, and requests the necessary follow-up review.
+When invoked with a structured output schema, return `head`, `verdict`,
+`findings`, and `report` as defined in `docs/development/agent-review.md`.
+The CI controller supplies skill digests and actual session IDs; do not invent
+them. The implementing agent fixes accepted findings, tests, and pushes; CI
+performs follow-up review. A local invocation can return the same report for
+early feedback without publishing a GitHub review.

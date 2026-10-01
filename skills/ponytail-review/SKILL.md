@@ -66,7 +66,8 @@ The parent agent applies valid scoped fixes and records the reason for any
 declined finding. In a follow-up, settle those findings and inspect the new
 delta; do not repeat unchanged suggestions or start another broad pass.
 
-For autonomous handoff, return the review record in
-`docs/development/agent-review.md` with the reviewed head, skill digest, a
-distinct reviewer session ID, and the report. A clean contract review does not
-substitute for this review, or vice versa.
+When invoked with a structured output schema, return `head`, `verdict`,
+`findings`, and `report` as defined in `docs/development/agent-review.md`.
+The CI controller supplies skill digests and actual session IDs; do not invent
+them. A local invocation can return the same report for early feedback. A
+clean contract review does not substitute for this review, or vice versa.

@@ -38,7 +38,7 @@ configuration must not appear in committed files or published run artifacts.
 | Host controller | Parallels lifecycle, resource limits, deadlines, source transfer, and artifact retention. |
 | Agent | One issue, its branch, and administrative control inside its assigned worker. |
 | Scenario runner | Reproduction steps, assertions, daemon fixtures, and terminal interaction. |
-| Review and merge runner | Two fresh-context skill reviews, current-head evidence, CI requirements, and progression of the issue. |
+| Review and merge runner | CI runs two independent Opus 5.5 high skill reviews and publishes the formal verdict; Sortie routes fixes and merges after current-head evidence and CI pass. |
 
 An agent may install tools, restart daemons, signal processes, and deliberately
 break its guest while investigating. It operates through a controller that can
@@ -143,11 +143,12 @@ explicit baseline identity rather than whichever snapshot happens to be latest.
    contents. Unit rendering tests remain useful alongside these checks.
 7. **Export and review.** Export commits or a patch, the result manifest, logs,
    and visual evidence. Open or reuse a draft PR explaining the original
-   failure, resulting behavior, specification changes, and checks. Run the
-   repository's contract-review and ponytail-review skills in distinct fresh
-   contexts, fix valid scoped findings, test, push, and obtain final reports
-   tied to the exact head. Follow the shared review workflow linked above.
-   The trusted gate and CI determine eligibility; Sortie owns automerge.
+   failure, resulting behavior, specification changes, and checks. Mark the
+   implementation ready and hand off to Sortie. After platform CI passes,
+   Actions runs contract-review and ponytail-review in separate Opus 5.5 high
+   sessions and publishes the formal verdict. Sortie resumes the implementer
+   for scoped fixes, tests, and pushes until both reports cover the final head.
+   Follow the shared review workflow linked above; Sortie owns automerge.
 8. **Continue or dispose.** Review findings, CI failures, or conflicts resume
    the same task with its branch and evidence in a new worker. A settled review
    with unchanged evidence does not launch another judgement. When the task
@@ -306,7 +307,8 @@ scope, exclusions, named tests, and required evidence. GitHub's native
 blocked-by relationships record the dependencies.
 
 [Bootstrap issue #81](https://github.com/githappens/busybee/issues/81) lands the
-portable review skills and lab dispatch profile before the task chain starts.
+portable review skills, CI review gate, and lab dispatch profile before the
+task chain starts.
 
 | Order | Issue | Blocked by |
 |---|---|---|
@@ -365,8 +367,8 @@ Initial scenarios should cover:
 
 Integrate with the existing agent runner through the controller interface;
 keep its issue selection and review policy separate from VM lifecycle. Include
-stable handling of already-judged review evidence. The lab's deterministic
-skill-report gate supersedes the external wording judge for this workflow;
+stable handling of already-judged review evidence. The lab's CI-owned skill
+reviews and deterministic publisher supersede the external wording judge;
 [#63](https://github.com/githappens/busybee/issues/63) remains a legacy-product
 gate issue rather than a lab prerequisite. Ordinary product agents
 must not need to modify the runner, global installation, or template to verify

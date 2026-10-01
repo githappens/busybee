@@ -61,7 +61,8 @@ mkdir -p "$BUSYBEE_SORTIE_STATE/trusted"
 trusted="$BUSYBEE_SORTIE_STATE/trusted/$sha"
 if [ ! -d "$trusted" ]; then
   candidate=$(mktemp -d "$BUSYBEE_SORTIE_STATE/trusted/.candidate.XXXXXX")
-  git archive "$sha" sortie skills docs/development/agent-review.md AGENTS.md CLAUDE.md | tar -x -C "$candidate"
+  git archive "$sha" sortie skills docs/development/agent-review.md AGENTS.md CLAUDE.md \
+    .github/workflows/agent-review-gate.yml | tar -x -C "$candidate"
   mv "$candidate" "$trusted"
 fi
 export BUSYBEE_SORTIE_TRUSTED=$trusted

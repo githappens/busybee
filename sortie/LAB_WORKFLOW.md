@@ -54,6 +54,19 @@ codex:
     networkAccess: true
 
 reactions:
+  bot_review:
+    provider: github
+    bot_usernames: ["github-actions", "github-actions[bot]"]
+    poll_interval_ms: 60000
+    debounce_ms: 60000
+    max_continuation_turns: 6
+    watch_window_ms: 21600000
+    escalation: label
+    escalation_label: needs-human
+    triage:
+      script: |
+        python3 "$BUSYBEE_SORTIE_TRUSTED/sortie/review-triage.py"
+      timeout_ms: 180000
   review_comments:
     provider: github
     max_retries: 2
@@ -62,6 +75,7 @@ reactions:
     poll_interval_ms: 120000
     debounce_ms: 60000
     max_continuation_turns: 6
+    watch_window_ms: 21600000
   ci_failure:
     provider: github
     max_retries: 3
@@ -69,6 +83,7 @@ reactions:
     escalation: label
     escalation_label: needs-human
     poll_interval_ms: 60000
+    watch_window_ms: 21600000
   merge_conflicts:
     provider: github
     max_retries: 2
@@ -122,17 +137,20 @@ When implementation and required checks are ready:
 
 1. Commit, push, and create/reuse a draft PR with `Closes #{{ .issue.identifier }}`.
    Use `gh pr create --draft` and `--body-file` for the prepared description.
-2. Use `$BUSYBEE_SORTIE_TRUSTED/sortie/reviews.py packet` to collect the actual
-   PR diff and contract. Run the trusted `skills/contract-review/SKILL.md` and
-   `skills/ponytail-review/SKILL.md` in distinct fresh reviewer contexts.
-3. Fix valid scoped findings, rerun relevant checks, and push. Follow-up reviews
-   settle prior findings and review the new delta. Obtain both final records
-   for the current head; do not fabricate reports or reuse a stale head.
-4. Publish the completion JSON with the trusted helper's `publish --ready`.
-   Required CI and the base-controlled gate determine merge eligibility.
-5. Write `.sortie/scm.json` with `branch`, `pr_number`, `owner`, and `repo`, then
-   write `needs-human-review` to `.sortie/status`. That is Sortie's handoff
-   protocol name; the lab gate and Sortie handle approval/merge automatically.
+2. Mark the implementation ready with `gh pr ready`. CI runs both trusted
+   review skills in separate Claude Opus 5.5 high sessions after Linux/macOS
+   checks pass. Local skill reviews are optional early feedback; do not publish
+   author review receipts or claim they can satisfy the gate.
+3. Use `$BUSYBEE_SORTIE_TRUSTED/sortie/reviews.py handoff --repo OWNER/REPO
+   --pr NUMBER` to write `.sortie/scm.json` (including the pushed SHA and time)
+   and `.sortie/status`. Hand off immediately; do not wait in an agent session
+   for CI review. `needs-human-review` is Sortie's protocol name: CI supplies
+   the formal review and Sortie handles the resulting continuation or merge.
+4. On a findings continuation, fix valid scoped findings, rerun affected
+   checks, and push to the same PR. Explain declined findings in a PR comment
+   with concrete evidence; CI re-reviews that new disposition even without a
+   code change. Repeat the handoff. CI settles prior findings and reviews the
+   new delta; both final reports and required CI must cover the current head.
 
 Do not change issue labels/state or merge the PR yourself. Do not request the
 external Codex review bot: these two skills provide this workflow's review.
@@ -153,11 +171,21 @@ Review feedback:
 Address the scoped feedback, then repeat affected checks and the current-head
 review/handoff process. Explain declined findings with concrete reasons.
 {{ end }}
+{{ if .bot_review_comments }}
+CI skill review findings:
+{{ range .bot_review_comments }}- {{ .reviewer }}: {{ .body }}
+{{ end }}
+Read the latest formal CI review on this PR. Fix its scoped findings or explain
+declined findings with concrete evidence in a PR comment. Retain settled
+decisions. Push changes and hand off again; CI owns the follow-up reviews.
+Do not run an author receipt loop, reply to a clean approval, or make an empty
+commit to trigger review. Authentication/tool failures escalate through triage.
+{{ end }}
 {{ if .ci_failure }}
 CI failed on {{ .ci_failure.ref }}:
 {{ .ci_failure.log_excerpt }}
 Reproduce and fix the failure; never weaken a test to pass. Push to the same PR
-and obtain review records for its new head.
+and hand off its new head for CI review.
 {{ end }}
 {{ if .merge_conflict }}
 PR #{{ .merge_conflict.pr_number }} conflicts with {{ .merge_conflict.base }}.

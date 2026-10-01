@@ -1,173 +1,174 @@
 # Autonomous PR review and handoff
 
-Sortie owns issue dispatch, continuation, CI feedback, and merge completion.
-The implementing agent owns implementation and the review/fix loop. These are
-separate from the [VM lab](../design/agent-lab.md), whose worker controller is
-still being implemented.
+Sortie owns issue dispatch, continuations, and merge completion. The implementing
+agent owns code, tests, and fixes. GitHub Actions runs the two independent review
+skills and publishes the formal approval or request for changes. Implementation
+may use Claude, Codex, or Cursor; CI reviewers use **Claude Opus 5.5, high effort**
+(`claude-opus-5-5`, `--effort high`).
 
-Task checkouts route HTTPS Git credentials through `gh` using local Git
-configuration, so fetch and push use the dispatcher's authenticated identity
-without changing global credential settings.
-
-The lab uses `sortie/LAB_WORKFLOW.md`. Existing product work retains
-`sortie/WORKFLOW.md` until migrated. Same-repository branches named
-`sortie-lab/<issue-number>` belong exclusively to the lab review gate; the old
-Codex gate skips them. The issue must belong to the lab milestone. This routing
-does not depend on the implementing agent being Claude, Codex, or Cursor.
+This is the bootstrap for the [VM lab](../design/agent-lab.md); it does not yet
+provide its worker controller, visual scenarios, or artifact matrix enforcement.
+Project Nix and configuration stay in this repository. No host activation or
+private configuration import is required.
 
 ## Shared skills
 
-The canonical skills are:
+The canonical, runner-neutral instructions are:
 
-- [contract-review](../../skills/contract-review/SKILL.md): does this delta
-  satisfy its contract without introducing a concrete P0/P1 failure?
-- [ponytail-review](../../skills/ponytail-review/SKILL.md): what unnecessary
-  complexity can be removed while preserving that contract?
+- [contract-review](../../skills/contract-review/SKILL.md): verify the issue and
+  specification, admitting only concrete P0/P1 blockers introduced by the delta.
+- [ponytail-review](../../skills/ponytail-review/SKILL.md): identify scoped cuts
+  that preserve the contract and its required tests.
 
-Discovery aliases expose the same files under `.agents/skills/` for Codex and
-`.claude/skills/` for Claude and Cursor. Every runner can also read the canonical
-files directly. Explicit paths avoid a personal skill with the same name
-overriding the repository's version. No plugin, personal path, or external
-project configuration is required.
+Discovery aliases expose the same files under `.agents/skills/` and
+`.claude/skills/`. Every runner can read the canonical files directly. CI reads
+skills from its trusted default-branch revision; a PR cannot weaken the skill
+reviewing itself. Both skills stay read-only. Local reviews are useful optional
+early feedback; they do not grant approval or replace either CI session.
 
 ## One issue through review
 
 1. Read the issue, applicable specification, `AGENTS.md`, and `CLAUDE.md`.
-   Implement only the assigned scope and its named regressions. Infrastructure
-   issues may change the runner/controller files their scope explicitly names;
-   ordinary product issues do not acquire that authority.
-2. Commit and push the implementation on `sortie-lab/<issue>`, then open or
-   reuse a **draft PR**. Include `Closes #<issue>` and a concrete description of
-   the failure, new behavior, and verification. The PR's actual base is the
-   comparison target, even when it is not the default branch.
-3. Collect the PR packet with the trusted `sortie/reviews.py packet` helper.
-   Give each skill a distinct fresh reviewer context: the skill, packet,
-   repository rules, relevant specification/code, and verification evidence.
-   Do not include the author's proposed verdict. Reviewers can be subagents or
-   separate CLI sessions; a second pass in the author's existing context does
-   not meet this workflow's review requirement.
-4. Both reviewers return reports without modifying the PR. The implementing
-   agent fixes genuine in-scope findings, runs the relevant tests, and pushes.
-   Record a concrete reason for declining a finding; a bare acknowledgement or
-   promise is not a resolution. The appropriate reviewer must settle the
-   disposition. Unrelated improvements remain outside this PR.
-5. After a push, both final records must name the new head. Follow-up reviews
-   verify fixes and new changes, preserving already settled decisions. Do not
-   restart discovery over unchanged code. Work within the issue's assigned
-   deadline and turn budget; if review cannot converge, retain reports and
-   work, identify the exact blocker, and leave the PR draft. Never manufacture
-   a clean verdict to exhaust a loop.
-6. Assemble the completion record below, publish it with the trusted helper,
-   and mark the PR ready. Required CI must pass on the current head before the
-   gate approves. Sortie then uses its existing automerge implementation and
-   repository protections; the implementing agent never merges.
-7. A CI failure, review finding, or merge conflict resumes the same issue and
-   PR. New commits invalidate old records. With no new evidence, no additional
-   review model call, reply, commit, or push is required.
+   Implement the assigned scope and named regressions. Infrastructure issues
+   may change the controller/runner files explicitly in scope; ordinary product
+   tasks do not gain authority over dispatch or approval policy.
+2. Commit and push on `sortie-lab/<issue>`, then create/reuse a draft PR. Include
+   `Closes #<issue>`, the concrete behavior change, and verification evidence.
+   Task checkouts use local Git configuration to route credentials through
+   `gh`; no global credential change is needed.
+3. Once implementation and local checks are ready, run `gh pr ready`. Hand off
+   immediately using the trusted helper; do not keep an agent waiting for CI:
 
-Only run checks needed by the change and its issue. Retain the repository's
-required checks; do not weaken or skip them. Product tests own their daemon
-state. In allocated VMs, builds use controller limits rather than gating
-through the binary under test. Source and review reports must survive worker
-replacement.
+   ```sh
+   python3 "$BUSYBEE_SORTIE_TRUSTED/sortie/reviews.py" handoff \
+     --repo OWNER/REPO --pr NUMBER
+   ```
 
-## Completion record
+   It verifies that the local branch/head matches the pushed, ready PR, then
+   writes `.sortie/scm.json` with `branch`, `sha`, `pushed_at`, `pr_number`,
+   `owner`, and `repo`, followed by `needs-human-review` in `.sortie/status`.
+   That status is Sortie's protocol name; the CI gate supplies the review.
+4. After the current Linux and macOS CI jobs pass, the base-controlled Actions
+   workflow starts two fresh Claude sessions, one per skill. They inspect the
+   full live PR packet and exact candidate tree with only read/search tools.
+   A deterministic publisher validates the structured results and posts a
+   formal GitHub `APPROVE` or `REQUEST_CHANGES` pinned to the reviewed commit.
+5. `BLOCKED` findings reach Sortie's `bot_review` reaction. The same issue and
+   PR resume in the selected implementation runner. Fix valid scoped findings,
+   rerun affected checks, push, and hand off again. Explain declined findings
+   with concrete evidence in an author PR comment; that changes the review
+   inputs and requests follow-up review without requiring an empty commit.
+6. Follow-up reviewers settle prior findings and inspect the new delta while
+   preserving unchanged settled decisions. Both final reports must be `READY`
+   and the latest CI jobs for both platforms must succeed on the current head.
+   Sortie then uses native automerge and the existing repository protections.
+   The implementing agent never merges or bypasses rules.
 
-Write a JSON file under ignored `build/review/`. Copy identity and skill hashes
-from the packet; `base` is the merge-base SHA, so an unrelated advance of the
-base branch does not invalidate an unchanged PR delta. `report` contains the
-reviewer's actual concise reasoning, resolved findings and dispositions, and
-references to durable sanitized evidence where needed.
+A CI failure or merge conflict also resumes the same PR. Unchanged evidence
+requires no new model call, reply, test run, commit, or push. Required checks
+must not be weakened. Product tests own private Pueue/bzbd state; allocated VM
+builds use controller limits instead of the binary under test.
+
+## CI authority, evidence, and bounds
+
+`.github/workflows/agent-review-gate.yml` runs on completed CI, issue comments,
+a five-minute recovery schedule, or a manual dispatch on the default branch.
+It selects only open, ready, same-repository lab PRs whose branch issue is an
+implementation task in the lab milestone. The old product gate skips these
+branches. The workflow and controller execute the triggering default-branch
+SHA; candidate files are read as data and are never executed in the review job.
+
+Each Claude Action has a 20-minute timeout and a 40-turn limit. Claude Code is
+pinned to 2.1.280 with explicit model and effort flags. Restricted mode,
+read/search-only tools, and disabled candidate settings/skills prevent the
+review session from running candidate hooks, tests, or shell commands. Normal
+CI builds the candidate separately. Review jobs have read-only GitHub tokens;
+only a separate deterministic publisher has permission to submit reviews.
+There is no extra model deciding whether another model's prose sounds clean.
+
+The model returns only:
 
 ```json
 {
-  "version": 1,
-  "repo": "OWNER/REPO",
-  "pr": 123,
-  "issue": 72,
   "head": "FULL_HEAD_SHA",
-  "base": "FULL_MERGE_BASE_SHA",
-  "reviews": {
-    "contract-review": {
-      "head": "FULL_HEAD_SHA",
-      "skill_sha256": "HASH_FROM_PACKET",
-      "reviewer": "RUNNER:REVIEW_SESSION_ID",
-      "verdict": "READY",
-      "findings": [],
-      "report": "Contract source, required evidence, and review outcome."
-    },
-    "ponytail-review": {
-      "head": "FULL_HEAD_SHA",
-      "skill_sha256": "HASH_FROM_PACKET",
-      "reviewer": "RUNNER:DIFFERENT_REVIEW_SESSION_ID",
-      "verdict": "READY",
-      "findings": [],
-      "report": "Scoped simplifications and their resolutions, or why no cuts remain."
-    }
-  },
-  "verification": [
-    {
-      "command": "the actual verification command",
-      "result": "passed",
-      "evidence": "Observed outcome and durable evidence reference."
-    }
-  ]
+  "verdict": "READY",
+  "findings": [],
+  "report": "Contract, evidence inspected, and disposition of prior findings."
 }
 ```
 
+`BLOCKED` requires concrete findings. `READY` requires no unresolved findings.
+`UNSURE` must explain missing evidence. The controller adds repository/PR/issue
+identity, the merge-base, trusted skill digests, actual Action session IDs,
+model/effort, input fingerprint, and the run URL. The two session IDs must be
+present and distinct. Author comments and invented model session IDs cannot
+supply review authority.
+
+The sanitized bundle is retained as an Actions artifact for 90 days. Formal
+reviews include both reports, findings, and the run link; raw transcripts and
+credentials are not published as evidence. Reuse is allowed only from this
+workflow's default-branch runs and only for the same head, merge-base, contract,
+PR description, author dispositions, and trusted policy/skills. Bot chatter and
+unrelated advances of the base do not create a fresh review. Expired evidence
+requires a new review. Corrupt newest evidence never falls back to an older
+clean report. Failed model attempts are retained too, preventing an unchanged
+authentication or model failure from becoming a subscription-spending loop.
+
+The publisher rechecks live inputs, head, and both platform jobs. Stale results
+cannot approve a newer head. Missing, malformed, incomplete, or uncertain
+results cannot earn approval. An earlier approval is revoked when the gate
+observes invalidated evidence or failing CI on that head. GitHub's stale-review
+dismissal protects new pushes. VM artifact and full scenario-matrix enforcement
+are delivered by #80; this bootstrap does not imply those checks already exist.
+
+Sortie's human `review_comments` handler excludes bots, so the lab explicitly
+uses `bot_review` for `github-actions[bot]`. Its trusted triage helper re-reads
+live reviews: current `BLOCKED` dispatches fixes, `READY`/`WAITING` and stale
+signals do not waste a continuation, and `UNSURE` or an unreadable gate result
+escalates to `needs-human`. The reaction's continuation cap bounds fix rounds;
+its six-hour watch window covers CI and the two review sessions. An operator
+resolves external authentication/tool failures before retrying with a new
+author comment or new head. Routine code fixes require no human intervention.
+
+## Authentication and activation
+
+Configure repository secret `CLAUDE_CODE_OAUTH_TOKEN` using `claude setup-token`
+from an eligible Claude subscription. Reviews consume that subscription's
+allowance. The Action receives the workflow's `github.token`, so this setup
+does not require installing the Claude GitHub App. Repository Actions settings
+must permit GitHub Actions to create/approve PR reviews. Keep the existing
+required approval and stale-review dismissal rules.
+
+This workflow must first land under the repository's existing approval policy:
+a candidate cannot activate its own gate. After merge, a trusted run verifies
+that the stored OAuth token and approval permissions work end to end. A local
+review or syntax check is not proof that those hosted credentials work.
+
+For manual, read-only inspection, any runner can collect the same packet:
+
 ```sh
-python3 sortie/reviews.py packet --repo OWNER/REPO --pr 123 --issue 72 \
+python3 sortie/reviews.py packet --repo OWNER/REPO --pr NUMBER --issue ISSUE \
   --output build/review/packet.json
-python3 sortie/reviews.py publish --repo OWNER/REPO --pr 123 \
-  --file build/review/completion.json --ready
 ```
-
-In a Sortie task, invoke the copy under `$BUSYBEE_SORTIE_TRUSTED`, which is
-outside the candidate workspace. Review the trusted skills too: an issue that
-changes a skill cannot pass by weakening the skill reviewing itself. New skill
-versions become operational only after their change is merged and a new
-trusted launcher snapshot is selected.
-
-Publishing is the implementing agent's action; the review skills remain
-read-only. The helper adds an author comment with the `busybee-agent-review:v1`
-marker. It does not publish raw transcripts, secrets, or local machine paths.
-The latest such comment from the PR author must come from a repository owner,
-member, or collaborator. Missing, malformed, stale, uncertain, or incomplete
-records cannot earn approval. The gate checks both actual CI platform jobs and
-the trusted skill digests, and rechecks the head before publishing its verdict.
-
-The record is an assertion by a trusted implementation agent, not cryptographic
-proof that a reviewer reasoned correctly. The independent contexts and reports
-make the reasoning inspectable; CI verifies execution. VM artifact and complete
-scenario-matrix enforcement are delivered by lab issue #80, not implied by this
-initial review gate. No additional model judges the wording of a clean record.
 
 ## Runner support
 
-Select one native adapter for each Sortie process. A continuation can move to a
-different runner after the previous session has stopped, using the same branch,
-PR, and durable reports; do not assume native conversation IDs transfer between
-providers.
+Select one native adapter per Sortie process. A continuation may move to another
+runner after the previous session stops, preserving the branch and PR; native
+conversation IDs do not transfer between providers. CI review remains the same.
 
-| Runner | Sortie adapter and command | Readiness |
+| Implementer | Sortie adapter and command | Qualification |
 |---|---|---|
-| Claude | `claude-code`, `claude` | Sortie 1.24 requires `bypassPermissions`; the lab launcher permits it only in an allocated worker. |
-| Codex | `codex`, `codex app-server` | Default for host bootstrap, with workspace sandbox and noninteractive approval policy. |
-| Cursor | `agent-client-protocol`, `agent acp` | Supported by pinned Sortie 1.24.1; unattended tool/permission behavior needs worker qualification. |
+| Claude | `claude-code`, `claude` | Sortie 1.24 requires `bypassPermissions`; launcher restricts this profile to an allocated worker. |
+| Codex | `codex`, `codex app-server` | Host bootstrap default, with workspace sandbox and noninteractive approval policy. |
+| Cursor | `agent-client-protocol`, `agent acp` | Pinned Sortie 1.24.1 supports the adapter; unattended tools and permissions need worker qualification. |
 
 The worker launcher sets `BUSYBEE_SORTIE_WORKER=1` inside its allocated guest.
-Do not set that on a shared host to bypass the environment check. This is an
-execution-profile condition, not a substitute for VM isolation. Any runner can
-use the same skills and completion record from its normal authorized session.
+Do not set it on a shared host to bypass the environment check. Sortie's
+`self_review` uses the author's context and does not replace these CI sessions.
 
-Sortie's built-in `self_review` is not this gate: it uses the author's session
-and does not establish two fresh-context reviews of a committed PR. Keep this
-explicit PR loop. Native adapter configuration and successful authenticated
-execution are distinct checks; validate the selected runtime before dispatch.
-
-Sources: [Sortie adapters](https://docs.sortie-ai.com/reference/workflow-config/),
-[Sortie ACP](https://docs.sortie-ai.com/reference/adapter-agent-client-protocol/),
-[Cursor ACP](https://prod.cursor.com/docs/cli/acp),
-[Codex skills](https://learn.chatgpt.com/docs/build-skills),
-[Claude skills](https://code.claude.com/docs/en/skills), and
-[Cursor skills](https://prod.cursor.com/help/customization/skills).
+Sources: [Claude Actions](https://code.claude.com/docs/en/github-actions),
+[Claude model configuration](https://code.claude.com/docs/en/model-config),
+[GitHub formal reviews](https://docs.github.com/en/rest/pulls/reviews#create-a-review-for-a-pull-request),
+[Sortie workflow and adapters](https://docs.sortie-ai.com/reference/workflow-config/),
+[Sortie reaction triage](https://docs.sortie-ai.com/guides/triage-reactions-before-dispatch/).
