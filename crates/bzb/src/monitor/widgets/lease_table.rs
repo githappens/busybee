@@ -1,8 +1,4 @@
-//! One row per lease bzbd is tracking, running rows first.
-//!
-//! The columns are `busybee status`' columns (`docs/design/bzbd.md`
-//! §Observability) and are formatted by the same helpers, so the table and the
-//! one-shot command cannot drift apart.
+//! One row per lease, running first, formatted by `busybee status`' helpers.
 
 use bzb_core::protocol::LeaseView;
 use ratatui::buffer::Buffer;
@@ -17,9 +13,7 @@ pub struct LeaseTable<'a> {
     pub leases: &'a [LeaseView],
 }
 
-/// Enough for what the columns hold: `running`, `12m34s`, a tool basename, a
-/// class name, `holding 12`. The label takes what is left of the width and is
-/// clipped to it.
+/// Minimum widths; the label takes the rest.
 const WIDTHS: [Constraint; 7] = [
     Constraint::Length(5),
     Constraint::Length(7),
@@ -30,14 +24,8 @@ const WIDTHS: [Constraint; 7] = [
     Constraint::Min(0),
 ];
 
-/// `WIDTHS` with the four columns whose content the monitor does not bound
-/// widened to what is actually on screen: bzbd's lease counter climbs for as
-/// long as the daemon lives, a lease runs for as long as its command does, the
-/// tool is the basename of whatever the caller wrapped, and the token count is
-/// as large as the pool. A clipped id is one the operator would pass to
-/// `busybee cancel` wrong, a clipped duration is a different duration rather
-/// than a shorter one, a clipped tool no longer names what is holding the pool,
-/// and a clipped count is a smaller share of it.
+/// Widens the unbounded columns (id, elapsed, tool, cores) to their content:
+/// clipping any of them changes its meaning.
 fn widths(leases: &[&LeaseView]) -> [Constraint; 7] {
     let mut widths = WIDTHS;
     widths[0] = fit(leases, 5, id);
@@ -47,8 +35,7 @@ fn widths(leases: &[&LeaseView]) -> [Constraint; 7] {
     widths
 }
 
-/// A column is measured in the cells the table draws it in, which is what
-/// `Span::width` counts: a character can fill two of them.
+/// Measured in terminal cells (`Span::width`), since a character can fill two.
 fn fit(leases: &[&LeaseView], least: u16, cell: impl Fn(&LeaseView) -> String) -> Constraint {
     let widest = leases
         .iter()
@@ -73,9 +60,7 @@ impl Widget for LeaseTable<'_> {
             .partition(|lease| lease.state == "running");
         let ordered: Vec<&LeaseView> = running.into_iter().chain(queued).collect();
 
-        // The queue is not bounded by the pool size, so it can hold more leases
-        // than the panel has rows. The table would drop the ones past the last
-        // row without a word; the last row instead says how many it stands for.
+        // The table would silently drop rows past the panel; count them instead.
         let overflows = ordered.len() > area.height as usize;
         let shown = if overflows {
             area.height as usize - 1
@@ -146,8 +131,7 @@ mod tests {
         jobserver.tool = "make".into();
         let mut xcode = lease(1, "running", "static");
         xcode.tool = "xcodebuild".into();
-        // The daemon sends the queued lease last; the widget must not depend on
-        // that, so hand it over first.
+        // Queued first, so the test does not depend on the daemon's order.
         vec![queued, jobserver, xcode]
     }
 
@@ -206,9 +190,6 @@ mod tests {
         assert!(lines[0].contains("#2"), "rows were {lines:?}");
     }
 
-    /// A label is the caller's `--name` and a tool is the basename of whatever
-    /// they wrapped, so either can carry an escape sequence. Cells are one row
-    /// of a redrawn TUI; a raw escape in one would rewrite the rest of it.
     #[test]
     fn a_control_character_in_a_label_is_shown_as_its_escape() {
         let mut leases = vec![lease(1, "running", "static")];
@@ -224,9 +205,6 @@ mod tests {
         );
     }
 
-    /// The id column is what `busybee cancel <id>` takes, and bzbd's counter
-    /// keeps going up for as long as the daemon lives: a clipped `#10000` is
-    /// an id the operator would type wrong.
     #[test]
     fn a_lease_id_wider_than_the_column_widens_it() {
         let leases = vec![lease(10_000, "running", "static")];
@@ -235,9 +213,6 @@ mod tests {
         assert!(lines[0].contains("xcodebuild") || lines[0].contains("cargo"));
     }
 
-    /// A column is measured in terminal cells, and the basename is not bound to
-    /// ASCII: a wide character takes two cells, so counting scalar values would
-    /// hand the tool half the room it draws in and clip it again.
     #[test]
     fn a_tool_of_wide_characters_is_measured_in_cells() {
         let mut leases = vec![lease(1, "running", "static")];
@@ -245,8 +220,7 @@ mod tests {
 
         let lines = draw(&leases, 90, 1);
 
-        // A wide character owns two cells and the second reads back blank, so
-        // the tool comes out of the buffer interleaved with the cells it fills.
+        // The second cell of a wide character reads back blank.
         assert!(
             lines[0].contains("ビ ル ド ラ ン ナ ー"),
             "row was {:?}",
@@ -255,9 +229,6 @@ mod tests {
         assert!(lines[0].contains("static"), "row was {:?}", lines[0]);
     }
 
-    /// The tool is the basename of whatever the caller wrapped, so it is as
-    /// long as they made it, and an explicit `--name` means the label does not
-    /// carry it either: clipped, the row no longer says what is running.
     #[test]
     fn a_tool_wider_than_the_column_widens_it() {
         let mut leases = vec![lease(1, "running", "static")];
@@ -273,9 +244,6 @@ mod tests {
         assert!(lines[0].contains("lease 1"), "row was {:?}", lines[0]);
     }
 
-    /// A lease can run for hours, and the elapsed time is the column the
-    /// observability contract names: `1000m00s` clipped to `1000m0` is a
-    /// different duration, not a shorter one.
     #[test]
     fn an_elapsed_time_wider_than_the_column_widens_it() {
         let mut leases = vec![lease(1, "running", "static")];
@@ -286,9 +254,6 @@ mod tests {
         assert!(lines[0].contains("1000m00s"), "row was {:?}", lines[0]);
     }
 
-    /// The pool is as wide as the jobserver lets it be, so a lease can hold a
-    /// four-digit count: `holding 4096` clipped to `holding 409` reads as a
-    /// tenth of the pool rather than all of it.
     #[test]
     fn a_token_count_wider_than_the_column_widens_it() {
         let mut leases = vec![lease(1, "running", "static")];
@@ -300,9 +265,6 @@ mod tests {
         assert!(lines[0].contains("lease 1"), "row was {:?}", lines[0]);
     }
 
-    /// The queue is not bounded by the pool, so it can be longer than the panel
-    /// is tall. Rows that do not fit are dropped by the table itself; saying how
-    /// many keeps the count on screen honest.
     #[test]
     fn leases_that_do_not_fit_are_counted_in_a_final_row() {
         let leases: Vec<LeaseView> = (1..=20).map(|id| lease(id, "queued", "static")).collect();
@@ -314,7 +276,6 @@ mod tests {
         assert!(lines[3].contains("17 more"), "rows were {lines:?}");
     }
 
-    /// Every lease fits, so there is nothing to say.
     #[test]
     fn leases_that_all_fit_get_no_overflow_row() {
         let lines = draw(&three(), 90, 5);

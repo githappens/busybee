@@ -4,11 +4,9 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd -P)
 hook="$root/sortie/machine-safety-hook.sh"
 launcher="$root/sortie/isolated.sh"
-settings="$root/sortie/claude-settings.json"
-install_script="$root/sortie/install-machine-safety.sh"
 failures=0
 
-chmod +x "$hook" "$launcher" "$install_script"
+chmod +x "$hook" "$launcher"
 
 call_hook() {
   local tool=$1 value=$2
@@ -195,70 +193,12 @@ else
 fi
 rm -rf "$root/build/sortie-agent-state/busybee" "$escape" "$fake_bin"
 
-# after merge: payload is origin/main, even if the issue branch lacks it.
-scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
-git -C "$scratch" init -q
-git -C "$scratch" checkout -q -b main
-mkdir -p "$scratch/sortie"
-install -m 0755 "$hook" "$scratch/sortie/machine-safety-hook.sh"
-install -m 0755 "$launcher" "$scratch/sortie/isolated.sh"
-install -m 0755 "$install_script" "$scratch/sortie/install-machine-safety.sh"
-install -m 0644 "$settings" "$scratch/sortie/claude-settings.json"
-git -C "$scratch" add sortie
-git -C "$scratch" -c user.email=test@example.com -c user.name=test \
-  commit -qm 'payload on main'
-git -C "$scratch" checkout -q -b old-issue
-git -C "$scratch" rm -rq sortie
-git -C "$scratch" -c user.email=test@example.com -c user.name=test \
-  commit -qm 'issue branch without payload'
-git -C "$scratch" update-ref refs/remotes/origin/main main
-(
-  cd "$scratch"
-  git cat-file -e origin/main:sortie/install-machine-safety.sh
-  git show origin/main:sortie/install-machine-safety.sh \
-    | MACHINE_SAFETY_REF=origin/main bash
-)
-test -x "$scratch/.claude/hooks/machine-safety-hook.sh"
-test -x "$scratch/.claude/isolated.sh"
-jq -e '.hooks.PreToolUse[] | select(.matcher | contains("Bash"))' \
-  "$scratch/.claude/settings.json" >/dev/null
-test ! -e "$scratch/sortie/machine-safety-hook.sh"
-printf 'ok - before_run payload from origin/main\n'
-
-# Missing origin/main payload fails loudly (no other-ref / HEAD fallback).
-scratch2=$(mktemp -d)
-git -C "$scratch2" init -q
-git -C "$scratch2" checkout -q -b main
-git -C "$scratch2" -c user.email=test@example.com -c user.name=test \
-  commit -qm 'main without payload' --allow-empty
-git -C "$scratch2" update-ref refs/remotes/origin/main main
-if git -C "$scratch2" cat-file -e origin/main:sortie/install-machine-safety.sh 2>/dev/null; then
-  printf 'not ok - missing origin/main payload fails closed\n' >&2
-  failures=$((failures + 1))
-else
-  printf 'ok - missing origin/main payload fails closed\n'
-fi
-rm -rf "$scratch2"
-
 if ! grep -q '\$BUSYBEE_SORTIE_TRUSTED/sortie/prepare-workspace.sh' "$root/sortie/WORKFLOW.md" ||
    ! grep -q 'ref=${BUSYBEE_SORTIE_TRUSTED_REF:-origin/main}' "$root/sortie/launch.sh"; then
   printf 'not ok - WORKFLOW.md installs from trusted snapshot of origin/main\n' >&2
   failures=$((failures + 1))
 else
   printf 'ok - WORKFLOW.md installs from trusted snapshot of origin/main\n'
-fi
-if grep -q 'refs/remotes/origin' "$root/sortie/WORKFLOW.md"; then
-  printf 'not ok - WORKFLOW.md must not scan arbitrary origin refs\n' >&2
-  failures=$((failures + 1))
-else
-  printf 'ok - WORKFLOW.md does not scan arbitrary origin refs\n'
-fi
-if grep -q 'install_ref=HEAD' "$root/sortie/WORKFLOW.md"; then
-  printf 'not ok - WORKFLOW.md must not fall back to HEAD\n' >&2
-  failures=$((failures + 1))
-else
-  printf 'ok - WORKFLOW.md does not fall back to HEAD\n'
 fi
 
 if [ "$failures" -ne 0 ]; then

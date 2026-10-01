@@ -1,14 +1,7 @@
 use pueue_lib::task::TaskResult;
 
-/// Maps a pueue `TaskResult` to the process exit code busybee should use
-/// when relaying the task's completion to the caller.
-///
-/// Conventions (matches §7 of the design spec):
-/// - `Success` → 0
-/// - `Failed(n)` → n
-/// - `Killed` → 130 (SIGINT convention)
-/// - `FailedToSpawn(_)` → 127 ("command not found" convention)
-/// - `Errored` / `DependencyFailed` → 1
+/// The single place a pueue `TaskResult` becomes a process exit code.
+/// `Killed` → 130 (SIGINT convention), `FailedToSpawn` → 127 (not found).
 pub fn task_result_to_exit_code(result: &TaskResult) -> i32 {
     match result {
         TaskResult::Success => 0,

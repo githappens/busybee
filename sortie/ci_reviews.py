@@ -91,9 +91,7 @@ def bundle(packet, results):
 
 
 def trigger_allowed(repo):
-    # Public comments and bot events must not spend subscription allowance or
-    # create failure evidence. The next trusted schedule run still reviews any
-    # eligible pending PR. The base Action handles only model execution.
+    # Untrusted events must not spend allowance; the next scheduled run picks the PR up.
     actor = os.environ["GITHUB_ACTOR"]
     if api(f"users/{actor}")["type"] != "User":
         return False
@@ -109,12 +107,7 @@ def select(args):
         candidates = [read_pr(args.repo, args.pr)]
     else:
         candidates = api(f"repos/{args.repo}/pulls?state=open&per_page=100", pages=True)
-    selected = []
-    for pr in candidates:
-        if not reviewable(pr):
-            continue
-        selected.append(pr["number"])
-    output("prs", json.dumps(selected))
+    output("prs", json.dumps([pr["number"] for pr in candidates if reviewable(pr)]))
 
 
 def prepare(args):

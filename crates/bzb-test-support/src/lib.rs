@@ -1,7 +1,6 @@
-//! Fixtures shared by the busybee crates' integration tests.
-//!
-//! Everything here spawns its own daemon in a temporary directory: a test must
-//! never reach the developer's own `pueued` or its `busybee` group.
+//! Fixtures shared by the busybee crates' integration tests. Every daemon runs
+//! in its own temporary directory: a test must never reach the developer's
+//! own `pueued` or its `busybee` group.
 
 pub mod counter;
 
@@ -13,9 +12,7 @@ use std::{
 };
 use tempfile::TempDir;
 
-/// Spawns an isolated `pueued` in a tempdir with its own socket. Kills it on
-/// `Drop`. Tests skip themselves (ignored) when `pueued` is not on PATH — this
-/// keeps `cargo test` green on machines without pueue installed.
+/// An isolated `pueued` in a tempdir with its own socket, killed on `Drop`.
 pub struct PueuedFixture {
     child: Child,
     _tmp: TempDir,
@@ -24,6 +21,7 @@ pub struct PueuedFixture {
 }
 
 impl PueuedFixture {
+    /// `None` when `pueued` is not on `PATH`, so the test skips itself.
     pub fn try_start() -> Option<Self> {
         Self::start_program("pueued", Duration::from_secs(3))
     }
@@ -32,18 +30,13 @@ impl PueuedFixture {
     /// socket. `None` means only "`program` is not on `PATH`"; a program that
     /// starts and never binds panics.
     fn start_program(program: &str, timeout: Duration) -> Option<Self> {
-        if which::which(program).is_err() {
-            eprintln!("{program} not on PATH; skipping integration test");
-            return None;
-        }
         let tmp = TempDir::new().expect("create tempdir");
         let config_path = tmp.path().join("pueue.yml");
         let socket_path = tmp.path().join("pueue.sock");
         let shared_dir = tmp.path().join("shared");
         std::fs::create_dir_all(&shared_dir).unwrap();
 
-        // Minimal pueue 4.x config. Only `shared` keys needed; groups are a
-        // runtime concept, not config.
+        // Minimal pueue 4.x config; groups are runtime state, not config.
         let config = format!(
             r#"shared:
   pueue_directory: {shared}
@@ -56,16 +49,21 @@ impl PueuedFixture {
         );
         std::fs::write(&config_path, config).unwrap();
 
-        let mut child = Command::new(program)
+        let spawned = Command::new(program)
             .arg("--config")
             .arg(&config_path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawn {program}: {e}"));
+            .spawn();
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("{program} not on PATH; skipping integration test");
+                return None;
+            }
+            Err(e) => panic!("spawn {program}: {e}"),
+        };
 
-        // Wait for the socket to appear. A daemon that spawns but never binds
-        // is a broken fixture, not a reason to skip the test.
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if socket_path.exists() {
@@ -86,13 +84,11 @@ impl PueuedFixture {
         );
     }
 
-    /// The daemon's pid, for a test that signals it.
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
 
-    /// Kills the daemon now, for a test about what happens when pueued dies.
-    /// Idempotent: `Drop` kills it again and does not mind.
+    /// Idempotent: `Drop` calls it again.
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -101,8 +97,7 @@ impl PueuedFixture {
 
 impl Drop for PueuedFixture {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.kill();
     }
 }
 
@@ -110,9 +105,8 @@ impl Drop for PueuedFixture {
 mod tests {
     use super::*;
 
-    /// A program that starts and exits without ever binding the socket is a
-    /// broken fixture, not a reason to skip: `start_program` must panic, never
-    /// return `None`. `true` stands in for such a daemon.
+    /// A daemon that never binds is a broken fixture, not a skip. `true`
+    /// stands in for one.
     #[test]
     #[should_panic(expected = "did not create")]
     fn start_program_panics_when_the_daemon_never_binds() {

@@ -1,11 +1,7 @@
-//! `busybee status` end to end, in a temp state directory. The user's daemon is
-//! never touched: every test binds its own socket, or runs its own `bzbd`, and
-//! points the client at it with `BUSYBEE_STATE_DIR`.
-//!
-//! One test runs the real daemon, which is what proves the command works
-//! against what it talks to in production. The rest use a stand-in: the daemon
-//! gives every lease `Class::None` until the classification work lands, so it
-//! cannot yet produce the static and jobserver rows the table is made of.
+//! `busybee status` end to end, against a stand-in socket or a real `bzbd` in a
+//! temp state directory.
+
+mod common;
 
 use std::{
     io::BufRead,
@@ -16,6 +12,7 @@ use std::{
 };
 
 use bzb_core::protocol::{LeaseView, Request, Response, StatusReply, PROTOCOL_VERSION};
+use common::spawn_wedged_daemon;
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -24,8 +21,6 @@ use tokio::{
 
 const BUSYBEE: &str = env!("CARGO_BIN_EXE_busybee");
 
-/// A pool of 18 with a static lease holding 9, a jobserver lease the daemon
-/// estimates at 3, and one queued behind them.
 fn reply() -> StatusReply {
     StatusReply {
         pool_size: 18,
@@ -77,8 +72,7 @@ struct RealBzbd {
 
 impl RealBzbd {
     fn start() -> Self {
-        // Cargo exports the path of `busybee` only, so the daemon is found next
-        // to it — the same place `bzb-core` looks for it when auto-starting.
+        // Cargo exports only `busybee`'s path; bzbd is built beside it.
         let bzbd = Path::new(BUSYBEE)
             .parent()
             .expect("busybee lives in a directory")
@@ -112,8 +106,6 @@ impl RealBzbd {
         self.state.path()
     }
 
-    /// SIGKILL and reap, so the daemon is gone before the caller looks at what
-    /// it left in the state directory.
     fn kill(&mut self) {
         self.child.kill().expect("kill bzbd");
         self.child.wait().expect("reap bzbd");
@@ -236,9 +228,6 @@ async fn the_json_output_is_the_status_reply_the_daemon_sent() {
     assert_eq!(object["approx_in_use"], 3);
 }
 
-/// The stand-in above covers the rendering; this covers the wiring, against the
-/// daemon the command actually talks to. Nothing has been submitted to it, so
-/// it holds no leases and the pool it reports is whole and free.
 #[tokio::test]
 async fn the_real_daemon_answers_the_status_request() {
     let daemon = RealBzbd::start();
@@ -264,9 +253,7 @@ async fn the_real_daemon_answers_the_status_request() {
     );
 }
 
-/// A daemon killed outright cannot unlink its socket, so the file outlives it.
-/// Nothing is listening on it and it held no leases, which is the idle pool the
-/// message describes — the presence of the file is not what decides that.
+/// A stale socket file with nothing listening and no leases is still idle.
 #[tokio::test]
 async fn a_killed_daemon_leaves_a_socket_that_still_reports_an_idle_pool() {
     let mut daemon = RealBzbd::start();
@@ -288,10 +275,6 @@ async fn a_killed_daemon_leaves_a_socket_that_still_reports_an_idle_pool() {
     );
 }
 
-/// `docs/design/bzbd.md` §Failure and recovery: a bzbd that dies leaves its
-/// tasks running — they are pueued's children — and `leases.json` records them.
-/// Nothing is listening, but the pool is not idle, and an agent told that it is
-/// starts more load on top of what is already on the machine.
 #[tokio::test]
 async fn a_daemon_that_died_with_live_leases_is_not_reported_as_an_idle_pool() {
     let state = TempDir::new().expect("create tempdir");
@@ -317,9 +300,6 @@ async fn a_daemon_that_died_with_live_leases_is_not_reported_as_an_idle_pool() {
     assert!(stderr.contains("leases.json"), "stderr was {stderr:?}");
 }
 
-/// A daemon that is listening and failing is not an idle machine. Reporting it
-/// as one would tell the caller the pool is free while bzbd is gating every
-/// command on it.
 #[tokio::test]
 async fn a_daemon_that_hangs_up_mid_handshake_is_reported_as_a_failure() {
     let state = TempDir::new().expect("create tempdir");
@@ -344,30 +324,10 @@ async fn a_daemon_that_hangs_up_mid_handshake_is_reported_as_a_failure() {
     assert!(stderr.contains("bzbd"), "stderr was {stderr:?}");
 }
 
-/// The handshake's own deadline ends at the pong. A daemon that answers it and
-/// then wedges leaves this one-shot command with nothing of its own to give up
-/// on, so the request-and-reply is bounded too.
 #[tokio::test]
 async fn a_daemon_that_never_answers_the_status_request_gives_up() {
     let state = TempDir::new().expect("create tempdir");
-    let listener = UnixListener::bind(state.path().join("bzbd.sock")).expect("bind");
-    tokio::spawn(async move {
-        let (stream, _) = listener.accept().await.expect("accept");
-        let (reader, mut writer) = stream.into_split();
-        let mut lines = BufReader::new(reader).lines();
-        lines.next_line().await.expect("read").expect("a hello");
-        respond(
-            &mut writer,
-            Response::Pong {
-                version: "test".into(),
-                pid: std::process::id(),
-            },
-        )
-        .await;
-        // Handshaken, and from here on silent. Holding the connection open is
-        // the point: nothing answers the `Status` and nothing closes on it.
-        std::future::pending::<()>().await;
-    });
+    spawn_wedged_daemon(&state.path().join("bzbd.sock"));
 
     let started = Instant::now();
     let output = run_status(state.path(), &[]).await;
@@ -386,9 +346,8 @@ async fn a_daemon_that_never_answers_the_status_request_gives_up() {
     assert!(stderr.contains("did not answer"), "stderr was {stderr:?}");
 }
 
-/// No daemon means no pool and nothing being gated, which is a true report and
-/// not a failure. stdout stays empty so a `--json` consumer never mistakes the
-/// message for a reply.
+/// stdout stays empty so a `--json` consumer never mistakes the message for a
+/// reply.
 #[tokio::test]
 async fn a_missing_daemon_reports_an_idle_pool_and_exits_zero() {
     let state = TempDir::new().expect("create tempdir");
@@ -414,9 +373,7 @@ async fn a_missing_daemon_reports_an_idle_pool_and_exits_zero() {
     }
 }
 
-/// `--json` is parsed, not read, so it must stay machine-readable when the
-/// caller happens to be a terminal — a colouring library that switches on
-/// `isatty` would put escape sequences through the middle of the object.
+/// A colouring library switching on `isatty` would corrupt the JSON.
 #[tokio::test]
 async fn the_json_output_carries_no_ansi_escapes_on_a_terminal() {
     let daemon = FakeBzbd::start(reply());
@@ -430,13 +387,9 @@ async fn the_json_output_carries_no_ansi_escapes_on_a_terminal() {
         .spawn()
         .expect("run busybee status --json on a pty");
 
-    // Read while the child runs, on a thread so the fake daemon's task still
-    // gets to answer. Waiting for the child first would race macOS, which
-    // flushes the pty's output queue once the last slave descriptor closes;
-    // `slave` stays open here for the same reason. Holding it open also means
-    // the read never sees EOF, so the line is collected with a deadline rather
-    // than by joining: a `status --json` that printed nothing must fail this
-    // test, not hang it.
+    // Read on a thread while the child runs: macOS flushes the pty's queue
+    // once the last slave fd closes, so `slave` stays open, the read never
+    // sees EOF, and the line is collected with a deadline instead of a join.
     let (send_line, line) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut read = String::new();
@@ -458,8 +411,7 @@ async fn the_json_output_carries_no_ansi_escapes_on_a_terminal() {
     assert_eq!(decoded.pool_size, 18);
 }
 
-/// A pseudo-terminal, as `(master reader, slave)`. The slave is what the child
-/// gets as stdout, which is what makes `isatty` true for it.
+/// `(master reader, slave)`.
 fn openpty() -> (std::io::BufReader<std::fs::File>, std::fs::File) {
     let (mut master, mut slave) = (-1, -1);
     assert_eq!(

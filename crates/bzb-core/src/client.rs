@@ -4,34 +4,42 @@ use std::{
     time::{Duration, Instant},
 };
 
+use pueue_lib::message::{Request, Response};
 use pueue_lib::network::socket::ConnectionSettings;
 use pueue_lib::settings::Settings;
-use pueue_lib::Client;
+pub use pueue_lib::Client;
 use tokio::time::sleep;
 
 use crate::errors::BusybeeError;
 
-/// Connects to a pueued that is expected to be already running, and says so
-/// when it is not. Callers that only read — streaming a task bzbd has already
-/// started — want this: spawning a replacement would give them an empty queue
-/// to read from instead of the reason their pueue configuration disagrees with
-/// the daemon's.
+/// One request/response round trip. pueued's `Failure` becomes
+/// [`BusybeeError::EnqueueRejected`]; every other response is the caller's.
+pub async fn request(client: &mut Client, req: Request) -> Result<Response, BusybeeError> {
+    let io = |e: pueue_lib::Error| BusybeeError::Other(format!("pueue-lib io: {e}"));
+    client.send_request(req).await.map_err(io)?;
+    match client.receive_response().await.map_err(io)? {
+        Response::Failure(msg) => Err(BusybeeError::EnqueueRejected(msg)),
+        other => Ok(other),
+    }
+}
+
+/// Connects to a pueued that must already be running. For readers (streaming
+/// a task bzbd started): a spawned replacement would show them an empty queue
+/// instead of the real problem.
 pub async fn connect() -> Result<Client, BusybeeError> {
     let (settings, socket_path) = settings()?;
     try_connect(&socket_path, &settings).await
 }
 
 /// Connects to pueued, spawning it in the background if the socket is
-/// unreachable. Returns a ready-to-use `Client` (handshake complete).
+/// unreachable.
 pub async fn connect_or_spawn() -> Result<Client, BusybeeError> {
     let (settings, socket_path) = settings()?;
 
-    // Try to connect first; if it works, we're done.
     if let Ok(client) = try_connect(&socket_path, &settings).await {
         return Ok(client);
     }
 
-    // Not reachable — spawn pueued detached and retry for up to 3s.
     spawn_pueued()?;
 
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -48,7 +56,6 @@ pub async fn connect_or_spawn() -> Result<Client, BusybeeError> {
     }
 }
 
-/// Where this process's pueue configuration says the daemon's socket is.
 fn settings() -> Result<(Settings, std::path::PathBuf), BusybeeError> {
     let (settings, _from_file) =
         Settings::read(&None).map_err(|e| BusybeeError::DaemonUnreachable {
@@ -78,8 +85,7 @@ async fn try_connect(socket_path: &Path, settings: &Settings) -> Result<Client, 
 }
 
 fn spawn_pueued() -> Result<(), BusybeeError> {
-    // Spawn pueued in daemonize mode. It picks up PUEUE_CONFIG_PATH if set
-    // (our fixture sets it; in real use the user's default config is fine).
+    // Honours PUEUE_CONFIG_PATH, which the test fixture sets.
     Command::new("pueued")
         .arg("-d")
         .stdout(Stdio::null())

@@ -1,7 +1,4 @@
-//! Lifecycle and wire-protocol tests for the daemon skeleton.
-//!
-//! Every test runs its own `bzbd` in a temp state directory; the user's
-//! instance is never touched.
+//! Daemon lifecycle and wire protocol.
 
 mod common;
 
@@ -39,9 +36,6 @@ async fn ping_reports_the_crate_version_and_the_daemon_pid() {
     }
 }
 
-/// The socket is the daemon's whole control surface, and it lives wherever the
-/// state directory does. Under the usual 022 umask both would otherwise be
-/// readable and connectable by every other user on the machine.
 #[tokio::test]
 async fn the_state_directory_and_the_socket_are_owner_only() {
     let daemon = Fixture::start();
@@ -52,10 +46,7 @@ async fn the_state_directory_and_the_socket_are_owner_only() {
         "the state directory {} is not owner-only",
         daemon.state_dir().display()
     );
-    // The exact mode `docs/design/bzbd.md` names, and it has to hold from the
-    // moment the socket was bound: a chmod afterwards would leave a window in
-    // which any user could connect. An execute bit on a socket means nothing,
-    // so the mask that produces this one drops it too.
+    // The mode the spec names.
     assert_eq!(
         mode(&daemon.socket_path()),
         0o600,
@@ -72,8 +63,6 @@ fn mode(path: &Path) -> u32 {
         & 0o777
 }
 
-/// An idle daemon still has a pool to report: every token is free and no lease
-/// holds one.
 #[tokio::test]
 async fn status_reports_an_untouched_pool_while_no_lease_exists() {
     let daemon = Fixture::start();
@@ -140,9 +129,6 @@ async fn sigterm_removes_the_socket_and_the_pid_file() {
     assert!(daemon.child.wait().expect("wait").success());
 }
 
-/// A line with no newline in sight must not be buffered without limit: the
-/// daemon outlives every client, so one hostile connection would otherwise take
-/// it down with the whole machine's memory.
 #[tokio::test]
 async fn an_oversized_hello_is_rejected_instead_of_buffered() {
     let daemon = Fixture::start();
@@ -155,7 +141,6 @@ async fn an_oversized_hello_is_rejected_instead_of_buffered() {
     );
 }
 
-/// Same limit after the handshake: the request loop reads from the same socket.
 #[tokio::test]
 async fn an_oversized_request_is_rejected_instead_of_buffered() {
     let daemon = Fixture::start();
@@ -168,16 +153,12 @@ async fn an_oversized_request_is_rejected_instead_of_buffered() {
     );
 }
 
-/// A handshake line the daemon accepts. Built from [`PROTOCOL_VERSION`] rather
-/// than written out, so the tests below that only need to get *past* the
-/// handshake keep doing so when the version moves.
 fn hello() -> String {
     format!("{{\"hello\":{PROTOCOL_VERSION}}}\n")
 }
 
-/// Sends `prelude` (discarding one reply per line in it), then a newline-free
-/// line one byte over the limit, and returns the error the daemon answers with.
-/// Panics unless the daemon then closes the connection.
+/// Sends `prelude` (one reply discarded per line), then a newline-free line one
+/// byte over the limit; returns the error and asserts the connection closed.
 async fn oversized_line_error(daemon: &Fixture, prelude: &[u8]) -> String {
     let stream = tokio::net::UnixStream::connect(daemon.socket_path())
         .await
@@ -199,8 +180,6 @@ async fn oversized_line_error(daemon: &Fixture, prelude: &[u8]) -> String {
         .await
         .expect("write an oversized line");
 
-    // A daemon that buffers the line instead of rejecting it never answers, so
-    // this has to fail rather than hang.
     let reply = tokio::time::timeout(Duration::from_secs(3), lines.next_line())
         .await
         .expect("the daemon did not answer within 3s")
@@ -217,10 +196,7 @@ async fn oversized_line_error(daemon: &Fixture, prelude: &[u8]) -> String {
     message
 }
 
-/// The limit binds both directions. Echoing an undecodable request back into
-/// the error message expands it: every quote and backslash costs two bytes
-/// once, then two more when the message is itself JSON-encoded, so a request
-/// that fits would be answered with a line that does not.
+/// Echoing the request back would expand every quote fourfold.
 #[tokio::test]
 async fn the_error_for_an_undecodable_request_stays_within_the_line_limit() {
     let mut request = vec![b'"'; MAX_LINE_BYTES - 1];
@@ -232,9 +208,7 @@ async fn the_error_for_an_undecodable_request_stays_within_the_line_limit() {
     );
 }
 
-/// Serde quotes the input it choked on, so an in-limit line naming an unknown
-/// variant comes back embedded in the error the daemon would otherwise relay
-/// verbatim. The prefix matters more than the offending name.
+/// Serde quotes the variant it choked on into its own error.
 #[tokio::test]
 async fn the_error_for_an_unknown_request_variant_stays_within_the_line_limit() {
     let mut request = vec![b'"'];
@@ -248,20 +222,14 @@ async fn the_error_for_an_unknown_request_variant_stays_within_the_line_limit() 
     );
 }
 
-/// A line that is not UTF-8 breaks the same contract as one that never ends:
-/// `docs/design/bzbd.md` §Components has one message per line and every line
-/// UTF-8. The daemon owes the client the reason, not a connection that drops
-/// without a word — from that, a client cannot tell a protocol error from a
-/// daemon that died.
 #[tokio::test]
 async fn a_request_that_is_not_utf8_gets_an_error_rather_than_a_dropped_connection() {
     let message = bounded_decode_error(b"\xff\xfe not utf-8\n").await;
     assert!(message.contains("utf-8"), "message was {message:?}");
 }
 
-/// Sends `request` to a fresh daemon after the handshake and returns the error
-/// message, having checked that the reply itself stayed inside the frame the
-/// client is willing to read.
+/// Sends `request` after the handshake; returns the error, asserting the reply
+/// fits in a line.
 async fn bounded_decode_error(request: &[u8]) -> String {
     let daemon = Fixture::start();
     let stream = tokio::net::UnixStream::connect(daemon.socket_path())
@@ -291,9 +259,6 @@ async fn bounded_decode_error(request: &[u8]) -> String {
     }
 }
 
-/// The frame ends at the newline. A hello that arrives without one was never
-/// finished, however complete its JSON looks, so the daemon must refuse it
-/// rather than serve a peer whose framing it cannot follow.
 #[tokio::test]
 async fn an_unterminated_hello_is_refused_instead_of_answered() {
     let daemon = Fixture::start();
@@ -352,8 +317,6 @@ async fn a_protocol_version_mismatch_gets_an_error_and_the_connection_closes() {
     );
 }
 
-/// Daemon mode forks; the parent may only exit once the child is serving,
-/// otherwise a client that waited for it still finds no socket.
 #[tokio::test]
 async fn daemonizing_returns_only_once_the_socket_is_serving() {
     let tmp = TempDir::new().expect("create tempdir");
@@ -377,8 +340,6 @@ async fn daemonizing_returns_only_once_the_socket_is_serving() {
     wait_for(&tmp.path().join("bzbd.sock"), false);
 }
 
-/// A daemon that dies after the fork must say why on the caller's stderr; the
-/// forking parent has no other way to report it.
 #[tokio::test]
 async fn a_startup_failure_after_the_fork_reaches_the_caller() {
     let tmp = TempDir::new().expect("create tempdir");
@@ -404,8 +365,7 @@ async fn a_startup_failure_after_the_fork_reaches_the_caller() {
 #[serial_test::serial]
 async fn connect_or_spawn_starts_a_daemon_when_none_is_running() {
     let tmp = TempDir::new().expect("create tempdir");
-    // `connect_or_spawn_bzbd` reads the environment of this process and looks
-    // up `bzbd` on PATH, so both have to be set here.
+    // Process-wide, hence serial.
     std::env::set_var("BUSYBEE_STATE_DIR", tmp.path());
     std::env::set_var("BUSYBEE_CONFIG", isolated_config(tmp.path()));
     std::env::set_var("PATH", Path::new(BZBD).parent().expect("bzbd's directory"));
@@ -419,7 +379,6 @@ async fn connect_or_spawn_starts_a_daemon_when_none_is_running() {
         other => panic!("expected a Pong, got {other:?}"),
     };
 
-    // The spawned daemon is detached, so it has to be stopped explicitly.
     assert_eq!(
         fs::read_to_string(tmp.path().join("bzbd.pid"))
             .expect("read pid file")
@@ -430,10 +389,8 @@ async fn connect_or_spawn_starts_a_daemon_when_none_is_running() {
     wait_for(&tmp.path().join("bzbd.sock"), false);
 }
 
-/// A daemon on its way out unlinks its socket first and keeps the pid-file
-/// lock until its runtime is gone. An auto-spawn landing in that window exits
-/// "already running" without serving, so the client has to spawn again once
-/// the lock is free rather than wait out its deadline on an absent socket.
+/// A departing daemon unlinks its socket before releasing the lock; a spawn in
+/// that window exits "already running", so the client must spawn again.
 #[tokio::test]
 #[serial_test::serial]
 async fn connect_or_spawn_starts_a_daemon_once_a_departing_one_releases_the_lock() {

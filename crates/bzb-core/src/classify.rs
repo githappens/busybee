@@ -1,37 +1,7 @@
-//! Turn a command line into an execution [`Plan`].
-//!
-//! `classify` is a pure function over argv: no IO, no environment access, no
-//! knowledge of the daemon. It answers two questions — which admission class
-//! the command belongs to, and which env/argv edits make the command respect
-//! busybee's core budget — and hands both back as data for the daemon to
-//! apply (see `docs/design/bzbd.md` §Classification).
-//!
-//! # Placeholders
-//!
-//! Neither the jobserver fifo path nor the granted core count is known at
-//! classification time, so emitted values may carry exactly three
-//! placeholders. They are the only substitution points; the daemon replaces
-//! them verbatim when it dispatches the task:
-//!
-//! | placeholder | replaced with |
-//! |---|---|
-//! | `{fifo}` | absolute path of the jobserver fifo |
-//! | `{cores}` | the task's fair share of the pool at admission |
-//! | `{cores-1}` | `max(1, cores - 1)` |
-//!
-//! `{cores}` is a fair share for *every* class, jobserver included. A jobserver
-//! task holds no tokens of its own, but the threads it spawns that do not speak
-//! the protocol (rustc's test harness) still have to be bounded by something,
-//! and the pool size is exactly the wrong number: every concurrently admitted
-//! task would claim all of it.
-//!
-//! # Shape of a plan
-//!
-//! [`Plan::argv`] is the *whole* command line as received, wrappers included,
-//! with any injected tokens appended — the daemon runs it as-is.
-//! [`Plan::env_set`] overwrites, [`Plan::env_append`] appends to whatever the
-//! caller's environment already had (space-separated, no leading space when
-//! the existing value is empty), and [`Plan::env_unset`] removes.
+//! Pure argv → [`Plan`]: the admission class plus the env/argv edits that
+//! keep the command inside its core budget, with `{fifo}`, `{cores}` and
+//! `{cores-1}` placeholders for the daemon to fill. See `docs/design/bzbd.md`
+//! §Classification.
 
 use std::str::FromStr;
 
@@ -75,8 +45,7 @@ const MAKE_REQUIRED_VALUE_LONG_OPTIONS: [&str; 10] = [
 ];
 
 /// How a task is admitted against the token pool. Also the wire form of
-/// `LeaseRequest::class_override`, which is why it serialises as the same
-/// lowercase names `--class` and [`Class::as_str`] use.
+/// `LeaseRequest::class_override`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Class {
@@ -126,11 +95,8 @@ pub enum Inject {
     Cmake,
     /// `MAKEFLAGS`, `CARGO_MAKEFLAGS`, and `RUST_TEST_THREADS`.
     Cargo,
-    /// [`Inject::Cargo`] with the fifo authentication left out: the test-thread
-    /// cap only. What a `cargo` row keeps when an override forces it off the
-    /// pool — those threads take no tokens either way, so without the cap a
-    /// static lease holding `--cores N` would still start the machine's
-    /// default number of them.
+    /// [`Inject::Cargo`] without the fifo: the test-thread cap a `cargo` row
+    /// keeps when forced off the pool.
     CargoCores,
     /// Append `-jobs {cores-1}` to argv.
     Xcodebuild,
@@ -156,10 +122,8 @@ pub struct Rule {
     /// a notice is emitted, and for [`Inject::Xcodebuild`] the injection is
     /// skipped entirely (argv injection would otherwise duplicate the flag).
     pub parallel_flags: Vec<String>,
-    /// Extra variables the row sets, on top of whatever [`Rule::inject`]
-    /// recipe applies. Empty for every built-in row: this is what carries a
-    /// config file's `[overrides]` `env` table, whose values the file cannot
-    /// express as one of the fixed recipes.
+    /// Extra variables on top of [`Rule::inject`]: a config `[overrides]`
+    /// row's `env` table. Empty for built-in rows.
     pub env_set: Vec<(String, String)>,
 }
 
@@ -170,12 +134,9 @@ pub struct Table {
 }
 
 impl Table {
-    /// First row matching `tool` whose `requires` token (if any) is the tool's
-    /// first argument — the position that selects a mode. cmake dispatches on
-    /// it exactly (`--build`, `--install`, `--open`, `-E`), so a `--build`
-    /// anywhere else is another mode's operand (`cmake --install --build`) or
-    /// an argument of a payload command (`cmake -E env ./x --build`), and every
-    /// non-build cmake mode falls through to `none`.
+    /// First row matching `tool` whose `requires` token (if any) is the first
+    /// argument, the position cmake dispatches its mode on: a `--build`
+    /// anywhere else is another mode's operand (`cmake --install --build`).
     pub fn lookup(&self, tool: &str, args: &[String]) -> Option<&Rule> {
         self.rows.iter().find(|row| {
             row.tool == tool
@@ -214,7 +175,7 @@ pub struct Plan {
     pub notices: Vec<String>,
 }
 
-/// The built-in table. `#11` layers user config rows on top of this.
+/// The built-in table; `Config::apply_overrides` layers the file's rows on top.
 pub fn default_table() -> Table {
     fn rule(
         tool: &str,
@@ -294,11 +255,8 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
     let table_class = rule.map_or(Class::None, |r| r.class);
     let class = overrides.class.unwrap_or(table_class);
 
-    // Keep the table's injection when it still makes sense for the effective
-    // class: fifo recipes only suit Jobserver, core-count recipes only suit
-    // Static/None (both hold a fixed number of tokens). A forced jobserver
-    // class always gets the fifo handed to it, which is the only way
-    // `--class jobserver ./build.sh` can do anything.
+    // Fifo recipes only suit Jobserver, core-count recipes only Static/None.
+    // A forced jobserver class always gets the fifo (spec §Classification).
     let table_inject = rule.map_or(Inject::None, |r| r.inject);
     let inject = match (class, table_inject) {
         (Class::Jobserver, Inject::Jobserver | Inject::Cmake | Inject::Cargo) => table_inject,
@@ -307,9 +265,7 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
             Class::Static | Class::None,
             Inject::Xcodebuild | Inject::Go | Inject::Ctest | Inject::Pytest,
         ) => table_inject,
-        // `docs/design/bzbd.md` §Classification: forcing static/none keeps a
-        // core-count injection and drops a fifo one. Cargo's recipe is the one
-        // that carries both, so it degrades rather than disappearing.
+        // Cargo's recipe carries both, so it degrades rather than disappearing.
         (Class::Static | Class::None, Inject::Cargo) => Inject::CargoCores,
         _ => Inject::None,
     };
@@ -337,31 +293,20 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
     };
 
     apply_injection(&mut plan, inject, user_flag.is_some());
-    // Injected before the row's own variables are layered on, so that the
-    // collision guard below covers them too: these two report the bargain the
-    // task was admitted under, and a row that replaced them would describe
-    // itself to the task as something other than what the scheduler booked.
-    // `BUSYBEE_LEASE` is filled at admission (the classifier does not know
-    // the id) and is reserved by name so a row cannot take it either.
+    // Before the row's own variables, so the collision guard covers these.
     plan.env_set
         .push(("BUSYBEE_CLASS".to_string(), class.as_str().to_string()));
     plan.env_set
         .push(("BUSYBEE_CORES".to_string(), "{cores}".to_string()));
-    // A row's own variables ride along with whichever recipe it kept: they are
-    // core counts and tool-specific knobs, so they stay useful under a forced
-    // class the way an injected `GOMAXPROCS` does. What they may not do is
-    // supply the fifo authentication: a row that named a fifo of its own would
-    // keep the class that reserves no tokens while running outside the pool.
-    // Busybee owns every variable it already set, and — for a jobserver task —
-    // every variable the authentication can arrive in, whether the recipe
-    // filled it or not. The dropped value is named.
+    // A row may not replace a variable busybee set, the fifo authentication
+    // of a jobserver task (it would run outside the pool while reserving no
+    // tokens), or `BUSYBEE_LEASE`, which the daemon writes at admission. The
+    // dropped value is named.
     if let Some(rule) = rule {
         for (name, value) in &rule.env_set {
             let taken = plan.env_set.iter().any(|(set, _)| set == name);
             let reserved =
                 class == Class::Jobserver && JOBSERVER_AUTH_VARS.contains(&name.as_str());
-            // The daemon writes `BUSYBEE_LEASE` at admission; a row that set
-            // it here would be overwritten there, which is a silent drop.
             let owned = name == crate::nest::LEASE_ENV;
             if taken || reserved || owned {
                 plan.notices.push(format!(
@@ -381,10 +326,8 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
             "--cores is ignored for jobserver commands; the shared pool rebalances on its own"
                 .to_string(),
         ),
-        // An exclusive lease drains the whole pool by definition
-        // (`Scheduler::drain_target`), so a count cannot be honoured. Left
-        // unset rather than carried, so `busybee status` cannot report a
-        // number nothing acts on.
+        // Exclusive drains the whole pool; left unset so `busybee status`
+        // cannot report a number nothing acts on.
         (Class::None, Some(_)) => plan.notices.push(
             "--cores is ignored for an exclusive command; it holds the whole pool until it ends"
                 .to_string(),
@@ -397,10 +340,8 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
     plan
 }
 
-/// `env NAME=value` operands survive in [`Plan::argv`], and `env` applies them
-/// *after* the daemon has set up the task's environment — so they win. Drop the
-/// edits they would override rather than emitting a plan that provably does not
-/// take effect, and say which ones went.
+/// `env NAME=value` operands in [`Plan::argv`] apply after the daemon's
+/// environment and win, so drop the edits they shadow and say so.
 fn drop_shadowed_env(plan: &mut Plan, assigned: &[&str]) {
     let shadowed = |name: &str| assigned.contains(&name);
 
@@ -484,13 +425,9 @@ fn flag_matches(flag: &str, arg: &str) -> bool {
     !flag.starts_with("--") && !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit())
 }
 
-/// The jobs flag GNU make itself will see, which the plain scan cannot find:
-/// make clusters short options, so `make -ksj8` puts `-j8` in `MAKEFLAGS` and
-/// overrides the injected jobserver just as a standalone `-j8` would. Walking
-/// argv the way getopt does is what keeps the cluster reading honest — `--`
-/// ends the options, and an option whose value is mandatory takes the next
-/// argument as an operand, so it is not a cluster at all (`make -f -kj` builds
-/// a makefile named `-kj`).
+/// The jobs flag GNU make will see, walking argv as getopt does: clusters
+/// (`-ksj8`), `--` ending options, and mandatory values taking the next
+/// argument (`make -f -kj` builds a makefile named `-kj`).
 fn find_make_jobs_flag(args: &[String]) -> Option<&str> {
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -605,8 +542,7 @@ fn unwrap_wrappers(argv: &[String]) -> (String, &[String], Vec<&str>) {
     }
 }
 
-/// The tool a token names, which is what the table is keyed by — and what
-/// `config`'s override keys are matched on, hence the crate visibility.
+/// What the table and `config`'s override keys are matched on.
 pub(crate) fn basename(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
@@ -618,14 +554,10 @@ fn skip_nix(args: &[String]) -> Option<usize> {
     if sub != "develop" && sub != "shell" {
         return None;
     }
-    let at = args
-        .iter()
-        .position(|a| a == "-c" || a == "--command")
-        .unwrap_or(usize::MAX);
-    if at == usize::MAX || at + 1 >= args.len() {
-        return Some(0);
+    match args.iter().position(|a| a == "-c" || a == "--command") {
+        Some(at) if at + 1 < args.len() => Some(at + 1),
+        _ => Some(0),
     }
-    Some(at + 1)
 }
 
 /// `env [NAME=value …] <cmd>`: assignments are skipped, anything else (`-i`,
@@ -641,10 +573,7 @@ fn skip_env(args: &[String]) -> Option<usize> {
         }
         n += 1;
     }
-    if n >= args.len() {
-        return Some(0);
-    }
-    Some(n)
+    Some(if n < args.len() { n } else { 0 })
 }
 
 /// Leading `-flags` of a wrapper, where the flags in `with_value` consume the
@@ -661,10 +590,7 @@ fn skip_flags(args: &[String], with_value: &[&str]) -> Option<usize> {
             1
         };
     }
-    if n >= args.len() {
-        return Some(0);
-    }
-    Some(n)
+    Some(if n < args.len() { n } else { 0 })
 }
 
 #[cfg(test)]
@@ -730,9 +656,6 @@ mod tests {
         assert!(!flag_matches("--jobs", "--jobs="));
     }
 
-    /// `--class jobserver` reaches the fifo injection the same way a
-    /// jobserver row does, so a row's own variables cannot take `MAKEFLAGS`
-    /// from under it there either.
     #[test]
     fn a_forced_jobserver_class_keeps_the_authentication_over_a_rows_own_env() {
         let table = Table {
@@ -765,11 +688,7 @@ mod tests {
         assert!(plan.notices.iter().any(|n| n.contains("MAKEFLAGS")));
     }
 
-    /// `BUSYBEE_CLASS` and `BUSYBEE_CORES` are how a task reports the bargain
-    /// it was admitted under, and `BUSYBEE_LEASE` is how a nested client
-    /// knows not to queue; a row's own variables may not take any of them.
-    /// The first two are injected here; the lease id is filled at admission
-    /// and reserved by name so the collision is still loud.
+    /// `BUSYBEE_LEASE` is filled at admission, so it is reserved by name.
     #[test]
     fn a_rows_own_env_cannot_take_the_busybee_variables() {
         let table = Table {
@@ -825,12 +744,8 @@ mod tests {
         );
     }
 
-    /// `docs/design/bzbd.md` §Classification: forcing static or none off the
-    /// pool "keeps a core-count injection and drops a fifo one". Cargo's
-    /// recipe carries both, and its test threads take no tokens whichever
-    /// class the lease ends up in — so dropping the cap with the
-    /// authentication would let a lease holding `--cores N` still start the
-    /// machine's default number of them.
+    /// Spec §Classification: forcing static/none keeps a core-count injection
+    /// and drops a fifo one; cargo's recipe has both.
     #[test]
     fn forcing_cargo_off_the_pool_keeps_its_test_thread_cap() {
         for class in [Class::Static, Class::None] {
@@ -858,10 +773,6 @@ mod tests {
         }
     }
 
-    /// A count an exclusive lease cannot honour is said out loud rather than
-    /// dropped: `drain_target` gives `Class::None` the whole pool whatever the
-    /// caller asked for, and a request that quietly did something other than
-    /// what was typed is the failure this project calls a silent fallback.
     #[test]
     fn a_cores_count_an_exclusive_lease_cannot_honour_is_announced() {
         let plan = classify(

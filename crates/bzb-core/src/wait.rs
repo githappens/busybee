@@ -1,12 +1,7 @@
-//! The lines a waiting client prints while its lease is queued.
-//!
-//! Pure state machine, no IO and no clock: it is fed the queue positions bzbd
-//! reports and a tick counter, and answers with the line to print, if any.
-//! The wording is `docs/design/bzbd.md` §Client output contract; the caller
-//! prefixes `busybee: ` and writes to stderr.
+//! Pure state machine for the lines a client prints while its lease is queued
+//! (spec §Client output contract); the caller prefixes `busybee: `.
 
-/// Ticks of quiet before the client says it is still there, and the interval
-/// between repeats. The caller ticks once a second, so this is 30 seconds.
+/// Quiet ticks (seconds) before, and between, heartbeats.
 const HEARTBEAT_TICKS: u64 = 30;
 
 #[derive(Debug, Default)]
@@ -21,9 +16,8 @@ impl QueueLines {
         Self::default()
     }
 
-    /// A `Queued` event arrived. The first one announces the position; later
-    /// ones report it only when it moved, so a queue that is not moving stays
-    /// quiet until the heartbeat.
+    /// The first `Queued` event announces the position; later ones only when
+    /// it moved.
     pub fn queued(&mut self, ahead: usize) -> Option<String> {
         let line = match self.last_ahead {
             None => format!("queued ({ahead} ahead)"),
@@ -35,12 +29,9 @@ impl QueueLines {
         Some(line)
     }
 
-    /// A second passed with the lease still queued. Emits the heartbeat once
-    /// the queue has been quiet for [`HEARTBEAT_TICKS`], and every
-    /// [`HEARTBEAT_TICKS`] after that.
+    /// A second passed while queued; heartbeat every [`HEARTBEAT_TICKS`] of
+    /// quiet.
     pub fn tick(&mut self, tick: u64) -> Option<String> {
-        // Nothing has been announced yet, so there is nothing to repeat: the
-        // first `Queued` event has not arrived.
         let ahead = self.last_ahead?;
         self.ticks_since_change += 1;
         if self.ticks_since_change < HEARTBEAT_TICKS
@@ -73,8 +64,7 @@ mod tests {
         assert_eq!(lines.queued(0).as_deref(), Some("0 ahead…"));
     }
 
-    /// bzbd re-notifies every waiting lease whenever the queue changes, so a
-    /// lease whose own position did not move would otherwise repeat itself.
+    /// bzbd re-notifies every waiting lease whenever the queue changes.
     #[test]
     fn a_queue_position_that_did_not_move_stays_quiet() {
         let mut lines = QueueLines::new();
@@ -102,7 +92,6 @@ mod tests {
         );
     }
 
-    /// A position that keeps moving is already reporting itself.
     #[test]
     fn movement_postpones_the_heartbeat() {
         let mut lines = QueueLines::new();
@@ -114,8 +103,6 @@ mod tests {
         assert_eq!(lines.tick(HEARTBEAT_TICKS), None);
     }
 
-    /// Before the first event there is no position to report, and claiming one
-    /// would put a number on the screen that bzbd never said.
     #[test]
     fn nothing_is_said_before_the_first_queued_event() {
         let mut lines = QueueLines::new();

@@ -1,8 +1,4 @@
-//! `--detach` and the `cancel` subcommand that goes with it.
-//!
-//! A detached lease outlives the connection that asked for it, so nothing is
-//! left holding it: Ctrl-C has no client to interrupt, and `busybee cancel
-//! <id>` is the only way to end it early.
+//! `--detach` and `busybee cancel <id>`, the only way to end a detached lease.
 
 use anyhow::{bail, Result};
 use bzb_core::{
@@ -24,9 +20,7 @@ pub async fn run(
         cmd, name, class, cores, true,
     )?))
     .await?;
-    // Far enough to know the lease exists and what to cancel it by. Its pueue
-    // task id only exists once it is admitted, which is not worth waiting for:
-    // that is what `--detach` is asking not to do.
+    // Wait only for the lease id; the pueue task id needs admission.
     loop {
         let line = match conn.events().next().await? {
             Some(LeaseEvent::Queued { id, .. }) => {
@@ -35,8 +29,6 @@ pub async fn run(
             Some(LeaseEvent::Admitted {
                 id, pueue_task_id, ..
             }) => format!("busybee: lease {id} detached (pueue task {pueue_task_id})"),
-            // Loud: the lease is already over, so nothing was detached and
-            // nothing is going to run.
             Some(LeaseEvent::Finished { id, exit_code }) => {
                 bail!("lease {id} ended before it was queued (exit code {exit_code})")
             }

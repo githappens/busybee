@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Core library for bzb — async helpers for talking to pueued, enqueuing tasks, streaming logs, and snapshotting queue state."
+description = "Core library for busybee: the pueued client, the bzbd protocol, and the classification, scheduling and config logic."
 repository = "https://github.com/githappens/busybee"
 homepage = "https://github.com/githappens/busybee"
 keywords = ["queue", "pueue", "scheduler", "task", "async"]
@@ -12,7 +12,6 @@ categories = ["asynchronous", "command-line-utilities"]
 readme = "../../README.md"
 
 [dependencies]
-anyhow.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 pueue-lib.workspace = true
@@ -24,9 +23,7 @@ toml.workspace = true
 
 [dev-dependencies]
 bzb-test-support = { path = "../bzb-test-support" }
-chrono = "0.4"
 serial_test = "3"
-serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 # `test-util` for `#[tokio::test(start_paused = true)]`: tests that assert a
 # timeout fires do it on a paused clock rather than by waiting out the budget.

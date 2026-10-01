@@ -1,9 +1,5 @@
-//! `busybee status [--json]`: one shot of the token pool and the leases bzbd
-//! is tracking, for humans and for agents.
-//!
-//! See `docs/design/bzbd.md` §Observability. The client renders what the
-//! daemon reports and computes nothing of its own beyond `approx_in_use`,
-//! which is arithmetic on the numbers in the reply.
+//! `busybee status [--json]`: one shot of the pool and leases (bzbd.md
+//! §Observability).
 
 use std::{io::ErrorKind, time::Duration};
 
@@ -13,44 +9,37 @@ use bzb_core::{
     protocol::{LeaseView, Request, Response, StatusReply},
 };
 
-/// How long the daemon has to answer, once it has handshaken. The handshake's
-/// own deadline ends at the pong, and this command has none of its own — a
-/// daemon that wedges after it would hold `status` open for as long as it stays
-/// wedged.
+/// Bounds the exchange after the handshake, whose own deadline ends at the pong.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Asks the running daemon for a status and prints it.
-///
-/// Deliberately does not auto-start bzbd the way a lease request does: asking
-/// what the pool is doing should not create the pool, and a daemon that failed
-/// to *start* is a failure to report, not an idle machine. So a socket nothing
-/// is listening on is reported as what it is, and everything else propagates.
-pub async fn run(json: bool) -> Result<()> {
+/// Sends `req` to a running bzbd and returns its reply, or `None` if nothing is
+/// listening. Never starts the daemon; `Response::Error` becomes an error.
+pub(crate) async fn ask_running(req: Request, timeout: Duration) -> Result<Option<Response>> {
     let socket = socket_path()?;
-    // A daemon that answered and then failed the handshake is running, so that
-    // propagates rather than being reported as an idle machine; nothing
-    // listening is `report_absent_daemon`'s to explain.
     let Some(mut conn) = Connection::connect_if_listening(&socket).await? else {
-        return report_absent_daemon();
+        return Ok(None);
     };
-
     let exchange = async {
-        conn.send(Request::Status).await?;
+        conn.send(req).await?;
         conn.recv().await
     };
-    let response = match tokio::time::timeout(REPLY_TIMEOUT, exchange).await {
-        Ok(result) => result?,
+    match tokio::time::timeout(timeout, exchange).await {
+        Ok(Ok(Response::Error { message })) => bail!("bzbd refused the request: {message}"),
+        Ok(result) => Ok(Some(result?)),
         Err(_) => bail!(
-            "bzbd took the status request but did not answer within {} seconds",
-            REPLY_TIMEOUT.as_secs()
+            "bzbd took the request but did not answer within {}s",
+            timeout.as_secs()
         ),
-    };
-    let reply = match response {
-        Response::Status(reply) => reply,
-        Response::Error { message } => bail!("bzbd refused the status request: {message}"),
-        other => bail!("expected a status reply from bzbd, got {other:?}"),
-    };
+    }
+}
 
+/// Deliberately no auto-start: asking about the pool should not create it.
+pub async fn run(json: bool) -> Result<()> {
+    let reply = match ask_running(Request::Status, REPLY_TIMEOUT).await? {
+        None => return report_absent_daemon(),
+        Some(Response::Status(reply)) => reply,
+        Some(other) => bail!("expected a status reply from bzbd, got {other:?}"),
+    };
     println!(
         "{}",
         if json {
@@ -62,19 +51,9 @@ pub async fn run(json: bool) -> Result<()> {
     Ok(())
 }
 
-/// What to report when nothing is listening on the socket.
-///
-/// No daemon usually means no pool, no leases and nothing being gated, which is
-/// what the message says: it is a true report, not a degraded one, and it goes
-/// to stderr like every other busybee message so a `--json` consumer sees an
-/// empty stdout rather than an invented reply — an all-zero `StatusReply` is
-/// indistinguishable from a real idle pool.
-///
-/// A daemon that *died* is the exception. Its tasks are pueued's children and
-/// keep running (`docs/design/bzbd.md` §Failure and recovery), and `leases.json`
-/// is the record of them it left behind. Leases in that file are load on the
-/// machine this command cannot report on, so it says so and exits non-zero
-/// rather than calling the pool idle and inviting more.
+/// Nothing listening is an idle pool, unless a dead daemon left leases in
+/// `leases.json`: their tasks may still run under pueued (bzbd.md §Failure and
+/// recovery), so that is an error, not "idle".
 fn report_absent_daemon() -> Result<()> {
     let recorded = recorded_leases()?;
     if recorded > 0 {
@@ -88,16 +67,13 @@ fn report_absent_daemon() -> Result<()> {
     Ok(())
 }
 
-/// How many leases the daemon recorded in `leases.json`, for a caller that
-/// found nothing listening. A record that cannot be read is an error, not a
-/// zero: it is the only evidence of what a dead daemon left running.
+/// Leases recorded in `leases.json`. Unreadable is an error, not zero: it is
+/// the only evidence of what a dead daemon left running.
 pub(crate) fn recorded_leases() -> Result<usize> {
     let path = leases_path()?;
     let recorded: Vec<serde_json::Value> = match std::fs::read(&path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .with_context(|| format!("cannot read the leases bzbd left in {}", path.display()))?,
-        // Never written, or written and cleaned up: either way it records no
-        // leases, which is the same as an empty one.
         Err(e) if e.kind() == ErrorKind::NotFound => Vec::new(),
         Err(e) => bail!(
             "cannot open the leases bzbd left in {}: {e}",
@@ -107,21 +83,18 @@ pub(crate) fn recorded_leases() -> Result<usize> {
     Ok(recorded.len())
 }
 
-/// The reply verbatim plus `approx_in_use`, as one JSON object.
 fn json_line(reply: &StatusReply) -> Result<String> {
     let mut value = serde_json::to_value(reply)?;
     value
         .as_object_mut()
-        // `StatusReply` is a struct, so serde always gives us a map here.
         .expect("a StatusReply serialises as a JSON object")
         .insert("approx_in_use".into(), approx_in_use(reply).into());
     Ok(value.to_string())
 }
 
-/// Tokens neither free nor held by a static lease, so approximately what the
-/// jobserver tasks are using. Clamped at 0: the pool and the fifo are sampled
-/// separately, so a sum over the boundary is drift, not a negative count.
-fn approx_in_use(reply: &StatusReply) -> u32 {
+/// Tokens neither free nor held, i.e. roughly what jobserver tasks use. Clamped
+/// at 0 because the pool and the fifo are sampled separately.
+pub(crate) fn approx_in_use(reply: &StatusReply) -> u32 {
     reply
         .pool_size
         .saturating_sub(reply.free)
@@ -156,12 +129,8 @@ fn row(lease: &LeaseView) -> String {
     )
 }
 
-/// A label is the caller's `--name` and a tool is the basename of the command
-/// they wrapped, i.e. both are arbitrary text. One lease is one row, so a
-/// newline in either must not split the row and an escape sequence must not
-/// rewrite what the terminal has already drawn: control characters are shown as
-/// their escape (`\n`, `\u{1b}`) instead of being sent through. `--json` still
-/// carries them verbatim — a decoder is not a terminal.
+/// Escapes control characters in caller-supplied text (labels, tool names) so
+/// they cannot split a row or drive the terminal.
 pub(crate) fn printable(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {
@@ -174,20 +143,12 @@ pub(crate) fn printable(text: &str) -> String {
     out
 }
 
-/// What the lease is doing with the pool: waiting for it, sharing it, holding
-/// a slice of it, or owning the whole machine.
 pub(crate) fn cores(lease: &LeaseView) -> String {
     match lease.ahead {
         Some(ahead) => format!("{ahead} ahead"),
-        // A jobserver task takes and returns tokens as its compile jobs come
-        // and go, so its count is an estimate the daemon made and is marked as
-        // one. A static task holds exactly what it drained.
+        // A jobserver count is the daemon's estimate.
         None if lease.class == "jobserver" => format!("using ~{}", lease.cores),
-        // A `none` lease is admitted only when nothing else is
-        // (`docs/design/bzbd.md` §Admission policy), so what it holds is the
-        // machine, not a token count. Today it drains nothing, and printing
-        // the resulting "holding 0" beside a pool line counting every token
-        // free would read as a task using none of it.
+        // A `none` lease owns the machine but drains no tokens.
         None if lease.class == "none" => "exclusive".to_string(),
         None => format!("holding {}", lease.cores),
     }
@@ -202,8 +163,6 @@ pub(crate) fn elapsed(ms: u64) -> String {
 mod tests {
     use super::*;
 
-    /// The table itself is asserted column for column in
-    /// `crates/bzb/tests/status.rs`, against a daemon.
     fn reply() -> StatusReply {
         StatusReply {
             pool_size: 18,
@@ -223,9 +182,6 @@ mod tests {
         }
     }
 
-    /// A label is whatever the caller passed to `--name`, so it can carry a
-    /// newline or an escape sequence. One lease is still one row, and the
-    /// terminal above the table is still the caller's.
     #[test]
     fn a_control_character_in_a_label_cannot_break_the_table() {
         let mut reply = reply();
@@ -241,8 +197,6 @@ mod tests {
         );
     }
 
-    /// The tool is the basename of whatever the caller wrapped, so it is the
-    /// caller's text too and can carry the same control characters a label can.
     #[test]
     fn a_control_character_in_a_tool_name_cannot_break_the_table() {
         let mut reply = reply();
@@ -258,9 +212,6 @@ mod tests {
         );
     }
 
-    /// An exclusive lease owns the machine whether or not it drained a token,
-    /// and today it drains none: reporting it as "holding 0" beside a pool line
-    /// that counts every token free reads as a task using nothing.
     #[test]
     fn an_exclusive_lease_is_reported_as_exclusive_not_as_holding_zero() {
         let mut reply = reply();
@@ -275,8 +226,6 @@ mod tests {
         assert!(!rendered.contains("holding"), "rendered {rendered:?}");
     }
 
-    /// The pool and the fifo are sampled separately, so the three numbers can
-    /// cross. A wrapped subtraction would report four billion tokens in use.
     #[test]
     fn approx_in_use_clamps_at_zero() {
         let drifted = StatusReply {
@@ -288,9 +237,6 @@ mod tests {
         assert_eq!(approx_in_use(&drifted), 0);
     }
 
-    /// `--json` is the agent-facing contract: the field names are
-    /// `protocol::StatusReply`'s own, so a consumer can decode the line back
-    /// into the type the daemon sent.
     #[test]
     fn the_json_line_decodes_back_into_a_status_reply() {
         let sent = reply();

@@ -1,8 +1,5 @@
-//! `ensure_busybee_group` against a real, isolated `pueued`.
-//!
-//! `docs/design/bzbd.md` §Components puts the group at `parallel_tasks = 0`:
-//! pueue's dispatcher is bypassed and bzbd decides what runs, so the group must
-//! never hold a task back on its own.
+//! `ensure_busybee_group` against a real, isolated `pueued`; the group sits at
+//! `parallel_tasks = 0` (spec §Components).
 
 use bzb_core::{client, group};
 use bzb_test_support::PueuedFixture;
@@ -10,6 +7,15 @@ use pueue_lib::{
     message::{GroupRequest, ParallelRequest, Request, Response},
     Client,
 };
+
+/// A client to a fresh isolated pueued, or `None` (skip) without pueued.
+/// `PUEUE_CONFIG_PATH` is process-wide, hence `serial` on every caller.
+async fn connected() -> Option<(PueuedFixture, Client)> {
+    let p = PueuedFixture::try_start()?;
+    std::env::set_var("PUEUE_CONFIG_PATH", &p.config_path);
+    let client = client::connect_or_spawn().await.expect("connect");
+    Some((p, client))
+}
 
 async fn parallel_tasks(client: &mut Client) -> usize {
     client
@@ -35,11 +41,9 @@ async fn parallel_tasks(client: &mut Client) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn the_group_is_created_with_pueue_scheduling_disabled() {
-    let Some(p) = PueuedFixture::try_start() else {
+    let Some((_p, mut client)) = connected().await else {
         return;
     };
-    std::env::set_var("PUEUE_CONFIG_PATH", &p.config_path);
-    let mut client = client::connect_or_spawn().await.expect("connect");
 
     group::ensure_busybee_group(&mut client)
         .await
@@ -48,16 +52,12 @@ async fn the_group_is_created_with_pueue_scheduling_disabled() {
     assert_eq!(parallel_tasks(&mut client).await, 0);
 }
 
-/// Every invocation re-enforces the group, so creating one that already exists
-/// has to be a no-op rather than an error.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn ensure_group_is_idempotent() {
-    let Some(p) = PueuedFixture::try_start() else {
+    let Some((_p, mut client)) = connected().await else {
         return;
     };
-    std::env::set_var("PUEUE_CONFIG_PATH", &p.config_path);
-    let mut client = client::connect_or_spawn().await.expect("connect");
     group::ensure_busybee_group(&mut client)
         .await
         .expect("create the group");
@@ -66,18 +66,13 @@ async fn ensure_group_is_idempotent() {
         .expect("create the group again");
 }
 
-/// bzbd admits tasks itself and submits them with `start_immediately`. A limit
-/// someone raised by hand (`pueue parallel -g busybee 4`) would leave pueue
-/// dispatching queued tasks behind bzbd's back, so it is put back on every
-/// invocation.
+/// A hand-raised limit would let pueue dispatch behind bzbd's back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial_test::serial]
 async fn a_hand_set_parallel_limit_is_re_enforced() {
-    let Some(p) = PueuedFixture::try_start() else {
+    let Some((_p, mut client)) = connected().await else {
         return;
     };
-    std::env::set_var("PUEUE_CONFIG_PATH", &p.config_path);
-    let mut client = client::connect_or_spawn().await.expect("connect");
     group::ensure_busybee_group(&mut client)
         .await
         .expect("create the group");

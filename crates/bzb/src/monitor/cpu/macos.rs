@@ -8,7 +8,7 @@ use mach2::traps::mach_task_self;
 use mach2::vm::mach_vm_deallocate;
 use mach2::vm_types::{integer_t, mach_vm_address_t, mach_vm_size_t, natural_t};
 
-// PROCESSOR_CPU_LOAD_INFO = 2 (from <mach/processor_info.h>)
+// From <mach/processor_info.h> and <mach/machine.h>.
 const PROCESSOR_CPU_LOAD_INFO: i32 = 2;
 const CPU_STATE_MAX: usize = 4;
 const CPU_STATE_USER: usize = 0;
@@ -17,10 +17,8 @@ const CPU_STATE_IDLE: usize = 2;
 const CPU_STATE_NICE: usize = 3;
 
 extern "C" {
-    /// Returns a port for the current host; does not need to be deallocated.
     fn mach_host_self() -> mach_port_t;
 
-    /// Retrieves per-processor load information for the host.
     fn host_processor_info(
         host: host_t,
         flavor: i32,
@@ -30,8 +28,7 @@ extern "C" {
     ) -> kern_return_t;
 }
 
-/// Sample per-core CPU tick counters via Mach `host_processor_info`.
-/// Mirrors cpumon's C implementation; see the task context for the reference.
+/// Per-core CPU tick counters via Mach `host_processor_info`.
 pub fn sample() -> Vec<CoreSample> {
     unsafe {
         let host: host_t = mach_host_self();
@@ -63,8 +60,7 @@ pub fn sample() -> Vec<CoreSample> {
             });
         }
 
-        // Return the memory to the kernel via mach_vm_deallocate.
-        // mach_vm_deallocate takes mach_vm_address_t (u64) and mach_vm_size_t (u64).
+        // The kernel allocated `cpu_info` in our address space.
         let _ = mach_vm_deallocate(
             mach_task_self(),
             cpu_info as mach_vm_address_t,

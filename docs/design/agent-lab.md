@@ -5,17 +5,10 @@ disposable Parallels VMs. An agent must be able to reproduce an issue, change
 the code, inspect the running terminal UI, and verify the fix on Linux and
 macOS without asking a person to operate its development environment.
 
-**Status: design for implementation.** Of the controller operations below,
-only the read-only `doctor` preflight has shipped (`scripts/vm/vmctl.py`, with
-its contracts and tests under `scripts/vm/`); every other operation returns an
-explicit `unsupported` result. Template definitions and the remaining commands
-are proposed interfaces, not shipped tooling.
-The initial issue dispatch and skill-review process is implemented in
-[the review workflow](../development/agent-review.md); it does not yet provide
-VM lifecycle or scenario execution.
-The existing build instructions in [CLAUDE.md](../../CLAUDE.md) and the current
-[Sortie workflow](../../sortie/README.md) remain the operational instructions
-until their replacements are implemented and tested.
+**Status: design for implementation.** Only the read-only `doctor` preflight
+(`scripts/vm/vmctl.py`) has shipped; every other operation returns `unsupported`.
+Until the rest lands, [CLAUDE.md](../../CLAUDE.md) and the
+[Sortie workflow](../../sortie/README.md) remain the operational instructions.
 
 This is a development facility, not a runtime dependency of busybee. Broker
 semantics remain defined by [bzbd.md](bzbd.md). A product change that alters
@@ -26,8 +19,8 @@ those semantics must update that specification in the same pull request.
 All project-specific Nix definitions, provisioning scripts, and test scenarios
 live in this repository. The host supplies existing Nix and Parallels
 installations. The workflow must not import a personal configuration repository,
-edit host system configuration, install into the host's global tool profile,
-or run host NixOS or nix-darwin activation. `nix develop` supplies temporary
+edit or activate host system configuration, or install into the host's global
+tool profile. `nix develop` supplies temporary
 controller tooling; normal Nix store and cache writes are expected.
 
 The public repository contains generic configuration and examples. Actual VM
@@ -41,7 +34,7 @@ configuration must not appear in committed files or published run artifacts.
 | Host controller | Parallels lifecycle, resource limits, deadlines, source transfer, and artifact retention. |
 | Agent | One issue, its branch, and administrative control inside its assigned worker. |
 | Scenario runner | Reproduction steps, assertions, daemon fixtures, and terminal interaction. |
-| Review and merge runner | CI runs two independent Opus 5.5 high skill reviews and publishes the formal verdict; Sortie routes fixes and merges after current-head evidence and CI pass. |
+| Review and merge runner | The shared [review workflow](../development/agent-review.md). |
 
 An agent may install tools, restart daemons, signal processes, and deliberately
 break its guest while investigating. It operates through a controller that can
@@ -91,8 +84,8 @@ Ansible is not a second source of guest package and service configuration.
 macOS verification starts from a prepared Parallels baseline with Nix, the
 required Apple development tools, and unattended command access. Project tools
 come from the repository's development shell. Routine runs require no
-nix-darwin activation. Any OS setup or consent that requires human interaction
-belongs to baseline preparation and is reported by template validation before
+system-configuration activation. Any OS setup or consent that requires human
+interaction belongs to baseline preparation and is reported by template validation before
 the template becomes eligible for workers.
 
 Template preparation follows this sequence:
@@ -147,11 +140,8 @@ explicit baseline identity rather than whichever snapshot happens to be latest.
 7. **Export and review.** Export commits or a patch, the result manifest, logs,
    and visual evidence. Open or reuse a draft PR explaining the original
    failure, resulting behavior, specification changes, and checks. Mark the
-   implementation ready and hand off to Sortie. After platform CI passes,
-   Actions runs contract-review and ponytail-review in separate Opus 5.5 high
-   sessions and publishes the formal verdict. Sortie resumes the implementer
-   for scoped fixes, tests, and pushes until both reports cover the final head.
-   Follow the shared review workflow linked above; Sortie owns automerge.
+   implementation ready and hand off to Sortie, which follows the shared
+   [review workflow](../development/agent-review.md).
 8. **Continue or dispose.** Review findings, CI failures, or conflicts resume
    the same task with its branch and evidence in a new worker. A settled review
    with unchanged evidence does not launch another judgement. When the task
@@ -183,17 +173,10 @@ CLI usable by different agent runners.
 | `worker reset`, `destroy` | Collect first, then restore the recorded baseline or remove the owned clone. |
 
 The shipped entry point is `python3 scripts/vm/vmctl.py [--json] <operation>`
-inside the project development shell. Local configuration lives in ignored
-`build/vm/local.toml`, copied from `infra/vm/local.example.toml`; its state
-directory must stay inside `build/vm/`. Results follow `busybee.vm.result/v1`:
-an operation, one of the states `success`, `product_failure`,
-`environment_failure`, `timeout`, `cancelled`, `incomplete_collection` or
-`unsupported`, coded findings, and data. Only `success` is a pass; the exit
-status is 0 for success, 3 for an unsupported operation and 1 otherwise.
-Template manifests (`busybee.vm.template/v1`) and worker ownership records
-(`busybee.vm.worker/v1`) are validated by `scripts/vm/contracts.py`. All
-Parallels access goes through `scripts/vm/parallels.py`, which in this revision
-refuses anything other than its read-only queries.
+inside the project development shell, configured by ignored
+`build/vm/local.toml` (copied from `infra/vm/local.example.toml`). Result,
+template and worker schemas and exit codes are documented in
+`scripts/vm/vmctl.py` and `scripts/vm/contracts.py`.
 
 Long commands return a run handle with status, elapsed time, last-output time,
 and artifact locations. Agents can await completion and read output from a byte
@@ -318,43 +301,8 @@ checks. Product fixes follow in their own issue-scoped pull requests.
 ### Implementation issues
 
 [Tracking issue #68](https://github.com/githappens/busybee/issues/68) splits
-these milestones into individually assignable tasks. Each issue specifies its
-scope, exclusions, named tests, and required evidence. GitHub's native
-blocked-by relationships record the dependencies.
-
-[Bootstrap issue #81](https://github.com/githappens/busybee/issues/81) lands the
-portable review skills, CI review gate, and lab dispatch profile before the
-task chain starts.
-
-| Order | Issue | Blocked by |
-|---|---|---|
-| 1 | [#72: controller contracts and read-only preflight](https://github.com/githappens/busybee/issues/72) | #81 |
-| 2 | [#73: pinned NixOS baseline](https://github.com/githappens/busybee/issues/73) | #72 |
-| 3 | [#74: owned worker lifecycle and bounded execution](https://github.com/githappens/busybee/issues/74) | #73 |
-| 4 | [#75: independent deadlines and durable evidence](https://github.com/githappens/busybee/issues/75) | #74 |
-| 5 | [#76: isolated cold and prepared scenarios](https://github.com/githappens/busybee/issues/76) | #75 |
-| 6 | [#77: live terminal control and visual evidence](https://github.com/githappens/busybee/issues/77) | #76 |
-| 7 | [#78: macOS verification](https://github.com/githappens/busybee/issues/78) | #77 |
-| 8 | [#79: issue-agent integration and continuations](https://github.com/githappens/busybee/issues/79) | #78, #71 |
-| 9 | [#80: verification and review evidence gates](https://github.com/githappens/busybee/issues/80) | #79 |
-
-After the bootstrap lands, start with #72 and give the implementing agent this
-design plus its issue.
-Infrastructure work needs an execution profile authorized to modify the
-relevant controller and runner files; the current product-agent workflow
-prohibits changes under `sortie/` and `.github/workflows/`. Creating issues
-does not enable dispatch. Step 8 implements the eligibility and dependency
-checks for VM capabilities while preserving the product-agent boundary. The
-initial lab dispatch profile already checks issue readiness and merged
-dependencies. Its trusted review loop is shared by all supported agent runners.
-
-The separately scoped regressions are
-[#69: startup umask](https://github.com/githappens/busybee/issues/69),
-[#70: pytest and xdist](https://github.com/githappens/busybee/issues/70), and
-[#71: the isolated launcher's Pueue config file](https://github.com/githappens/busybee/issues/71).
-They can proceed using existing development tooling. If fixed before the lab
-is ready, replay their recorded failing base and passing candidate as lab
-acceptance cases rather than duplicating the product work.
+these milestones into individually assignable tasks, with their order and
+blocked-by dependencies, and links the separately scoped product regressions.
 
 ### Initial regression scenarios
 
@@ -382,13 +330,9 @@ Initial scenarios should cover:
   [#48](https://github.com/githappens/busybee/issues/48)).
 
 Integrate with the existing agent runner through the controller interface;
-keep its issue selection and review policy separate from VM lifecycle. Include
-stable handling of already-judged review evidence. The repository-wide CI-owned
-skill reviews and deterministic publisher replace the external wording judge
-for both lab and product PRs, retiring its loop defect tracked in
-[#63](https://github.com/githappens/busybee/issues/63). Ordinary product agents
-must not need to modify the runner, global installation, or template to verify
-their issue.
+keep its issue selection and review policy separate from VM lifecycle. Ordinary
+product agents must not need to modify the runner, global installation, or
+template to verify their issue.
 
 The first implementation preflight must resolve unattended guest access,
 Parallels guest integration, and clone/reset capabilities by exercising them.

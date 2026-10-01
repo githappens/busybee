@@ -6,21 +6,12 @@ acceptance criteria, the specification carries semantics.
 
 ## Agent review workflow
 
-Repository skills live in `skills/contract-review/SKILL.md` and
-`skills/ponytail-review/SKILL.md`. Use these exact files for PR review, regardless
-of the agent runner or identically named personal skills. For ready PRs from
-this repository, CI runs
-both skills in separate Claude Opus 5.5 high sessions and publishes a formal
-review. The implementing agent fixes valid scoped findings, tests, pushes, and
-hands the same PR back to Sortie. Local skill reviews are optional feedback.
-Reviewers remain read-only; author comments do not grant approval.
-The CI evidence and Sortie handoff are defined in
-[`docs/development/agent-review.md`](docs/development/agent-review.md).
-
-For VM infrastructure, also read `docs/design/agent-lab.md`. Infrastructure
-issues may change the controller and runner files explicitly in their scope;
-an ordinary product task must not change dispatch or merge policy. The running
-controller and gate use a trusted revision outside the candidate branch.
+PR review uses exactly `skills/contract-review/SKILL.md` and
+`skills/ponytail-review/SKILL.md`, whatever the runner and regardless of
+identically named personal skills. CI runs both and publishes the formal
+review; the process is [`docs/development/agent-review.md`](docs/development/agent-review.md).
+VM infrastructure work also reads `docs/design/agent-lab.md`; an ordinary
+product task must not change dispatch or merge policy.
 
 ## Code Review Rules
 

@@ -1,13 +1,7 @@
-//! A `busybee` client with daemons of its own: an isolated `pueued` and a
-//! `bzbd` in a temporary state directory.
-//!
-//! `busybee` starts bzbd itself when the socket is unreachable, so no test
-//! spawns one by hand — the auto-start is the path under test. What every test
-//! does is point `BUSYBEE_STATE_DIR` and `PUEUE_CONFIG_PATH` somewhere of its
-//! own, so nothing here can reach a developer's daemon or queue.
+//! A `busybee` client with an isolated `pueued` and state directory; the
+//! client auto-starts its own `bzbd` there.
 
-// Every test binary compiles this module for itself and uses a different part
-// of it, so what one leaves unused another needs.
+// Each test binary uses a different part of this module.
 #![allow(dead_code)]
 
 use std::{
@@ -22,9 +16,9 @@ use bzb_core::{
 };
 use bzb_test_support::PueuedFixture;
 use tempfile::TempDir;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-/// Long enough for a poll tick (1 s) plus the daemons' own latency, short
-/// enough that a task which never runs fails the test instead of hanging it.
+/// A poll tick plus daemon latency, with room to spare.
 pub const PATIENCE: Duration = Duration::from_secs(15);
 
 pub struct Busybee {
@@ -33,18 +27,13 @@ pub struct Busybee {
 }
 
 impl Busybee {
-    /// `None` when `pueued` is not on `PATH`, which is how these tests skip
-    /// themselves outside the dev shell.
+    /// `None` when `pueued` is not on `PATH`, so tests self-skip.
     pub fn start() -> Option<Self> {
         Self::start_on("pool_size = 4\n")
     }
 
-    /// The same, on a configuration of the test's choosing: the pool size is
-    /// pinned rather than left to the core count of whatever runs the tests,
-    /// and the developer's config stays out of it.
     pub fn start_on(config: &str) -> Option<Self> {
         let pueue = PueuedFixture::try_start()?;
-        // bzbd is started by the client, from next to the client's own binary.
         let bzbd = Path::new(env!("CARGO_BIN_EXE_busybee"))
             .parent()
             .expect("the client binary has a directory")
@@ -60,8 +49,6 @@ impl Busybee {
         Some(Self { _pueue: pueue, tmp })
     }
 
-    /// A `busybee` invocation pointed at this test's daemons. The bzbd it
-    /// auto-starts inherits this environment, config file included.
     pub fn cmd(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_busybee"));
         cmd.env("BUSYBEE_STATE_DIR", self.state_dir())
@@ -75,9 +62,7 @@ impl Busybee {
         self.cmd(args).output().expect("run busybee")
     }
 
-    /// Like [`Self::run`], but kills the process and panics if it outlives
-    /// [`PATIENCE`]. Nested gating used to deadlock; a regression must fail
-    /// the test rather than stall the suite.
+    /// Like [`Self::run`], but kills busybee and panics after [`PATIENCE`].
     pub fn run_timed(&self, args: &[&str]) -> Output {
         let mut cmd = self.cmd(args);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -109,9 +94,7 @@ impl Busybee {
         self.state_dir().join("bzbd.sock")
     }
 
-    /// bzbd is started by the client under test, so a test that only spawned
-    /// one has a window in which there is no socket to ask yet. The error is
-    /// returned rather than raised: to the waiters below it is a "not yet".
+    /// Errors are returned, not raised: to the waiters they mean "not yet".
     pub fn status(&self) -> anyhow::Result<StatusReply> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -126,15 +109,12 @@ impl Busybee {
         })
     }
 
-    /// Waits for bzbd to hold `count` leases, or fails saying what it held.
     pub fn wait_for_leases(&self, count: usize) {
         self.wait_for(&format!("{count} lease(s)"), |status| {
             status.leases.len() == count
         });
     }
 
-    /// Waits for a task to be running, which is the point at which bzbd has it
-    /// on the machine rather than merely on the queue.
     pub fn wait_for_a_running_task(&self) {
         self.wait_for("a running task", |status| {
             status.leases.iter().any(|l| l.state == "running")
@@ -144,8 +124,6 @@ impl Busybee {
     pub fn wait_for(&self, what: &str, ready: impl Fn(&StatusReply) -> bool) {
         let deadline = Instant::now() + PATIENCE;
         loop {
-            // Kept for the failure message, so a wait that never reached bzbd
-            // at all says that instead of blaming the condition.
             let why = match self.status() {
                 Ok(status) if ready(&status) => return,
                 Ok(status) => format!("bzbd holds {:?}", status.leases),
@@ -159,9 +137,7 @@ impl Busybee {
 
 impl Drop for Busybee {
     fn drop(&mut self) {
-        // The daemon the client auto-started is in its own session; the pid
-        // file is what is left to find it by. A test that never started one
-        // has no file and nothing to kill.
+        // The auto-started daemon is in its own session; find it by pid file.
         let Ok(pid) = std::fs::read_to_string(self.state_dir().join("bzbd.pid")) else {
             return;
         };
@@ -177,4 +153,22 @@ pub fn stderr(output: &Output) -> String {
 
 pub fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Binds `socket`, answers one handshake, then holds the connection silently.
+pub fn spawn_wedged_daemon(socket: &Path) {
+    let listener = tokio::net::UnixListener::bind(socket).expect("bind");
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let (reader, mut writer) = stream.into_split();
+        let mut lines = tokio::io::BufReader::new(reader).lines();
+        lines.next_line().await.expect("read").expect("a hello");
+        let pong = Response::Pong {
+            version: "test".into(),
+            pid: std::process::id(),
+        };
+        let line = format!("{}\n", serde_json::to_string(&pong).expect("encode"));
+        writer.write_all(line.as_bytes()).await.expect("write");
+        std::future::pending::<()>().await;
+    });
 }

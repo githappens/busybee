@@ -1,15 +1,6 @@
-//! The config file: `~/.config/busybee/config.toml`.
-//!
-//! Every key is optional, so a machine with no file at all runs on
-//! [`Config::defaults`] (see `docs/design/bzbd.md` §Configuration). What the
-//! file can say is pool geometry, the per-class default core count, and rows
-//! that extend or replace the built-in classification table without waiting
-//! for a release.
-//!
-//! Nothing here is applied partially. A file that does not parse, names a key
-//! nobody reads, or carries a value outside its range is refused whole, with
-//! the line it went wrong on: bzbd then refuses to start, and a reload keeps
-//! the configuration it already had.
+//! `~/.config/busybee/config.toml` (spec §Configuration). Every key is
+//! optional; a file that does not parse, has an unknown key or an out-of-range
+//! value is refused whole, naming the line.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -25,42 +16,32 @@ use toml::Spanned;
 use crate::{
     classify::{basename, Class, Inject, Rule, Table},
     errors::BusybeeError,
+    jobserver::MAX_POOL,
     scheduler::Params,
 };
 
-/// Leases admitted at once, when the file does not say.
-pub const DEFAULT_MAX_CONCURRENT: u32 = 4;
-/// How long a static task's token drain may take, when the file does not say.
-pub const DEFAULT_DRAIN_DEADLINE_MS: u64 = 2000;
-/// How long a signalled task has to exit before SIGKILL follows, when the file
-/// does not say.
+const DEFAULT_MAX_CONCURRENT: u32 = 4;
+const DEFAULT_DRAIN_DEADLINE_MS: u64 = 2000;
 pub const DEFAULT_KILL_GRACE_MS: u64 = 1000;
-
-/// Largest pool the fifo can hold at once — the smallest pipe capacity on
-/// macOS and Linux, which is what `jobserver::Jobserver` seeds into.
-const MAX_POOL_SIZE: u32 = 4096;
 const MIN_DRAIN_DEADLINE_MS: u64 = 100;
 const MAX_DRAIN_DEADLINE_MS: u64 = 60_000;
 const MIN_KILL_GRACE_MS: u64 = 100;
 const MAX_KILL_GRACE_MS: u64 = 60_000;
 
-/// The only substitutions the daemon performs on an injected value; see
-/// `docs/design/bzbd.md` §Classification.
+/// The only substitutions the daemon performs (spec §Classification).
 const PLACEHOLDERS: [&str; 3] = ["{cores}", "{cores-1}", "{fifo}"];
 
-/// The effective configuration: what the file said, with every unset key
-/// resolved to its default. `busybee config show` prints exactly this.
+/// The effective configuration, defaults resolved; what `config show` prints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Config {
     pub pool_size: u32,
     pub max_concurrent: u32,
     pub drain_deadline_ms: u64,
-    /// How long a task that was signalled has to exit before SIGKILL follows.
+    /// How long a signalled task has before SIGKILL follows.
     pub kill_grace_ms: u64,
     pub defaults: Defaults,
-    /// Classification rows, keyed by the tool they match. Kept as written so
-    /// `config show` prints the file's own spelling; [`Config::apply_overrides`]
-    /// matches on the basename.
+    /// Keyed as written, so `config show` keeps the file's spelling;
+    /// [`Config::apply_overrides`] matches on the basename.
     pub overrides: BTreeMap<String, Override>,
 }
 
@@ -127,27 +108,21 @@ impl<'de> Deserialize<'de> for StaticDefault {
 #[serde(deny_unknown_fields)]
 pub struct Override {
     pub class: Class,
-    /// Variables to set for the task. Values may carry the placeholders in
-    /// [`PLACEHOLDERS`] and nothing else.
-    // Skipped when empty so `config show` does not print an empty `env` table
-    // under every row that does not have one.
+    /// Values may carry the [`PLACEHOLDERS`] and nothing else.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
 }
 
 impl Config {
-    /// The configuration of a machine with no config file.
     pub fn defaults() -> Result<Self, BusybeeError> {
         Self::parse("", Path::new("<defaults>"))
     }
 
-    /// Reads the file [`Config::path`] names.
     pub fn load() -> Result<Self, BusybeeError> {
         Self::load_from(&Self::path()?)
     }
 
-    /// Reads `path`; a file that is not there is not an error, it is the
-    /// defaults.
+    /// A missing file is the defaults, not an error.
     pub fn load_from(path: &Path) -> Result<Self, BusybeeError> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
@@ -172,7 +147,6 @@ impl Config {
         )
     }
 
-    /// The scheduler's view of this configuration.
     pub fn params(&self) -> Params {
         Params {
             pool_size: self.pool_size,
@@ -186,11 +160,9 @@ impl Config {
     pub fn apply_overrides(&self, table: &mut Table) {
         for (key, over) in &self.overrides {
             let tool = basename(key);
-            // How a tool spells parallelism is not something the file can say,
-            // so it is not something a row replaces either: the notice a
-            // user's own `-j` earns is promised for every tool that has one
-            // (`docs/design/bzbd.md` §Classification), and it outlives the
-            // built-in row that knew the flags.
+            // The file cannot spell parallelism flags, so the replaced row's
+            // are kept: the `-j` notice is promised for every tool that has one
+            // (spec §Classification).
             let parallel_flags = table
                 .rows
                 .iter()
@@ -202,9 +174,8 @@ impl Config {
                 tool: tool.to_string(),
                 requires: None,
                 class: over.class,
-                // A row forced to jobserver still gets the fifo handed to it —
-                // that is the whole point of overriding an opaque script —
-                // while static and none rows carry only what the file sets.
+                // Forcing jobserver on an opaque script is the point of the
+                // override, so it still gets the fifo.
                 inject: match over.class {
                     Class::Jobserver => Inject::Jobserver,
                     Class::Static | Class::None => Inject::None,
@@ -219,88 +190,28 @@ impl Config {
         }
     }
 
-    /// The effective configuration as TOML — what `busybee config show`
-    /// prints, and a file that parses back to the same thing.
+    /// What `config show` prints; parses back to the same config.
     pub fn to_toml(&self) -> Result<String, BusybeeError> {
         toml::to_string_pretty(self)
             .map_err(|err| BusybeeError::Other(format!("cannot render the config: {err}")))
     }
 
     fn parse(text: &str, path: &Path) -> Result<Self, BusybeeError> {
-        /// The file as written: every key optional, and nothing else allowed.
-        /// A key nobody reads is a setting that silently does nothing.
-        ///
-        /// Every value [`Config::validate`] can refuse keeps the [`Spanned`]
-        /// position it was written at, so a refusal names a line the way a
-        /// parse error does. A value that is absent has no span and no way to
-        /// be wrong: it is the default.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Written {
-            #[serde(default)]
-            pool_size: Option<Spanned<u32>>,
-            #[serde(default)]
-            max_concurrent: Option<Spanned<u32>>,
-            #[serde(default)]
-            drain_deadline_ms: Option<Spanned<u64>>,
-            #[serde(default)]
-            kill_grace_ms: Option<Spanned<u64>>,
-            #[serde(default)]
-            defaults: WrittenDefaults,
-            #[serde(default)]
-            overrides: BTreeMap<String, Spanned<WrittenOverride>>,
-        }
-
-        /// [`Override`] as written. Its `env` values keep their own spans:
-        /// written as an expanded `[overrides.<tool>.env]` table an assignment
-        /// sits well below the row header, so the row's span would name a line
-        /// the reader has to search from rather than the one to fix.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct WrittenOverride {
-            class: Class,
-            #[serde(default)]
-            env: BTreeMap<String, Spanned<String>>,
-        }
-
-        /// [`Defaults`] as written. Separate because [`Defaults`] is what the
-        /// daemon and `config show` carry, and a span belongs to neither.
-        #[derive(Deserialize, Default)]
-        #[serde(deny_unknown_fields)]
-        struct WrittenDefaults {
-            #[serde(default)]
-            r#static: Option<Spanned<StaticDefault>>,
-        }
-
         let written: Written = toml::from_str(text)
             .map_err(|err| BusybeeError::Other(format!("{}: {err}", path.display())))?;
-        let spans = Spans {
-            pool_size: written.pool_size.as_ref().map(Spanned::span),
-            max_concurrent: written.max_concurrent.as_ref().map(Spanned::span),
-            drain_deadline_ms: written.drain_deadline_ms.as_ref().map(Spanned::span),
-            kill_grace_ms: written.kill_grace_ms.as_ref().map(Spanned::span),
-            r#static: written.defaults.r#static.as_ref().map(Spanned::span),
-            overrides: written
-                .overrides
-                .iter()
-                .map(|(key, row)| (key.clone(), row.span()))
-                .collect(),
-            env: written
-                .overrides
-                .iter()
-                .flat_map(|(key, row)| {
-                    row.as_ref()
-                        .env
-                        .iter()
-                        .map(move |(name, value)| ((key.clone(), name.clone()), value.span()))
-                })
-                .collect(),
+        let pool_size = match &written.pool_size {
+            Some(n) => *n.get_ref(),
+            None => logical_cores()?,
         };
-        let config = Config {
-            pool_size: match written.pool_size {
-                Some(n) => n.into_inner(),
-                None => logical_cores()?,
-            },
+        written.validate(pool_size).map_err(|refusal| {
+            BusybeeError::Other(format!(
+                "{}: {}",
+                location(path, text, refusal.at),
+                refusal.reason
+            ))
+        })?;
+        Ok(Config {
+            pool_size,
             max_concurrent: written
                 .max_concurrent
                 .map_or(DEFAULT_MAX_CONCURRENT, Spanned::into_inner),
@@ -321,141 +232,145 @@ impl Config {
                 .into_iter()
                 .map(|(key, row)| {
                     let row = row.into_inner();
+                    let env = row
+                        .env
+                        .into_iter()
+                        .map(|(name, value)| (name, value.into_inner()))
+                        .collect();
                     (
                         key,
                         Override {
                             class: row.class,
-                            env: row
-                                .env
-                                .into_iter()
-                                .map(|(name, value)| (name, value.into_inner()))
-                                .collect(),
+                            env,
                         },
                     )
                 })
                 .collect(),
-        };
-        config.validate(&spans).map_err(|refusal| {
-            BusybeeError::Other(format!(
-                "{}: {}",
-                location(path, text, refusal.at),
-                refusal.reason
-            ))
-        })?;
-        Ok(config)
+        })
     }
+}
 
-    /// Ranges and placeholders. Anything refused here would otherwise reach
-    /// the pool or a task as a value it cannot act on.
-    fn validate(&self, spans: &Spans) -> Result<(), Refusal> {
-        if !(1..=MAX_POOL_SIZE).contains(&self.pool_size) {
-            return Err(Refusal::at(
-                &spans.pool_size,
-                format!(
-                    "pool_size must be between 1 and {MAX_POOL_SIZE}, got {}",
-                    self.pool_size
-                ),
-            ));
+/// The file as written: every key optional, unknown keys refused. Values that
+/// [`Written::validate`] can refuse keep their [`Spanned`] position so the
+/// refusal names a line, as a parse error does.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Written {
+    #[serde(default)]
+    pool_size: Option<Spanned<u32>>,
+    #[serde(default)]
+    max_concurrent: Option<Spanned<u32>>,
+    #[serde(default)]
+    drain_deadline_ms: Option<Spanned<u64>>,
+    #[serde(default)]
+    kill_grace_ms: Option<Spanned<u64>>,
+    #[serde(default)]
+    defaults: WrittenDefaults,
+    #[serde(default)]
+    overrides: BTreeMap<String, Spanned<WrittenOverride>>,
+}
+
+/// `env` values keep their own spans: in an expanded `[overrides.<tool>.env]`
+/// table the assignment sits well below the row header.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WrittenOverride {
+    class: Class,
+    #[serde(default)]
+    env: BTreeMap<String, Spanned<String>>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct WrittenDefaults {
+    #[serde(default)]
+    r#static: Option<Spanned<StaticDefault>>,
+}
+
+impl Written {
+    /// Ranges and placeholders. `pool_size` is the effective one, so a core
+    /// count above the cap is refused too. Absent values are defaults and
+    /// cannot be wrong.
+    fn validate(&self, pool_size: u32) -> Result<(), Refusal> {
+        fn refuse<T>(value: &Spanned<T>, reason: String) -> Result<(), Refusal> {
+            Err(Refusal {
+                reason,
+                at: Some(value.span()),
+            })
         }
-        if self.max_concurrent == 0 {
-            return Err(Refusal::at(
-                &spans.max_concurrent,
-                "max_concurrent must be at least 1, got 0".to_string(),
-            ));
+        if !(1..=MAX_POOL).contains(&pool_size) {
+            return Err(Refusal {
+                reason: format!("pool_size must be between 1 and {MAX_POOL}, got {pool_size}"),
+                at: self.pool_size.as_ref().map(Spanned::span),
+            });
         }
-        if !(MIN_DRAIN_DEADLINE_MS..=MAX_DRAIN_DEADLINE_MS).contains(&self.drain_deadline_ms) {
-            return Err(Refusal::at(
-                &spans.drain_deadline_ms,
-                format!(
-                    "drain_deadline_ms must be between {MIN_DRAIN_DEADLINE_MS} and \
-                     {MAX_DRAIN_DEADLINE_MS}, got {}",
-                    self.drain_deadline_ms
-                ),
-            ));
+        if let Some(n) = &self.max_concurrent {
+            if *n.get_ref() == 0 {
+                return refuse(n, "max_concurrent must be at least 1, got 0".to_string());
+            }
         }
-        if !(MIN_KILL_GRACE_MS..=MAX_KILL_GRACE_MS).contains(&self.kill_grace_ms) {
-            return Err(Refusal::at(
-                &spans.kill_grace_ms,
-                format!(
-                    "kill_grace_ms must be between {MIN_KILL_GRACE_MS} and \
-                     {MAX_KILL_GRACE_MS}, got {}",
-                    self.kill_grace_ms
-                ),
-            ));
+        if let Some(ms) = &self.drain_deadline_ms {
+            if !(MIN_DRAIN_DEADLINE_MS..=MAX_DRAIN_DEADLINE_MS).contains(ms.get_ref()) {
+                return refuse(
+                    ms,
+                    format!(
+                        "drain_deadline_ms must be between {MIN_DRAIN_DEADLINE_MS} and \
+                         {MAX_DRAIN_DEADLINE_MS}, got {}",
+                        ms.get_ref()
+                    ),
+                );
+            }
         }
-        if self.defaults.r#static.cores_wanted() == Some(0) {
-            return Err(Refusal::at(
-                &spans.r#static,
-                "defaults.static must be \"fair\" or at least 1, got 0".to_string(),
-            ));
+        if let Some(ms) = &self.kill_grace_ms {
+            if !(MIN_KILL_GRACE_MS..=MAX_KILL_GRACE_MS).contains(ms.get_ref()) {
+                return refuse(
+                    ms,
+                    format!(
+                        "kill_grace_ms must be between {MIN_KILL_GRACE_MS} and \
+                         {MAX_KILL_GRACE_MS}, got {}",
+                        ms.get_ref()
+                    ),
+                );
+            }
+        }
+        if let Some(st) = &self.defaults.r#static {
+            if st.get_ref().cores_wanted() == Some(0) {
+                return refuse(
+                    st,
+                    "defaults.static must be \"fair\" or at least 1, got 0".to_string(),
+                );
+            }
         }
 
         let mut seen: BTreeSet<&str> = BTreeSet::new();
-        for (key, over) in &self.overrides {
-            let row = spans.overrides.get(key).cloned();
+        for (key, row) in &self.overrides {
             // Rows are looked up by basename, so two keys that share one would
             // fight over a single row and the winner would be invisible.
             let tool = basename(key);
             if !seen.insert(tool) {
-                return Err(Refusal::at(
-                    &row,
+                return refuse(
+                    row,
                     format!(
                         "two overrides match the tool {tool:?}; keys are matched on the \
                          basename, so only one of them can have the row"
                     ),
-                ));
+                );
             }
-            for (name, value) in &over.env {
-                check_placeholders(value).map_err(|reason| {
-                    // The assignment's own line, falling back to the row's for
-                    // a config that was not parsed from a file at all.
-                    let at = spans
-                        .env
-                        .get(&(key.clone(), name.clone()))
-                        .cloned()
-                        .or_else(|| row.clone());
-                    Refusal::at(&at, format!("overrides.{key}.env.{name}: {reason}"))
-                })?;
+            for (name, value) in &row.get_ref().env {
+                if let Err(reason) = check_placeholders(value.get_ref()) {
+                    return refuse(value, format!("overrides.{key}.env.{name}: {reason}"));
+                }
             }
         }
         Ok(())
     }
 }
 
-/// Where in the file each value that [`Config::validate`] can refuse was
-/// written. Without it a refusal names the key but not the line, which is the
-/// half of a parse error that makes a typo findable.
-struct Spans {
-    pool_size: Option<Range<usize>>,
-    max_concurrent: Option<Range<usize>>,
-    drain_deadline_ms: Option<Range<usize>>,
-    kill_grace_ms: Option<Range<usize>>,
-    r#static: Option<Range<usize>>,
-    /// Keyed as the file wrote them; the span covers the whole row.
-    overrides: BTreeMap<String, Range<usize>>,
-    /// Each `env` value's own span, keyed by (override key, variable name).
-    /// Separate from the row's because an expanded `[overrides.<tool>.env]`
-    /// table puts the assignment lines away from the row header.
-    env: BTreeMap<(String, String), Range<usize>>,
-}
-
-/// Why a file was refused, and where in it to look.
 struct Refusal {
     reason: String,
     at: Option<Range<usize>>,
 }
 
-impl Refusal {
-    fn at(span: &Option<Range<usize>>, reason: String) -> Self {
-        Refusal {
-            reason,
-            at: span.clone(),
-        }
-    }
-}
-
-/// The file, plus the line to look at when the refusal knows one — the same
-/// "line N" a parse error names.
 fn location(path: &Path, text: &str, at: Option<Range<usize>>) -> String {
     match at {
         Some(span) => format!("{} line {}", path.display(), line_of(text, span.start)),
@@ -463,8 +378,7 @@ fn location(path: &Path, text: &str, at: Option<Range<usize>>) -> String {
     }
 }
 
-/// The 1-based line the byte at `offset` sits on. Counted over bytes rather
-/// than by slicing, so a span the caller got wrong cannot panic here.
+/// 1-based line of byte `offset`; clamped, so a bad span cannot panic.
 fn line_of(text: &str, offset: usize) -> usize {
     text.as_bytes()[..offset.min(text.len())]
         .iter()
@@ -473,9 +387,8 @@ fn line_of(text: &str, offset: usize) -> usize {
         + 1
 }
 
-/// Rejects any `{…}` span that is not one the daemon substitutes: an unknown
-/// one would reach the task verbatim, as a literal `{threads}` where a number
-/// belongs.
+/// Rejects any `{…}` the daemon does not substitute: it would reach the task
+/// verbatim, a literal `{threads}` where a number belongs.
 fn check_placeholders(value: &str) -> Result<(), String> {
     let mut rest = value;
     while let Some(open) = rest.find('{') {
@@ -495,9 +408,7 @@ fn check_placeholders(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Logical cores, the default pool size. Not a guess: a machine whose core
-/// count cannot be read gets an error naming the key to set by hand, because
-/// falling back to 1 would quietly serialise every build on a 64-core box.
+/// The default pool size. No fallback: 1 would quietly serialise every build.
 fn logical_cores() -> Result<u32, BusybeeError> {
     std::thread::available_parallelism()
         .map(|n| n.get() as u32)
@@ -509,36 +420,60 @@ fn logical_cores() -> Result<u32, BusybeeError> {
         })
 }
 
-/// [`Config::path`]'s decision, with the environment passed in so it is
-/// testable without touching the process's own.
+/// [`Config::path`] with the environment passed in, for tests.
 fn path_from(
     busybee_config: Option<OsString>,
     xdg_config_home: Option<OsString>,
     home: Option<OsString>,
 ) -> Result<PathBuf, BusybeeError> {
-    if let Some(path) = busybee_config {
-        // The daemon and the client run from different directories, so a
-        // relative path would give them different files.
+    locate(
+        "config file",
+        ("BUSYBEE_CONFIG", busybee_config),
+        ("XDG_CONFIG_HOME", xdg_config_home),
+        home,
+        ".config",
+        Some("config.toml"),
+    )
+}
+
+/// `$var` outright, else `$xdg/busybee[/leaf]`, else
+/// `$HOME/<home_base>/busybee[/leaf]`. Relative paths are refused (`$var`) or
+/// count as unset (XDG, HOME): client and daemon run from different
+/// directories, and would resolve different files and each auto-start a
+/// daemon of its own.
+pub(crate) fn locate(
+    what: &str,
+    (var, explicit): (&str, Option<OsString>),
+    (xdg_var, xdg): (&str, Option<OsString>),
+    home: Option<OsString>,
+    home_base: &str,
+    leaf: Option<&str>,
+) -> Result<PathBuf, BusybeeError> {
+    if let Some(path) = explicit {
         if !Path::new(&path).is_absolute() {
             return Err(BusybeeError::Other(format!(
-                "BUSYBEE_CONFIG must be an absolute path, got {:?}",
+                "{var} must be an absolute path, got {:?}",
                 Path::new(&path)
             )));
         }
         return Ok(PathBuf::from(path));
     }
-    // The XDG spec says a value that is empty or not absolute counts as unset.
-    if let Some(dir) = xdg_config_home.filter(|d| Path::new(d).is_absolute()) {
-        return Ok(PathBuf::from(dir).join("busybee/config.toml"));
-    }
-    let home = home.filter(|d| Path::new(d).is_absolute()).ok_or_else(|| {
-        BusybeeError::Other(
-            "cannot locate the busybee config file: BUSYBEE_CONFIG is unset and neither \
-                 XDG_CONFIG_HOME nor HOME holds an absolute path"
-                .to_string(),
-        )
-    })?;
-    Ok(PathBuf::from(home).join(".config/busybee/config.toml"))
+    let absolute = |d: &OsString| Path::new(d).is_absolute();
+    let base = match (xdg.filter(absolute), home.filter(absolute)) {
+        (Some(xdg), _) => PathBuf::from(xdg),
+        (None, Some(home)) => PathBuf::from(home).join(home_base),
+        (None, None) => {
+            return Err(BusybeeError::Other(format!(
+                "cannot locate the busybee {what}: {var} is unset and neither \
+                 {xdg_var} nor HOME holds an absolute path"
+            )))
+        }
+    };
+    let dir = base.join("busybee");
+    Ok(match leaf {
+        Some(leaf) => dir.join(leaf),
+        None => dir,
+    })
 }
 
 #[cfg(test)]
@@ -610,9 +545,6 @@ static = "fair"
         assert!(config.overrides.is_empty());
     }
 
-    /// A key nobody reads is a setting that silently does nothing, and the
-    /// user cannot see that from the file. Name the line so the typo is
-    /// findable.
     #[test]
     fn a_misspelled_key_is_refused_with_its_line() {
         let message = error("pool_size = 4\nmax_concurent = 2\n");
@@ -628,10 +560,7 @@ static = "fair"
         assert!(message.contains("line 1"), "message was {message:?}");
     }
 
-    /// A value inside its type but outside its range is as hard to find as a
-    /// typo, so it is refused the same way: the key, and the line it is on.
-    /// The leading blank line puts each offender past line 1, where a message
-    /// that names no line at all cannot pass by accident.
+    /// The leading blank line keeps a message naming no line from passing.
     #[test]
     fn out_of_range_values_are_refused_with_their_line() {
         for (body, key, line) in [
@@ -661,9 +590,6 @@ static = "fair"
         assert!(message.contains("statik"), "message was {message:?}");
     }
 
-    /// The daemon substitutes exactly three placeholders; anything else would
-    /// reach the task verbatim, as a literal `{threads}` where a number
-    /// belongs.
     #[test]
     fn an_unknown_placeholder_in_an_override_env_is_refused() {
         let message = error(
@@ -679,8 +605,6 @@ static = "fair"
         assert!(message.contains("line 3"), "message was {message:?}");
     }
 
-    /// Written as an expanded table, an `env` value sits lines below the row
-    /// header. The line to fix is the assignment's own, not the row's.
     #[test]
     fn an_expanded_env_table_is_refused_at_the_offending_assignment() {
         let message = error(
@@ -706,9 +630,6 @@ static = "fair"
         assert_eq!(config.overrides["mytool"].env.len(), 3);
     }
 
-    /// Rows are looked up by the tool's basename, so two keys that share one
-    /// would fight over the same row and the winner would depend on nothing
-    /// the user can see.
     #[test]
     fn two_keys_with_the_same_basename_are_refused() {
         let message = error(
@@ -717,8 +638,7 @@ static = "fair"
         );
 
         assert!(message.contains("build.sh"), "message was {message:?}");
-        // The line of the second of the two, which is the one that has no row
-        // of its own to take.
+        // The second key's line.
         assert!(message.contains("line 3"), "message was {message:?}");
     }
 
@@ -747,10 +667,6 @@ static = "fair"
         );
     }
 
-    /// The file has no way to spell how a tool writes parallelism, so that is
-    /// not part of what a row replaces: `docs/design/bzbd.md` §Classification
-    /// promises a notice for every user-supplied parallelism flag, and a
-    /// replaced row that lost the built-in scanner would stop earning it.
     #[test]
     fn an_override_keeps_the_replaced_rows_parallelism_flags() {
         let config = load("[overrides]\ncargo = { class = \"jobserver\" }\n").expect("parse");
@@ -770,7 +686,6 @@ static = "fair"
         );
     }
 
-    /// `./build.sh` is what the user types; `classify` looks up the basename.
     #[test]
     fn a_path_shaped_key_matches_the_script_it_names() {
         let config =
@@ -810,10 +725,8 @@ static = "fair"
         );
     }
 
-    /// A jobserver row's `MAKEFLAGS` is how the task reaches the fifo, so it is
-    /// also how the task gets accounted. A row's own `env` may not take that
-    /// key from under it: the task would keep the class that reserves no
-    /// tokens and lose the pool that bounds it.
+    /// The task would keep the class that reserves no tokens and lose the pool
+    /// that bounds it.
     #[test]
     fn override_env_cannot_take_the_jobserver_authentication() {
         let config = load(
@@ -845,11 +758,8 @@ static = "fair"
         );
     }
 
-    /// Cargo reads `CARGO_MAKEFLAGS` in preference to `MAKEFLAGS`, so the
-    /// generic jobserver recipe setting only the latter leaves a gap a row's
-    /// own `env` could fill. Filling it would point the task at a fifo the
-    /// scheduler never handed out, which is the same escape as replacing
-    /// `MAKEFLAGS` outright — a jobserver row owns both keys.
+    /// Cargo prefers `CARGO_MAKEFLAGS` over `MAKEFLAGS`, so a jobserver row
+    /// owns both keys.
     #[test]
     fn override_env_cannot_take_the_cargo_jobserver_authentication() {
         let config = load(
@@ -879,9 +789,6 @@ static = "fair"
         );
     }
 
-    /// `busybee config show` prints what the daemon runs with, so every key is
-    /// there whether the file mentioned it or not, and what it prints has to
-    /// parse back to the same thing.
     #[test]
     fn the_effective_config_round_trips_through_toml() {
         let config = load(EXAMPLE).expect("parse");
@@ -937,9 +844,6 @@ static = "fair"
         assert_eq!(path, std::path::Path::new("/tmp/somewhere/busybee.toml"));
     }
 
-    /// Same reason `BUSYBEE_STATE_DIR` insists on one: the daemon and the
-    /// client run from different directories, so a relative path would give
-    /// them different files.
     #[test]
     fn a_relative_override_is_refused() {
         let err = path_from(Some(OsString::from("config.toml")), None, None)
@@ -963,7 +867,6 @@ static = "fair"
         assert_eq!(path, std::path::Path::new("/xdg/busybee/config.toml"));
     }
 
-    /// The XDG spec says a relative value counts as unset.
     #[test]
     fn a_relative_xdg_config_home_falls_back_to_home() {
         let path = path_from(

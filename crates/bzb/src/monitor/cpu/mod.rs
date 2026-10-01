@@ -1,4 +1,4 @@
-/// Raw tick counters for one CPU core sampled from the kernel.
+/// Raw tick counters for one CPU core.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CoreSample {
     pub user: u64,
@@ -16,7 +16,7 @@ impl CoreSample {
     }
 }
 
-/// Convert a pair of samples (previous, current) into 0–100% usage.
+/// 0–100% usage between two samples.
 pub fn usage_percent(prev: CoreSample, curr: CoreSample) -> u8 {
     let total = curr.total().saturating_sub(prev.total());
     if total == 0 {

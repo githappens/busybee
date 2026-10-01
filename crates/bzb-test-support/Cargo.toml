@@ -9,4 +9,3 @@ publish = false
 
 [dependencies]
 tempfile = "3"
-which = "6"

@@ -1,30 +1,10 @@
-//! The machine-wide CPU token pool: a GNU make 4.4-style fifo jobserver.
+//! The machine-wide CPU token pool: a GNU make 4.4-style fifo jobserver
+//! (`docs/design/bzbd.md` §Jobserver).
 //!
-//! The protocol, in full:
-//!
-//! 1. The pool is a named pipe holding `pool_size` single-byte tokens.
-//! 2. A build joins when its environment carries
-//!    `MAKEFLAGS=--jobserver-auth=fifo:<path>`. An explicit `-j` on the
-//!    build's own command line makes it ignore the pool instead.
-//! 3. Every participant may run one job without a token (the implicit job).
-//! 4. Before starting any further job it reads one byte from the pipe,
-//!    blocking until one is available.
-//! 5. When that job exits it writes the byte back.
-//! 6. Token content is irrelevant (`+`); only counts matter.
-//!
-//! So at most `pool_size + <participants>` jobs run at once, and tokens move
-//! between builds at job granularity with no scheduler involved. Make, ninja
-//! and cargo all speak this dialect.
-//!
-//! The daemon keeps an `O_RDWR | O_NONBLOCK` handle open: the pipe never
-//! reports EOF when the last build exits, and creation never blocks waiting
-//! for a peer. Reads and `FIONREAD` go through a separate read-only handle:
-//! on macOS a fifo is a socket pair and `FIONREAD` on a read-write descriptor
-//! reports the write side, which is always empty. The path carries the
-//! creating pid so a restarted daemon gets a fresh pipe while orphaned builds
-//! keep reading the old one. `MAKEFLAGS` has no quoting, so [`Jobserver::create`]
-//! refuses directories containing whitespace rather than hand out a path
-//! clients would truncate.
+//! The daemon holds an `O_RDWR` handle so the fifo never reports EOF when the
+//! last build exits. Reads and `FIONREAD` use a separate read-only handle: on
+//! macOS a fifo is a socket pair and `FIONREAD` on a read-write descriptor
+//! reports the always-empty write side.
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -36,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Smallest pipe capacity on macOS and Linux; every token must fit at once.
-const MAX_POOL: u32 = 4096;
+pub const MAX_POOL: u32 = 4096;
 
 pub struct Jobserver {
     path: PathBuf,
@@ -45,10 +25,8 @@ pub struct Jobserver {
     fd_rw: File,
     /// Read-only handle for `read` and `FIONREAD`.
     fd_r: File,
-    pool_size: u32,
-    /// Set by [`close`](Self::close), whose caller owns the unlink result;
-    /// `Drop` then neither retries nor reports it a second time.
-    closed: bool,
+    /// Set by [`leave`](Self::leave): `Drop` keeps the fifo.
+    left: bool,
 }
 
 fn open_nonblocking(path: &Path, write: bool) -> io::Result<File> {
@@ -63,8 +41,6 @@ impl Jobserver {
     /// Create `<dir>/jobserver-<pid>` (mode 0600), open it, and seed it with
     /// `pool_size` tokens.
     pub fn create(dir: &Path, pool_size: u32) -> io::Result<Self> {
-        // A configuration error rather than a bug: the pool size comes from
-        // the user, so it is reported, not asserted.
         if pool_size > MAX_POOL {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -111,8 +87,7 @@ impl Jobserver {
             path,
             fd_rw,
             fd_r,
-            pool_size,
-            closed: false,
+            left: false,
         };
         js.release(pool_size)?;
         Ok(js)
@@ -120,15 +95,6 @@ impl Jobserver {
 
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    pub fn pool_size(&self) -> u32 {
-        self.pool_size
-    }
-
-    /// The `MAKEFLAGS` value a build needs to join this pool.
-    pub fn makeflags_value(&self) -> String {
-        format!("--jobserver-auth=fifo:{}", self.path.display())
     }
 
     /// Tokens currently in the pipe (`FIONREAD`). A snapshot: any participant
@@ -215,22 +181,11 @@ impl Jobserver {
         self.acquire(excess, Duration::ZERO)
     }
 
-    /// Unlink the fifo and report failure to do so. Prefer this over `Drop`
-    /// at daemon shutdown: `Drop` can only warn on stderr, and a stale
-    /// `jobserver-<pid>` makes a later process with that pid fail `create`
-    /// with `EEXIST`. The descriptors close when `self` is dropped either way.
-    pub fn close(mut self) -> io::Result<()> {
-        self.closed = true;
-        unlink(&self.path)
-    }
-
-    /// Keep the fifo when `self` is dropped. A daemon shutting down leaves it
-    /// to the builds that hold it open — a recursive make opens the path
-    /// again for every sub-make — and the next daemon's recovery unlinks it
-    /// once they are gone (`docs/design/bzbd.md` §Failure and recovery). The
-    /// descriptors still close with `self`.
+    /// Keep the fifo when `self` is dropped: builds still holding it (a
+    /// recursive make reopens the path per sub-make) keep working, and the
+    /// next daemon's recovery unlinks it (spec §Failure and recovery).
     pub fn leave(&mut self) {
-        self.closed = true;
+        self.left = true;
     }
 }
 
@@ -241,7 +196,7 @@ fn unlink(path: &Path) -> io::Result<()> {
 
 impl Drop for Jobserver {
     fn drop(&mut self) {
-        if self.closed {
+        if self.left {
             return;
         }
         if let Err(e) = unlink(&self.path) {

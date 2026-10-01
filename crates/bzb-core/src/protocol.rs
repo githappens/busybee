@@ -1,10 +1,5 @@
-//! Wire protocol between busybee clients and `bzbd`.
-//!
-//! Newline-delimited JSON over a unix socket: one UTF-8 message per line, no
-//! embedded newlines. The client opens with `{"hello": <protocol_version>}`
-//! and the daemon answers [`Response::Pong`], or [`Response::Error`] when it
-//! does not speak that version. Every line after the handshake is a
-//! [`Request`] from the client and a [`Response`] from the daemon.
+//! Wire protocol between busybee clients and `bzbd`: newline-delimited JSON
+//! over a unix socket, opened by a [`Hello`] handshake (spec §Protocol).
 
 use std::{collections::BTreeMap, io, path::PathBuf};
 
@@ -13,29 +8,12 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 
 use crate::classify::Class;
 
-/// Bumped whenever a change to the types below is not backwards compatible.
-/// The handshake matches it exactly, so a bump is what stops a client and a
-/// daemon from different builds — one of which is still installed while the
-/// other has just been upgraded — from half-understanding each other.
-///
-/// 2: [`LeaseView::tool`], which a version-1 daemon does not send, so a client
-/// left talking to one hears about the mismatch at the handshake instead of
-/// failing to decode its replies.
-///
-/// 3: [`LeaseRequest::detached`]. Neither direction survives the mismatch: a
-/// v2 client's `Submit` no longer decodes, and a v2 daemon ignores the field
-/// and kills a `--detach`ed lease the moment the client leaves.
-///
-/// 4: [`Request::ConfigReload`] and [`Response::ConfigReloaded`], neither of
-/// which a v3 peer can decode — a `busybee config reload` against a daemon
-/// left running across the upgrade would hear "that is not a request" rather
-/// than the mismatch the handshake exists to name.
+/// Bumped on every incompatible change to the types below; the handshake
+/// matches it exactly. 2: `LeaseView::tool`, 3: `detached`, 4: `ConfigReload`.
 pub const PROTOCOL_VERSION: u32 = 4;
 
-/// The longest line either end will read. Anyone who can open the socket could
-/// otherwise stream a newline-free message until the long-lived daemon runs out
-/// of memory; real messages are orders of magnitude smaller than this. It binds
-/// responses too, so a stale or wedged daemon cannot do the same to a client.
+/// The longest line either end will read, so a newline-free stream cannot
+/// exhaust the daemon's (or a client's) memory.
 pub const MAX_LINE_BYTES: usize = 64 * 1024;
 
 /// What one bounded read off a connection produced.
@@ -44,10 +22,8 @@ pub enum Line {
     Text(String),
     /// The peer closed the connection between messages.
     Closed,
-    /// The bytes are not a message and the connection cannot be read past
-    /// them, so the reason is all the peer gets: no newline within
-    /// [`MAX_LINE_BYTES`], a close part-way through a message, or bytes that
-    /// are not UTF-8.
+    /// Over [`MAX_LINE_BYTES`], closed mid-message, or not UTF-8. The
+    /// connection cannot be read past it.
     Malformed(String),
 }
 
@@ -67,17 +43,12 @@ pub async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Li
     } else if line.is_empty() {
         return Ok(Line::Closed);
     } else {
-        // The newline is the frame delimiter: complete-looking JSON that never
-        // got one is a message the peer stopped writing, not one it finished.
+        // Complete-looking JSON without its newline is a truncated write.
         return Ok(Line::Malformed(format!(
             "the connection closed {} bytes into a message with no newline",
             line.len()
         )));
     }
-    // Not an `io::Error`: the read succeeded and the frame ended where it
-    // should. What arrived simply is not a message, which is a protocol error
-    // the peer is owed an answer about — the same answer as any other broken
-    // frame, since the decoder cannot be handed these bytes either.
     match String::from_utf8(line) {
         Ok(text) => Ok(Line::Text(text)),
         Err(e) => Ok(Line::Malformed(format!(
@@ -86,7 +57,6 @@ pub async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> io::Result<Li
     }
 }
 
-/// The client's first line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hello {
     pub hello: u32,
@@ -142,16 +112,10 @@ pub enum Response {
     },
 }
 
-/// The longest message [`Response::error`] will carry. A decoder quotes the
-/// input it choked on, so an error over a line that fit within
-/// [`MAX_LINE_BYTES`] can already be longer than one, and JSON-encoding the
-/// message escapes it again. Cutting the message this far below the limit
-/// leaves room for either expansion; nothing said past a kilobyte of
-/// explanation helps the peer.
+/// Far below [`MAX_LINE_BYTES`]: a decoder error quotes the offending line,
+/// and JSON-encoding escapes it again.
 const MAX_ERROR_MESSAGE_BYTES: usize = 1024;
 
-/// Marks a message [`Response::error`] cut short. Its bytes come out of
-/// [`MAX_ERROR_MESSAGE_BYTES`], not on top of it.
 const ELLIPSIS: char = '…';
 
 impl Response {
@@ -183,15 +147,12 @@ pub struct StatusReply {
 pub struct LeaseView {
     pub id: u64,
     pub label: String,
-    /// Basename of the tool [`crate::classify`] recognised, which is what
-    /// decided the class (see `docs/design/bzbd.md` §Observability). Separate
-    /// from `label`, which is the caller's `--name` when there is one.
+    /// The tool that decided the class; `label` is the caller's `--name`.
     pub tool: String,
     pub class: String,
     pub cores: u32,
-    /// `queued`, `running`, or `orphaned`: running with no client, taken over
-    /// from a daemon that died (`docs/design/bzbd.md` §Failure and recovery),
-    /// so only `busybee cancel` can end it early.
+    /// `queued`, `running`, or `orphaned` (adopted from a dead daemon, no
+    /// client; spec §Failure and recovery).
     pub state: String,
     pub elapsed_ms: u64,
     pub ahead: Option<usize>,
@@ -225,10 +186,6 @@ pub enum LeaseEvent {
 mod tests {
     use super::*;
 
-    /// The newline is the frame delimiter, not decoration: a peer that closes
-    /// after syntactically complete JSON never finished the message. Handing
-    /// it to the decoder anyway would let a truncated write pass for a whole
-    /// one whenever the truncation happened to land on a `}`.
     #[tokio::test]
     async fn a_message_that_ends_without_a_newline_is_a_framing_error() {
         let mut reader = tokio::io::BufReader::new(&br#"{"hello":1}"#[..]);
@@ -249,10 +206,6 @@ mod tests {
         ));
     }
 
-    /// The class vocabulary is closed (`docs/design/bzbd.md` §Lease model
-    /// types the field as `Option<Class>`), so a typo is a wire error the
-    /// client hears about now rather than a string the scheduler has to
-    /// re-validate at admission.
     #[test]
     fn a_class_override_carries_only_a_known_class() {
         let request = LeaseRequest {
@@ -276,8 +229,6 @@ mod tests {
         );
     }
 
-    /// The cap is on the message the peer receives, so the ellipsis has to
-    /// come out of the budget rather than be added on top of it.
     #[test]
     fn a_truncated_error_message_stays_within_the_cap() {
         let Response::Error { message } = Response::error("x".repeat(5000)) else {
@@ -291,13 +242,8 @@ mod tests {
         assert!(message.ends_with('…'), "message was {message:?}");
     }
 
-    /// `tool` was added to [`LeaseView`] after protocol version 1, and a
-    /// version-1 daemon — one still running from before an in-place upgrade —
-    /// sends status replies without it. Making the field optional would leave
-    /// `busybee status` printing a blank tool column against such a daemon
-    /// instead of naming the mismatch, so the field is required and
-    /// [`PROTOCOL_VERSION`] moved with it: the handshake refuses the pairing
-    /// before any reply is decoded.
+    /// `tool` is required rather than optional, so the version bump (not a
+    /// blank column) is what a v1 daemon runs into.
     #[test]
     fn a_lease_view_from_protocol_version_1_does_not_decode() {
         let version_1 = r#"{"id":41,"label":"ui build","class":"static","cores":9,
@@ -315,16 +261,9 @@ mod tests {
         );
     }
 
-    /// [`Request::ConfigReload`] was added after protocol version 3. A
-    /// version-3 daemon — one still running from before an in-place upgrade —
-    /// cannot decode it, and answers the generic "that is not a request" error
-    /// rather than naming the mismatch. The handshake is where that pairing is
-    /// supposed to be refused, and it only refuses it if [`PROTOCOL_VERSION`]
-    /// moved with the variant.
     #[test]
     fn a_config_reload_does_not_decode_against_protocol_version_3() {
-        /// [`Request`] as version 3 spelled it. Nothing reads the payloads —
-        /// it is the set of variants that decides what decodes.
+        /// [`Request`] as version 3 spelled it.
         #[derive(Debug, Deserialize)]
         #[allow(dead_code)]
         enum Version3 {

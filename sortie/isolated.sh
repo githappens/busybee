@@ -33,26 +33,16 @@ state_root=$root/build/sortie-agent-state
 busybee_state=$state_root/busybee
 pueue_state=$state_root/pueue
 
-# Refuse a state directory that physically resolves outside the workspace
-# (for example a symlink to the user's config). mkdir first so the path
-# exists, then resolve it.
+# Refuse a state directory that resolves outside the workspace (for example a
+# symlink to the user's config). A failed cd aborts via set -e.
+root_resolved=$(cd "$root" && pwd -P)
 ensure_workspace_dir() {
-  local dir=$1 resolved root_resolved
-  mkdir -p "$dir"
-  resolved=$(cd "$dir" && pwd -P) || {
-    echo "isolated.sh: cannot resolve $dir" >&2
-    exit 2
-  }
-  root_resolved=$(cd "$root" && pwd -P) || {
-    echo "isolated.sh: cannot resolve workspace root" >&2
-    exit 2
-  }
+  local resolved
+  mkdir -p "$1"
+  resolved=$(cd "$1" && pwd -P)
   case "$resolved" in
     "$root_resolved"|"$root_resolved"/*) ;;
-    *)
-      echo "isolated.sh: $dir resolves outside the workspace" >&2
-      exit 2
-      ;;
+    *) echo "isolated.sh: $1 resolves outside the workspace" >&2; exit 2 ;;
   esac
 }
 
