@@ -5,35 +5,15 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use bzb_core::{
-    daemon::Connection,
-    protocol::{Request, Response, StatusReply},
-};
-use common::Fixture;
+use bzb_core::protocol::{Request, Response};
+use common::{connect, status, Fixture};
 
-/// Sends `ConfigReload` on a fresh connection and returns the daemon's answer.
 async fn reload(daemon: &Fixture) -> Response {
-    let mut conn = Connection::connect(&daemon.socket_path())
-        .await
-        .expect("connect");
+    let mut conn = connect(daemon).await;
     conn.send(Request::ConfigReload)
         .await
         .expect("send a reload request");
     conn.recv().await.expect("recv the reload reply")
-}
-
-/// Asks the daemon what pool it is running on.
-async fn status(daemon: &Fixture) -> StatusReply {
-    let mut conn = Connection::connect(&daemon.socket_path())
-        .await
-        .expect("connect");
-    conn.send(Request::Status)
-        .await
-        .expect("send a status request");
-    match conn.recv().await.expect("recv the status reply") {
-        Response::Status(status) => status,
-        other => panic!("expected a status reply, got {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -57,8 +37,6 @@ async fn a_reload_request_picks_up_the_rewritten_file() {
     }
 }
 
-/// A signal has no reply, so the log is the only place the daemon can say what
-/// it now runs on.
 #[tokio::test]
 async fn sighup_reloads_the_config() {
     let daemon = Fixture::start_on("pool_size = 4\n");
@@ -70,9 +48,6 @@ async fn sighup_reloads_the_config() {
     wait_for_log(&daemon, "pool_size=6");
 }
 
-/// The reply is not the only thing that moves: a reloaded `pool_size` reaches
-/// the scheduler, so the pool `Status` reports is the new one and all of it is
-/// free while nothing holds a lease.
 #[tokio::test]
 async fn a_reloaded_pool_size_reaches_the_scheduler() {
     let daemon = Fixture::start_on("pool_size = 4\n");
@@ -87,8 +62,6 @@ async fn a_reloaded_pool_size_reaches_the_scheduler() {
     assert_eq!(status.free, 6);
 }
 
-/// No partial apply: a file that does not parse leaves the daemon on the
-/// configuration it already had, and the reason names the line to fix.
 #[tokio::test]
 async fn a_malformed_file_is_refused_on_reload_and_the_running_config_stays() {
     let daemon = Fixture::start_on("pool_size = 4\n");
@@ -110,8 +83,6 @@ async fn a_malformed_file_is_refused_on_reload_and_the_running_config_stays() {
     }
 }
 
-/// Running the machine's builds under a configuration the user did not write
-/// is worse than not running them: refuse the file, name the line, exit.
 #[test]
 fn a_malformed_file_stops_the_daemon_from_starting() {
     let tmp = tempfile::tempdir().expect("create tempdir");
@@ -130,11 +101,8 @@ fn a_malformed_file_stops_the_daemon_from_starting() {
     assert!(stderr.contains("pool_size"), "stderr was {stderr:?}");
 }
 
-/// The refusal is the would-be daemon's, not every invocation's. A second
-/// `bzbd` launched while one is already serving starts nothing, so a file that
-/// has gone bad since the first one read it is none of its business: it reports
-/// the running daemon and exits zero, and that daemon stays on the
-/// configuration it started with.
+/// A second `bzbd` that finds one serving starts nothing, so a bad file is
+/// none of its business.
 #[tokio::test]
 async fn a_malformed_file_leaves_the_already_running_path_alone() {
     let daemon = Fixture::start_on("pool_size = 4\n");
@@ -152,13 +120,11 @@ async fn a_malformed_file_leaves_the_already_running_path_alone() {
     assert_eq!(status(&daemon).await.pool_size, 4);
 }
 
-/// Waits up to 3 s for `needle` to show up in the daemon's log.
 fn wait_for_log(daemon: &Fixture, needle: &str) {
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut log = String::new();
     while Instant::now() < deadline {
-        // The daemon opens its log before it binds the socket the fixture
-        // waited for, so a missing one here is a failure, not a race.
+        // The log exists before the socket the fixture waited for.
         log = std::fs::read_to_string(daemon.log_path()).expect("read the log");
         if log.contains(needle) {
             return;

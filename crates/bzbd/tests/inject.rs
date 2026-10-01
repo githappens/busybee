@@ -1,17 +1,9 @@
-//! The injection plan, executed: jobserver tasks get the fifo, static tasks
-//! get tokens drained on their behalf and the count injected, and every task
-//! gets `BUSYBEE_CLASS` / `BUSYBEE_CORES` / `BUSYBEE_LEASE`.
-//!
-//! Real GNU make from the dev shell on a Makefile of `sleep` targets; an
-//! isolated `pueued` and a `bzbd` in a temporary state directory. Each target
-//! creates a marker under `run/`, sleeps, appends the number of markers
-//! present to `counts.log` and removes its marker, so the maximum in
-//! `counts.log` is the peak concurrency make actually reached.
+//! Injection end to end: GNU make on a Makefile of `sleep` targets, an
+//! isolated `pueued`, and the peak concurrency each target logs to `counts.log`.
 
 mod common;
 
 use std::{
-    collections::BTreeMap,
     path::Path,
     process::Command,
     time::{Duration, Instant},
@@ -20,13 +12,11 @@ use std::{
 use bzb_core::{
     classify::Class,
     daemon::Connection,
-    protocol::{LeaseEvent, LeaseRequest, Request, Response, StatusReply},
+    protocol::{LeaseEvent, LeaseRequest, Request, Response},
 };
 use bzb_test_support::PueuedFixture;
-use common::Fixture;
+use common::{event, leases_json, status, submit, Fixture, PATIENCE};
 use tempfile::TempDir;
-
-const PATIENCE: Duration = Duration::from_secs(15);
 
 /// Sixteen independent targets plus an `env` target that records the
 /// environment make hands its children.
@@ -39,8 +29,7 @@ $(T):
 \t@f=run/$@.$$$$; touch $$f; sleep 0.5; ls run | wc -l >> counts.log; rm $$f
 ";
 
-/// True when GNU make ≥ 4.4 (the first fifo-jobserver release) is on `PATH`;
-/// otherwise says why the calling test is skipped.
+/// GNU make ≥ 4.4 (fifo jobserver) is on `PATH`; otherwise says why not.
 fn make_available() -> bool {
     let version = Command::new("make")
         .arg("--version")
@@ -94,39 +83,7 @@ fn env_log(dir: &Path) -> String {
 }
 
 fn request(argv: &[&str], cwd: &Path) -> LeaseRequest {
-    LeaseRequest {
-        argv: argv.iter().map(|a| (*a).to_string()).collect(),
-        cwd: cwd.to_path_buf(),
-        // The real client sends its own environment; the task needs a PATH to
-        // find `make` and `sh` with.
-        env: std::env::vars().collect::<BTreeMap<_, _>>(),
-        label: None,
-        class_override: None,
-        cores_wanted: None,
-        detached: false,
-    }
-}
-
-async fn connect(daemon: &Fixture) -> Connection {
-    Connection::connect(&daemon.socket_path())
-        .await
-        .expect("connect to bzbd")
-}
-
-async fn submit(daemon: &Fixture, request: LeaseRequest) -> Connection {
-    let mut conn = connect(daemon).await;
-    conn.send(Request::Submit(request))
-        .await
-        .expect("send a submit request");
-    conn
-}
-
-async fn event(conn: &mut Connection) -> LeaseEvent {
-    tokio::time::timeout(PATIENCE, conn.events().next())
-        .await
-        .expect("no lease event arrived in time")
-        .expect("read a lease event")
-        .expect("the event stream ended before the lease finished")
+    common::request_in(argv, cwd)
 }
 
 async fn queued(conn: &mut Connection) -> usize {
@@ -161,15 +118,6 @@ async fn finished(conn: &mut Connection) -> i32 {
     match event(conn).await {
         LeaseEvent::Finished { exit_code, .. } => exit_code,
         other => panic!("expected a Finished event, got {other:?}"),
-    }
-}
-
-async fn status(daemon: &Fixture) -> StatusReply {
-    let mut conn = connect(daemon).await;
-    conn.send(Request::Status).await.expect("send status");
-    match conn.recv().await.expect("recv a status reply") {
-        Response::Status(status) => status,
-        other => panic!("expected a Status reply, got {other:?}"),
     }
 }
 
@@ -236,10 +184,7 @@ async fn a_make_lease_joins_the_pool_and_returns_every_token() {
     );
 }
 
-/// `-j` on make's own command line makes it leave the pool, which is why
-/// the classifier flags it: the notice reaches the client before `Queued`,
-/// which is where a `--detach` client stops reading, and so before the task
-/// starts.
+/// Before `Queued`, which is where a `--detach` client stops reading.
 #[tokio::test]
 async fn a_plan_notice_is_streamed_before_admission() {
     if !make_available() {
@@ -295,11 +240,7 @@ async fn a_static_lease_holds_its_cores_for_its_lifetime() {
     assert_eq!(done.held, 0, "status was {done:?}");
 }
 
-/// `docs/design/bzbd.md` §Failure and recovery, client disconnects while
-/// running: the tokens a static lease drained go back to the pool only once
-/// pueued reports its task gone. Until then the task is still on the machine,
-/// and a running jobserver build would take the returned tokens and
-/// oversubscribe the pool.
+/// Spec table row "client disconnects while running".
 #[tokio::test]
 async fn a_killed_static_task_keeps_its_tokens_until_it_is_gone() {
     let Some(pueued) = PueuedFixture::try_start() else {
@@ -308,8 +249,6 @@ async fn a_killed_static_task_keeps_its_tokens_until_it_is_gone() {
     let daemon = pool(&pueued.config_path, 4);
     let dir = TempDir::new().expect("create tempdir");
 
-    // Ignores the first signal, so it outlives the grace period and is only
-    // gone once SIGKILL follows.
     let mut request = request(&["sh", "-c", "trap '' TERM; sleep 30"], dir.path());
     request.class_override = Some(Class::Static);
     request.cores_wanted = Some(3);
@@ -319,8 +258,6 @@ async fn a_killed_static_task_keeps_its_tokens_until_it_is_gone() {
     assert_eq!(status(&daemon).await.free, 1);
 
     drop(conn);
-    // The lease leaves the books the moment the hangup lands; the tokens
-    // must not.
     let deadline = Instant::now() + PATIENCE;
     let torn_down = loop {
         let status = status(&daemon).await;
@@ -352,10 +289,6 @@ async fn a_killed_static_task_keeps_its_tokens_until_it_is_gone() {
     }
 }
 
-/// `leases.json` is what a restarted bzbd — and a `busybee status` that finds
-/// no daemon — reads to learn which tasks still hold tokens. A task being torn
-/// down holds its tokens until pueued reports it gone, so it stays in the file
-/// until then, marked as ending rather than running.
 #[tokio::test]
 async fn a_teardown_in_flight_stays_in_leases_json_until_the_task_is_gone() {
     let Some(pueued) = PueuedFixture::try_start() else {
@@ -414,12 +347,7 @@ async fn a_teardown_in_flight_stays_in_leases_json_until_the_task_is_gone() {
     assert_eq!(status(&daemon).await.free, 4);
 }
 
-/// The tokens a static lease drains are its grant from the moment they leave
-/// the fifo, and pueued starts the task the moment the submission arrives. A
-/// bzbd that dies waiting for pueued's answer leaves a task running at that
-/// width, so `leases.json` records the grant before the submission goes out —
-/// observed here by stopping pueued, which leaves the submission unanswered
-/// for as long as the test likes.
+/// A stopped pueued leaves the submission unanswered for as long as needed.
 #[tokio::test]
 async fn a_drained_grant_is_in_leases_json_before_pueued_answers() {
     let Some(pueued) = PueuedFixture::try_start() else {
@@ -471,14 +399,7 @@ async fn a_drained_grant_is_in_leases_json_before_pueued_answers() {
     assert_eq!(status(&daemon).await.held, 3);
 }
 
-fn leases_json(daemon: &Fixture) -> Vec<serde_json::Value> {
-    let raw = std::fs::read_to_string(daemon.leases_path()).expect("read leases.json");
-    serde_json::from_str(&raw).expect("decode leases.json")
-}
-
-/// A static lease admitted beside a running make drains its tokens out of
-/// make's hands: make gives them back as jobs finish and cannot start new
-/// ones without them, so its concurrency drops to `pool − held + 1`.
+/// make's concurrency drops to `pool − held + 1`.
 #[tokio::test]
 async fn a_static_drain_throttles_a_running_make() {
     if !make_available() {
@@ -503,8 +424,7 @@ async fn a_static_drain_throttles_a_running_make() {
     let asked = Instant::now();
     let mut held = submit(&daemon, request).await;
     assert_eq!(queued(&mut held).await, 1);
-    // Both tokens, well within the 2 s drain deadline: make returns one
-    // after every 0.5 s job.
+    // Well within the 2 s drain deadline: make returns a token per 0.5 s job.
     assert_eq!(admitted(&mut held).await, ("static".to_string(), 2, 4, 1));
     let drain = asked.elapsed();
     assert!(drain < Duration::from_secs(2), "the drain took {drain:?}");
@@ -529,10 +449,7 @@ async fn a_static_drain_throttles_a_running_make() {
     );
 }
 
-/// `cmake --build` hands parallelism to its generator, which joins the pool
-/// unless `CMAKE_BUILD_PARALLEL_LEVEL` tells it a fixed `-j`. The tool's
-/// basename is what classifies it; a script named `cmake` that runs make
-/// stands in for a generated build.
+/// A script named `cmake` that runs make stands in for a generated build.
 #[tokio::test]
 async fn a_cmake_build_loses_the_callers_parallel_level() {
     if !make_available() {
@@ -574,10 +491,7 @@ async fn a_cmake_build_loses_the_callers_parallel_level() {
     );
 }
 
-/// `docs/design/bzbd.md` §Failure and recovery: a drain that collects nothing
-/// is not a failure. The second static lease starts on the implicit token —
-/// told so, and told it holds one core — rather than waiting for the first to
-/// finish or running ungoverned.
+/// Spec table row "a drain comes up short, or collects nothing at all".
 #[tokio::test]
 async fn an_empty_drain_starts_on_the_implicit_token_and_says_so() {
     let Some(pueued) = PueuedFixture::try_start() else {
@@ -625,17 +539,13 @@ async fn an_empty_drain_starts_on_the_implicit_token_and_says_so() {
     assert_eq!(status(&daemon).await.free, 1);
 }
 
-/// The `DrainFailed` path: tokens were drained for a task that then could not
-/// be submitted. The lease ends with the reason at once; the tokens go back
-/// once the poll has settled whether pueued started the task anyway — here,
-/// with pueued gone for good, once it has been given up on.
+/// `DrainFailed`: the tokens go back once the poll gives up on pueued.
 #[tokio::test]
 async fn a_rejected_submission_returns_the_drained_tokens() {
     let Some(mut pueued) = PueuedFixture::try_start() else {
         return;
     };
-    // bzbd respawns pueued by name off its `PATH`; an empty one is a pueued
-    // that is not coming back.
+    // bzbd respawns pueued off its `PATH`; an empty one means it never comes back.
     let nothing_on_path = TempDir::new().expect("create tempdir");
     let daemon = Fixture::start_with(
         Some("pool_size = 2\n"),
@@ -659,9 +569,7 @@ async fn a_rejected_submission_returns_the_drained_tokens() {
     assert!(text.contains("could not start"), "got {text:?}");
     assert_ne!(finished(&mut conn).await, 0);
 
-    // The lease is gone, but the tokens drained for it are still out until
-    // the poll settles whether pueued started the task: status says so rather
-    // than showing a pool that adds up to less than its size.
+    // Until the poll settles it, the tokens still count as held.
     let gone = status(&daemon).await;
     assert!(gone.leases.is_empty(), "status was {gone:?}");
     assert_eq!(gone.free + gone.held, 2, "status was {gone:?}");
@@ -680,10 +588,6 @@ async fn a_rejected_submission_returns_the_drained_tokens() {
     }
 }
 
-/// A grant `leases.json` cannot carry is one a restarted bzbd would never
-/// find, and would seed the pool with again beside the task still running on
-/// it. So the task does not start: the tokens go back, and the client hears
-/// why.
 #[tokio::test]
 async fn a_grant_that_cannot_be_recorded_is_not_started() {
     let Some(pueued) = PueuedFixture::try_start() else {
@@ -691,8 +595,7 @@ async fn a_grant_that_cannot_be_recorded_is_not_started() {
     };
     let daemon = pool(&pueued.config_path, 2);
     let dir = TempDir::new().expect("create tempdir");
-    // `leases.json` is written through `leases.json.tmp`; a directory in its
-    // place fails every write the way a full disk would.
+    // A directory at `leases.json.tmp` fails every write like a full disk.
     std::fs::create_dir(daemon.state_dir().join("leases.json.tmp")).expect("plant the directory");
 
     let mut request = request(&["sh", "-c", "touch ran"], dir.path());
@@ -713,8 +616,6 @@ async fn a_grant_that_cannot_be_recorded_is_not_started() {
     );
 }
 
-/// A pool the fifo cannot hold is a configuration error, reported like any
-/// other startup failure rather than as a panic.
 #[tokio::test]
 async fn a_pool_larger_than_the_fifo_is_refused_at_startup() {
     let tmp = TempDir::new().expect("create tempdir");
@@ -738,10 +639,7 @@ async fn a_pool_larger_than_the_fifo_is_refused_at_startup() {
     );
 }
 
-/// `docs/design/bzbd.md` §Configuration: a reloaded `pool_size` is applied to
-/// the fifo, never taking back what a lease holds. A grown pool releases the
-/// delta at once; a shrunk one drains what is free, says what it could not
-/// take, and takes the rest once the lease holding it ends.
+/// Spec §Configuration: a reload never takes back what a lease holds.
 #[tokio::test]
 async fn a_reloaded_pool_size_resizes_the_fifo_around_what_is_held() {
     let Some(pueued) = PueuedFixture::try_start() else {
@@ -783,12 +681,8 @@ async fn a_reloaded_pool_size_resizes_the_fifo_around_what_is_held() {
     );
 
     assert_eq!(finished(&mut conn).await, 0);
-    // The lease's release finishes the shrink by itself: the undrained part
-    // was booked as debt, so those tokens are withheld as they come back. The
-    // deadline is deliberately shorter than the accounting check's interval —
-    // that check would also drain the excess eventually, and a test that
-    // allowed it to would pass while a queued admission could still run on a
-    // pool wider than the file says.
+    // Shorter than the accounting interval on purpose: the release itself must
+    // finish the shrink, not the periodic check.
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let status = status(&daemon).await;
@@ -807,13 +701,8 @@ async fn a_reloaded_pool_size_resizes_the_fifo_around_what_is_held() {
     }
 }
 
-/// `docs/design/bzbd.md` §Configuration: a shrink the free tokens cannot
-/// cover finishes as the holding leases end. A jobserver build returns its
-/// tokens straight to the fifo, where no `release` withholds them, so the
-/// daemon collects what it is owed from there — on the poll, since a build
-/// would run on those tokens until the accounting check came round — and
-/// only once: a debt already collected must not be taken again from the
-/// next static lease's release.
+/// A jobserver build returns tokens straight to the fifo, bypassing
+/// `release`; the debt is collected from there, and only once.
 #[tokio::test]
 async fn a_shrink_under_a_make_is_collected_from_what_it_returns() {
     if !make_available() {
@@ -828,8 +717,7 @@ async fn a_shrink_under_a_make_is_collected_from_what_it_returns() {
     let mut make = submit(&daemon, request(&["make"], dir.path())).await;
     assert_eq!(queued(&mut make).await, 0);
     assert_eq!(admitted(&mut make).await.0, "jobserver");
-    // Not before the build holds the whole pool: a shrink that finds its
-    // tokens free completes on the spot and owes nothing.
+    // Only a shrink under a build holding the whole pool owes anything.
     let deadline = Instant::now() + PATIENCE;
     while status(&daemon).await.free > 0 {
         assert!(
@@ -849,10 +737,7 @@ async fn a_shrink_under_a_make_is_collected_from_what_it_returns() {
     );
     assert_eq!(finished(&mut make).await, 0);
 
-    // The build handed its tokens back to a pool with room for two of them.
-    // The deadline is shorter than the accounting interval on purpose: the
-    // check would drain the excess eventually, and a test that allowed it
-    // to would pass while the next build ran on four tokens meanwhile.
+    // Shorter than the accounting interval on purpose, as above.
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let status = status(&daemon).await;
@@ -883,7 +768,7 @@ async fn a_shrink_under_a_make_is_collected_from_what_it_returns() {
 }
 
 async fn reload(daemon: &Fixture) {
-    let mut conn = connect(daemon).await;
+    let mut conn = common::connect(daemon).await;
     conn.send(Request::ConfigReload)
         .await
         .expect("send a reload request");
@@ -893,9 +778,7 @@ async fn reload(daemon: &Fixture) {
     }
 }
 
-/// `docs/design/bzbd.md` §Failure and recovery, fifo accounting drift: tokens
-/// a tool wrote without having read them are drained on the periodic check,
-/// and the check says so.
+/// Spec table row "fifo accounting drift".
 #[tokio::test]
 async fn extra_tokens_in_the_fifo_are_drained_by_the_accounting_check() {
     let daemon = Fixture::start_on("pool_size = 4\n");

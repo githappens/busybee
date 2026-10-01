@@ -1,24 +1,34 @@
-//! An isolated `bzbd` for integration tests: its own state directory and its
-//! own config file, so no test can reach the developer's daemon or read the
-//! config on their machine.
+//! An isolated `bzbd` (own state directory and config file) and the client
+//! helpers the integration tests share.
 
-// Every test binary compiles this module for itself and uses a different part
-// of it, so what one leaves unused another needs.
+// Each test binary uses a different part of this module.
 #![allow(dead_code)]
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     process::{Child, Command},
     time::{Duration, Instant},
 };
 
+use bzb_core::{
+    daemon::Connection,
+    protocol::{LeaseEvent, LeaseRequest, Request, Response, StatusReply},
+};
+use pueue_lib::{
+    message::{Request as PueueRequest, Response as PueueResponse},
+    task::TaskStatus,
+};
+use serde_json::Value;
 use tempfile::TempDir;
 
 pub const BZBD: &str = env!("CARGO_BIN_EXE_bzbd");
 
-/// A config file for a daemon started outside [`Fixture`]: a path inside the
-/// test's own directory, so the daemon reads the defaults rather than whatever
-/// the developer running the suite has configured.
+/// A poll tick plus latency, short enough to fail rather than hang.
+pub const PATIENCE: Duration = Duration::from_secs(15);
+
+/// A config path in the test's own directory, so a daemon started outside
+/// [`Fixture`] never reads the developer's config.
 pub fn isolated_config(dir: &Path) -> PathBuf {
     dir.join("config.toml")
 }
@@ -27,9 +37,6 @@ pub fn sigterm(pid: u32) {
     signal(pid, libc::SIGTERM);
 }
 
-/// Sends an arbitrary signal to any pid — a test's own `pueued` as much as its
-/// daemon, which is why this is a free function and not only a [`Fixture`]
-/// method.
 pub fn signal(pid: u32, signal: libc::c_int) {
     assert_eq!(unsafe { libc::kill(pid as i32, signal) }, 0, "kill failed");
 }
@@ -39,48 +46,30 @@ pub struct Fixture {
     pub child: Child,
     state: PathBuf,
     config: PathBuf,
-    /// What the daemon was started with, so `restart` starts the same one.
+    /// Kept so `restart` starts the same daemon.
     env: Vec<(String, String)>,
-    /// Kept for its drop: it takes the state directory with it.
     _tmp: TempDir,
 }
 
 impl Fixture {
-    /// Starts a daemon whose config file does not exist, i.e. on the defaults.
+    /// On the defaults: the config file does not exist.
     pub fn start() -> Self {
         Self::start_with(None, &[])
     }
 
-    /// Starts a daemon on `config`, written to a file of its own.
     pub fn start_on(config: &str) -> Self {
         Self::start_with(Some(config), &[])
     }
 
-    /// Same as [`Fixture::start`], but pointed at an isolated `pueued` through
-    /// the config path its fixture generated.
+    /// On the defaults, talking to the isolated pueued behind `config`.
     pub fn start_with_pueue(config: &Path) -> Self {
         Self::start_with(None, &[("PUEUE_CONFIG_PATH", config.display().to_string())])
     }
 
-    /// Same again, with a `PATH` of the test's choosing: it is where bzbd
-    /// looks for `pueued` when it has to spawn one.
-    pub fn start_with_pueue_and_path(config: &Path, path: &Path) -> Self {
-        Self::start_with(
-            None,
-            &[
-                ("PUEUE_CONFIG_PATH", config.display().to_string()),
-                ("PATH", path.display().to_string()),
-            ],
-        )
-    }
-
-    /// A daemon on `config` — the defaults when there is none — with the given
-    /// environment on top of the test's own: `PUEUE_CONFIG_PATH`, `PATH`, and
-    /// so on.
+    /// `env` goes on top of the test's own environment.
     pub fn start_with(config: Option<&str>, env: &[(&str, String)]) -> Self {
         let tmp = TempDir::new().expect("create tempdir");
-        // A directory bzbd has to create itself, so its mode is the daemon's
-        // doing rather than tempfile's.
+        // Created by bzbd itself, so its mode is the daemon's doing.
         let state = tmp.path().join("state");
         let config_path = tmp.path().join("config.toml");
         if let Some(config) = config {
@@ -102,8 +91,6 @@ impl Fixture {
         fixture
     }
 
-    /// Runs a second `bzbd` against the same state directory and config, to
-    /// completion.
     pub fn run_second_instance(&self) -> std::process::Output {
         Command::new(BZBD)
             .arg("--foreground")
@@ -113,17 +100,13 @@ impl Fixture {
             .expect("run second bzbd")
     }
 
-    /// SIGKILL: the daemon gets no chance to clean up, which is what a crash
-    /// looks like. The state directory stays for `restart`.
+    /// SIGKILL, like a crash; the state directory stays for `restart`.
     pub fn kill(&mut self) {
         self.child.kill().expect("kill bzbd");
         self.child.wait().expect("wait for bzbd");
     }
 
-    /// Starts a new daemon on the same state directory, config and
-    /// environment, and waits until it accepts connections — the socket file
-    /// alone proves nothing after a kill, since the dead daemon's is still
-    /// there.
+    /// Waits for a listener, not the socket file: a killed daemon's is still there.
     pub fn restart(&mut self) {
         self.child = spawn(&self.state, &self.config, &self.env);
         wait_for_listener(&self.socket_path());
@@ -157,17 +140,11 @@ impl Fixture {
         std::fs::write(&self.config, body).expect("rewrite the config");
     }
 
-    /// Sends `signal` to the daemon.
-    pub fn signal(&self, signal: libc::c_int) {
-        assert_eq!(
-            unsafe { libc::kill(self.child.id() as i32, signal) },
-            0,
-            "kill failed"
-        );
+    pub fn signal(&self, sig: libc::c_int) {
+        signal(self.child.id(), sig);
     }
 
-    /// The token pool: `jobserver-<pid>` in the state directory, and under
-    /// `--foreground` the pid is the child's own.
+    /// Under `--foreground` the fifo's pid suffix is the child's own.
     pub fn fifo_path(&self) -> PathBuf {
         self.state.join(format!("jobserver-{}", self.child.id()))
     }
@@ -192,7 +169,7 @@ impl Drop for Fixture {
     }
 }
 
-/// Waits up to 3 s for `path` to exist (or to be gone, when `present` is false).
+/// Waits up to 3 s for `path` to be present (or gone).
 pub fn wait_for(path: &Path, present: bool) {
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
@@ -218,4 +195,112 @@ pub fn wait_for_listener(socket: &Path) {
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("nothing was listening on {} after 3s", socket.display());
+}
+
+pub fn request(argv: &[&str]) -> LeaseRequest {
+    request_in(argv, &std::env::current_dir().expect("current dir"))
+}
+
+pub fn request_in(argv: &[&str], cwd: &Path) -> LeaseRequest {
+    LeaseRequest {
+        argv: argv.iter().map(|a| (*a).to_string()).collect(),
+        cwd: cwd.to_path_buf(),
+        // The task needs a PATH, as the real client's environment would give it.
+        env: std::env::vars().collect::<BTreeMap<_, _>>(),
+        label: None,
+        class_override: None,
+        cores_wanted: None,
+        detached: false,
+    }
+}
+
+pub async fn connect(daemon: &Fixture) -> Connection {
+    Connection::connect(&daemon.socket_path())
+        .await
+        .expect("connect to bzbd")
+}
+
+pub async fn submit(daemon: &Fixture, request: LeaseRequest) -> Connection {
+    let mut conn = connect(daemon).await;
+    conn.send(Request::Submit(request))
+        .await
+        .expect("send a submit request");
+    conn
+}
+
+pub async fn event(conn: &mut Connection) -> LeaseEvent {
+    tokio::time::timeout(PATIENCE, conn.events().next())
+        .await
+        .expect("no lease event arrived in time")
+        .expect("read a lease event")
+        .expect("the event stream ended before the lease finished")
+}
+
+pub async fn status(daemon: &Fixture) -> StatusReply {
+    let mut conn = connect(daemon).await;
+    conn.send(Request::Status).await.expect("send status");
+    match conn.recv().await.expect("recv a status reply") {
+        Response::Status(status) => status,
+        other => panic!("expected a Status reply, got {other:?}"),
+    }
+}
+
+pub async fn wait_for_no_leases(daemon: &Fixture, patience: Duration) -> StatusReply {
+    let deadline = tokio::time::Instant::now() + patience;
+    loop {
+        let status = status(daemon).await;
+        if status.leases.is_empty() {
+            return status;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "leases were still {:?} after {patience:?}",
+            status.leases
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+pub fn leases_json(daemon: &Fixture) -> Vec<Value> {
+    let raw = std::fs::read_to_string(daemon.leases_path()).expect("read leases.json");
+    serde_json::from_str(&raw).expect("decode leases.json")
+}
+
+/// Connects without spawning: a test whose pueued is gone must not get a new
+/// one. Sets the process-wide `PUEUE_CONFIG_PATH`, so callers are serial.
+pub async fn pueue(config: &Path) -> pueue_lib::Client {
+    std::env::set_var("PUEUE_CONFIG_PATH", config);
+    bzb_core::client::connect()
+        .await
+        .expect("connect to pueued")
+}
+
+/// `None` once pueued has no record of the task. See [`pueue`].
+pub async fn task_status(config: &Path, task_id: usize) -> Option<TaskStatus> {
+    let mut client = pueue(config).await;
+    client
+        .send_request(PueueRequest::Status)
+        .await
+        .expect("send a status request");
+    let state = match client.receive_response().await.expect("status response") {
+        PueueResponse::Status(state) => state,
+        other => panic!("expected a status response, got {other:?}"),
+    };
+    state.tasks.get(&task_id).map(|t| t.status.clone())
+}
+
+/// Gone from pueued itself, not just from bzbd's books. See [`pueue`].
+pub async fn wait_for_task_to_end(config: &Path, task_id: usize, patience: Duration) {
+    let deadline = tokio::time::Instant::now() + patience;
+    loop {
+        let status = task_status(config, task_id).await;
+        if matches!(status, None | Some(TaskStatus::Done { .. })) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pueue task {task_id} was still {status:?} after {patience:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

@@ -1,26 +1,17 @@
-//! Executing a [`Plan`]: the environment and argv a task is actually started
-//! with. Pure — the daemon supplies the fifo path and the core count it
-//! settled on at admission, and this fills the placeholders in.
-//!
-//! `docs/design/bzbd.md` §Classification: `{fifo}`, `{cores}` and `{cores-1}`
-//! (`max(1, cores − 1)`) are the only substitution points, and only in what
-//! the classifier wrote: the environment edits and the arguments it appended.
-//! The user's own command line is theirs, braces included. `env_unset` is
-//! applied first, then `env_set`, then `env_append` joined to the caller's
-//! value with a space — none when that value is empty.
+//! Fills a [`Plan`]'s `{fifo}`, `{cores}` and `{cores-1}` placeholders, only in
+//! what the classifier wrote (see `docs/design/bzbd.md` §Classification).
 
 use std::collections::BTreeMap;
 
 use bzb_core::classify::Plan;
 
-pub struct Injected {
-    pub env: BTreeMap<String, String>,
-    pub argv: Vec<String>,
+pub(crate) struct Injected {
+    pub(crate) env: BTreeMap<String, String>,
+    pub(crate) argv: Vec<String>,
 }
 
-/// `user_args` is how many of `plan.argv` the user typed; `env` is the
-/// client's environment; `cores` is the task's share of the pool.
-pub fn inject(
+/// `user_args` is how many of `plan.argv` the user typed.
+pub(crate) fn inject(
     plan: &Plan,
     user_args: usize,
     mut env: BTreeMap<String, String>,
@@ -75,8 +66,7 @@ pub fn inject(
             })
             .or_insert(value);
     }
-    // The classifier only ever appends to the user's argv, so the prefix is
-    // theirs byte for byte and the placeholders can only be in the rest.
+    // The classifier only appends, so the user's prefix is never filled.
     let (user, appended) = plan.argv.split_at(user_args);
     Injected {
         env,
@@ -105,16 +95,13 @@ mod tests {
             .collect()
     }
 
-    /// `-jobs N` yields N+1 concurrent compilers, so the row asks for
-    /// `{cores-1}`; at one core that still has to be a usable `1`.
+    /// `{cores-1}` floors at 1.
     #[test]
     fn xcodebuild_with_one_core_gets_jobs_one() {
         let injected = inject(&plan(&["xcodebuild", "build"]), 2, env(&[]), "/run/js", 1);
         assert_eq!(injected.argv, ["xcodebuild", "build", "-jobs", "1"]);
     }
 
-    /// The placeholders are the classifier's, in what it appended; the user's
-    /// own command line is not rewritten, braces and all.
     #[test]
     fn a_placeholder_in_the_users_own_argv_is_left_alone() {
         let argv = ["sh", "-c", "echo {cores} {cores-1} {fifo}"];
@@ -122,9 +109,6 @@ mod tests {
         assert_eq!(injected.argv, argv);
     }
 
-    /// The fifo path is whatever the state directory is, and a directory may
-    /// be named like a placeholder. Text a substitution put in is never
-    /// itself substituted.
     #[test]
     fn a_placeholder_shaped_fifo_path_is_kept_verbatim() {
         let injected = inject(&plan(&["make"]), 1, env(&[]), "/tmp/{cores}/js", 4);
@@ -203,8 +187,6 @@ mod tests {
         );
     }
 
-    /// `Plan::env_append`'s contract: no leading space when the caller's
-    /// value is there but empty (`PYTEST_ADDOPTS=""`).
     #[test]
     fn appending_to_an_empty_value_adds_no_leading_space() {
         let injected = inject(
