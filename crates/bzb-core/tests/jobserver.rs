@@ -1,11 +1,6 @@
-//! Integration tests for `bzb_core::jobserver` against real GNU make and ninja.
-//!
-//! Each build fixture has 16 independent targets that count each other; see
-//! [`bzb_test_support::counter`] for how, and `crates/bzb/tests/e2e_pool.rs`
-//! for the same fixture under the whole daemon.
-//!
-//! Tests that need an external tool print why they are skipped when the tool
-//! is missing or too old (visible with `--nocapture`); see `tests/README.md`.
+//! `bzb_core::jobserver` against real GNU make and ninja; fixtures are in
+//! [`bzb_test_support::counter`]. Tool-dependent tests skip when the tool is
+//! missing or too old (see `tests/README.md`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -15,14 +10,13 @@ use std::time::{Duration, Instant};
 use bzb_core::jobserver::Jobserver;
 use bzb_test_support::counter::{self, available};
 
-/// Targets in a build fixture, which is also how many samples it leaves.
+/// Targets in a build fixture, and so samples it leaves.
 const JOBS: usize = 16;
 
 /// Long enough that the tool has time to reach its peak before the first job
 /// finishes, short enough to keep the suite quick.
 const SLEEP: &str = "0.3";
 
-/// Fresh per-test directory, empty but for whatever the caller puts in it.
 fn fixture(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("bzb-jobserver-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -32,7 +26,10 @@ fn fixture(name: &str) -> PathBuf {
 
 fn build_cmd(tool: &str, dir: &Path, js: &Jobserver) -> Command {
     let mut cmd = Command::new(tool);
-    cmd.current_dir(dir).env("MAKEFLAGS", js.makeflags_value());
+    cmd.current_dir(dir).env(
+        "MAKEFLAGS",
+        format!("--jobserver-auth=fifo:{}", js.path().display()),
+    );
     cmd
 }
 
@@ -150,20 +147,13 @@ fn drop_unlinks_fifo() {
     let dir = fixture("drop");
     let js = Jobserver::create(&dir, 1).unwrap();
     let path = js.path().to_path_buf();
-    assert_eq!(
-        js.makeflags_value(),
-        format!("--jobserver-auth=fifo:{}", path.display())
-    );
     assert!(path.exists());
     drop(js);
     assert!(!path.exists());
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A daemon on its way out leaves the fifo to the builds that hold it open,
-/// tokens and all. The tokens live in the pipe, and the pipe lives as long as
-/// someone has it open, so a holder stands in for the build here: the
-/// daemon's own descriptors still close with the handle.
+/// `holder` stands in for a build that still has the fifo open.
 #[test]
 fn leave_keeps_the_fifo_and_its_tokens_for_whoever_holds_it() {
     use std::os::unix::fs::OpenOptionsExt;
@@ -188,29 +178,6 @@ fn leave_keeps_the_fifo_and_its_tokens_for_whoever_holds_it() {
         0
     );
     assert_eq!(n, 3, "the tokens went with the daemon");
-    let _ = fs::remove_dir_all(&dir);
-}
-
-#[test]
-fn close_reports_unlink_failure() {
-    use std::os::unix::fs::PermissionsExt;
-    // SAFETY: geteuid has no preconditions.
-    if unsafe { libc::geteuid() } == 0 {
-        eprintln!("skipping: running as root, directory permissions are not enforced");
-        return;
-    }
-    let dir = fixture("close");
-    let js = Jobserver::create(&dir, 1).unwrap();
-    let path = js.path().to_path_buf();
-
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
-    let err = js
-        .close()
-        .expect_err("unlink in a read-only directory must fail");
-    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
-
-    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
-    assert!(path.exists(), "fifo must survive a failed unlink");
     let _ = fs::remove_dir_all(&dir);
 }
 

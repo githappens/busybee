@@ -1,7 +1,5 @@
 //! Table-driven test over `tests/fixtures/classify_cases.toml`.
 
-use std::str::FromStr;
-
 use bzb_core::classify::{classify, default_table, Class, Overrides, Plan};
 use serde::Deserialize;
 
@@ -15,9 +13,9 @@ struct Fixture {
 struct Case {
     name: String,
     argv: Vec<String>,
-    class: String,
+    class: Class,
     tool: String,
-    override_class: Option<String>,
+    override_class: Option<Class>,
     override_cores: Option<u32>,
     cores_wanted: Option<u32>,
     #[serde(default)]
@@ -37,10 +35,6 @@ struct Case {
     notices_contain: Vec<String>,
     #[serde(default)]
     no_notices: bool,
-}
-
-fn parse_class(name: &str, raw: &str) -> Class {
-    Class::from_str(raw).unwrap_or_else(|e| panic!("case {name}: {e}"))
 }
 
 fn assert_pairs(name: &str, label: &str, pairs: &[(String, String)], expected: &[String]) {
@@ -69,20 +63,13 @@ fn fixture_cases_classify_as_expected() {
 
     for case in &fixture.case {
         let overrides = Overrides {
-            class: case
-                .override_class
-                .as_deref()
-                .map(|c| parse_class(&case.name, c)),
+            class: case.override_class,
             cores: case.override_cores,
         };
         let plan: Plan = classify(&case.argv, &overrides, &table);
         let name = &case.name;
 
-        assert_eq!(
-            plan.class,
-            parse_class(name, &case.class),
-            "case {name}: class"
-        );
+        assert_eq!(plan.class, case.class, "case {name}: class");
         assert_eq!(plan.tool, case.tool, "case {name}: tool");
         assert_eq!(plan.cores_wanted, case.cores_wanted, "case {name}: cores");
 

@@ -24,39 +24,18 @@ use crate::protocol::{
     read_line, Hello, LeaseEvent, Line, Request, Response, MAX_LINE_BYTES, PROTOCOL_VERSION,
 };
 
-/// Directory holding `bzbd.sock`, `bzbd.pid` and `bzbd.log`.
+/// Directory holding `bzbd.sock`, `bzbd.pid` and `bzbd.log`:
+/// `$BUSYBEE_STATE_DIR`, else `$XDG_STATE_HOME/busybee`, else
+/// `~/.local/state/busybee`.
 pub fn state_dir() -> Result<PathBuf, BusybeeError> {
-    if let Some(dir) = env::var_os("BUSYBEE_STATE_DIR") {
-        // A relative override resolves against the working directory, so
-        // clients started from different directories would reach different
-        // sockets and each auto-start a daemon of its own.
-        if !Path::new(&dir).is_absolute() {
-            return Err(BusybeeError::Other(format!(
-                "BUSYBEE_STATE_DIR must be an absolute path, got {:?}; \
-                 unset it or give it a directory",
-                Path::new(&dir)
-            )));
-        }
-        return Ok(PathBuf::from(dir));
-    }
-    // The XDG spec says a value that is empty or not absolute counts as unset.
-    // Resolving one relative to the working directory would give each caller
-    // its own socket, and each of those its own daemon.
-    if let Some(dir) = env::var_os("XDG_STATE_HOME").filter(|d| Path::new(d).is_absolute()) {
-        return Ok(PathBuf::from(dir).join("busybee"));
-    }
-    // HOME has to be absolute for the same reason: a relative one would put
-    // `.local/state/busybee` under whatever directory the caller ran from.
-    let home = env::var_os("HOME")
-        .filter(|d| Path::new(d).is_absolute())
-        .ok_or_else(|| {
-            BusybeeError::Other(
-                "cannot locate the busybee state directory: BUSYBEE_STATE_DIR is unset and \
-                 neither XDG_STATE_HOME nor HOME holds an absolute path"
-                    .into(),
-            )
-        })?;
-    Ok(PathBuf::from(home).join(".local/state/busybee"))
+    crate::config::locate(
+        "state directory",
+        ("BUSYBEE_STATE_DIR", env::var_os("BUSYBEE_STATE_DIR")),
+        ("XDG_STATE_HOME", env::var_os("XDG_STATE_HOME")),
+        env::var_os("HOME"),
+        ".local/state",
+        None,
+    )
 }
 
 pub fn socket_path() -> Result<PathBuf, BusybeeError> {
@@ -71,8 +50,7 @@ pub fn log_path() -> Result<PathBuf, BusybeeError> {
     Ok(state_dir()?.join("bzbd.log"))
 }
 
-/// The leases bzbd is holding, as of its last change. Written by the daemon on
-/// every change and read back by a daemon that restarted.
+/// The leases bzbd holds, rewritten on every change and read on restart.
 pub fn leases_path() -> Result<PathBuf, BusybeeError> {
     Ok(state_dir()?.join("leases.json"))
 }
@@ -102,17 +80,10 @@ impl Connection {
     }
 
     /// Connects only to a daemon that is already listening. `Ok(None)` means
-    /// nothing is: the socket is absent, or stale from a daemon that died. That
-    /// is the one failure a caller may read as "there is no daemon". Anything
-    /// after the connection was accepted — a dropped connection, a refused
-    /// protocol version, a handshake that never arrives — is a daemon that *is*
-    /// running and not answering, so it propagates.
-    ///
-    /// The whole attempt — the connect and the handshake — is bounded by
-    /// [`STARTUP_TIMEOUT`]: a wedged daemon accepts and then says nothing, and
-    /// the one-shot callers of this have no deadline of their own to fall back
-    /// on. The deadline covers the connect too so that no step of reaching the
-    /// daemon is left outside it.
+    /// the socket is absent or stale: the one failure that means "no daemon".
+    /// Anything after the connection was accepted is a running daemon not
+    /// answering, so it propagates. Bounded by [`STARTUP_TIMEOUT`], since a
+    /// wedged daemon accepts and then says nothing.
     pub async fn connect_if_listening(socket: &Path) -> Result<Option<Self>, BusybeeError> {
         let attempt = async {
             match UnixStream::connect(socket).await {
@@ -125,16 +96,7 @@ impl Connection {
                 Err(e) => Err(unreachable_at(socket, e)),
             }
         };
-        match tokio::time::timeout(STARTUP_TIMEOUT, attempt).await {
-            Ok(result) => result,
-            Err(_) => Err(BusybeeError::DaemonUnreachable {
-                context: format!(
-                    "bzbd at {} did not answer the connection and handshake within {} seconds",
-                    socket.display(),
-                    STARTUP_TIMEOUT.as_secs()
-                ),
-            }),
-        }
+        within(socket, STARTUP_TIMEOUT, attempt).await
     }
 
     async fn handshake(stream: UnixStream) -> Result<Self, BusybeeError> {
@@ -149,8 +111,7 @@ impl Connection {
         .await?;
         match conn.recv().await? {
             Response::Pong { .. } => Ok(conn),
-            // Reachable but incompatible: a protocol error, not an absent
-            // daemon, so callers do not try to spawn a replacement.
+            // Protocol, not DaemonUnreachable: see `connect_or_spawn_bzbd`.
             Response::Error { message } => Err(BusybeeError::Protocol(format!(
                 "bzbd rejected protocol version {PROTOCOL_VERSION}: {message}"
             ))),
@@ -172,7 +133,7 @@ impl Connection {
             })
     }
 
-    /// Reader over the events the daemon streams on a `Submit` connection.
+    /// The events the daemon streams on a `Submit` connection.
     pub fn events(&mut self) -> Events<'_> {
         Events {
             conn: self,
@@ -183,9 +144,8 @@ impl Connection {
     async fn write_json(&mut self, value: &impl serde::Serialize) -> Result<(), BusybeeError> {
         let mut line = serde_json::to_string(value)
             .map_err(|e| BusybeeError::Protocol(format!("cannot encode a message: {e}")))?;
-        // The limit binds both directions. The daemon stops reading at it and
-        // closes, so writing past it would race our own `EPIPE` against its
-        // framing error and blame an unreachable daemon for our message.
+        // The daemon closes at the limit, so writing past it would surface as
+        // our own `EPIPE`, blaming an unreachable daemon for our message.
         if line.len() > MAX_LINE_BYTES {
             return Err(BusybeeError::Protocol(format!(
                 "a message of {} bytes does not fit the {MAX_LINE_BYTES}-byte line limit",
@@ -193,8 +153,6 @@ impl Connection {
             )));
         }
         line.push('\n');
-        // Not `?`: the shared `Network` variant reads "pueue-lib I/O error",
-        // and this socket has nothing to do with pueued.
         self.outgoing
             .write_all(line.as_bytes())
             .await
@@ -214,13 +172,8 @@ impl Connection {
         let line = match read {
             Line::Text(line) => line,
             Line::Closed => return Ok(None),
-            // The same framing the daemon reads under: a peer that breaks it is
-            // not speaking this protocol, and we cannot find the next message.
-            // That covers bytes that are not UTF-8, which came from a daemon
-            // that did answer: calling those unreachable would send
-            // `connect_or_spawn_bzbd` off to spawn a replacement, which exits
-            // as "already running", and the caller would hear about a startup
-            // timeout instead of the real reason.
+            // Including non-UTF-8: the daemon did answer, so Protocol, not
+            // DaemonUnreachable (see `connect_or_spawn_bzbd`).
             Line::Malformed(reason) => {
                 return Err(BusybeeError::Protocol(format!(
                     "bzbd broke the protocol framing: {reason}"
@@ -239,9 +192,8 @@ pub struct Events<'a> {
 }
 
 impl Events<'_> {
-    /// The next lease event, or `None` once the stream ends. A stream that
-    /// ends before `Finished` lost the lease's exit code with it, so that is
-    /// an error rather than a normal end.
+    /// The next lease event, or `None` once the stream ends. Ending before
+    /// `Finished` lost the exit code, so that is an error.
     pub async fn next(&mut self) -> Result<Option<LeaseEvent>, BusybeeError> {
         match self.conn.recv_opt().await? {
             None if self.finished => Ok(None),
@@ -252,8 +204,6 @@ impl Events<'_> {
                 self.finished |= matches!(event, LeaseEvent::Finished { .. });
                 Ok(Some(event))
             }
-            // Not `EnqueueRejected`: that one reads "pueued rejected our
-            // request", and this refusal came from bzbd.
             Some(Response::Error { message }) => Err(BusybeeError::Rejected(message)),
             Some(other) => Err(BusybeeError::Protocol(format!(
                 "expected an event, got {other:?}"
@@ -262,28 +212,39 @@ impl Events<'_> {
     }
 }
 
-/// How long a client spends reaching a handshaken daemon: the whole of
-/// `connect_or_spawn_bzbd`, spawn included, and the handshake alone when
-/// [`Connection::connect_if_listening`] is not allowed to spawn one.
+/// How long a client spends reaching a handshaken daemon, spawn included.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Connects and handshakes, giving up at `deadline`. A daemon that accepts the
-/// connection but never answers would otherwise block the caller forever.
+/// Bounds a connect-and-handshake `attempt`: a daemon that accepts and never
+/// answers would otherwise block the caller forever.
+async fn within<T>(
+    socket: &Path,
+    budget: Duration,
+    attempt: impl std::future::Future<Output = Result<T, BusybeeError>>,
+) -> Result<T, BusybeeError> {
+    tokio::time::timeout(budget, attempt)
+        .await
+        .unwrap_or_else(|_| {
+            Err(BusybeeError::DaemonUnreachable {
+                context: format!(
+                    "bzbd at {} did not answer the connection and handshake within {} seconds",
+                    socket.display(),
+                    STARTUP_TIMEOUT.as_secs()
+                ),
+            })
+        })
+}
+
 async fn connect_by(socket: &Path, deadline: Instant) -> Result<Connection, BusybeeError> {
     let budget = deadline.saturating_duration_since(Instant::now());
-    match tokio::time::timeout(budget, Connection::connect(socket)).await {
-        Ok(result) => result,
-        Err(_) => Err(BusybeeError::DaemonUnreachable {
-            context: format!(
-                "bzbd at {} did not complete the handshake within {} seconds",
-                socket.display(),
-                STARTUP_TIMEOUT.as_secs()
-            ),
-        }),
-    }
+    within(socket, budget, Connection::connect(socket)).await
 }
 
 /// Connects to `bzbd`, starting it if the socket is unreachable.
+///
+/// A daemon that answered but refused (a `Protocol` error) is returned as is:
+/// a spawned replacement would exit as "already running" and the caller would
+/// see a startup timeout instead of the real reason.
 pub async fn connect_or_spawn_bzbd() -> Result<Connection, BusybeeError> {
     let socket = socket_path()?;
     let deadline = Instant::now() + STARTUP_TIMEOUT;
@@ -291,8 +252,6 @@ pub async fn connect_or_spawn_bzbd() -> Result<Connection, BusybeeError> {
     loop {
         let last = match connect_by(&socket, deadline).await {
             Ok(conn) => return Ok(conn),
-            // The daemon answered and refused us; a second one would exit as
-            // "already running" and we would lose the reason.
             Err(refusal @ BusybeeError::Protocol(_)) => return Err(refusal),
             Err(other) => other,
         };
@@ -312,11 +271,9 @@ pub async fn connect_or_spawn_bzbd() -> Result<Connection, BusybeeError> {
         if spawned {
             sleep(Duration::from_millis(100)).await;
         }
-        // Spawning again is not redundant. A daemon shutting down unlinks its
-        // socket while it still holds the pid-file lock, so a spawn landing in
-        // that window exits "already running" without leaving anything to
-        // connect to; only a later one, once the lock is free, brings a daemon
-        // back. An unnecessary spawn costs a fork that exits the same way.
+        // Spawning again is not redundant: a daemon shutting down unlinks its
+        // socket while still holding the pid-file lock, so a spawn in that
+        // window exits "already running" and leaves nothing to connect to.
         spawn_bzbd(&bzbd_program(), deadline).await?;
         spawned = true;
     }
@@ -332,18 +289,15 @@ fn bzbd_program() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("bzbd"))
 }
 
-/// Starts `bzbd` in daemonize mode. The daemonizing parent exits once its
-/// child is serving or has failed, so waiting for it both paces the retry and
-/// surfaces startup errors; a child that never reports is bounded by
-/// `deadline`.
+/// Starts `bzbd`. The daemonizing parent exits once its child is serving or
+/// has failed, so waiting for it surfaces startup errors.
 async fn spawn_bzbd(program: &Path, deadline: Instant) -> Result<(), BusybeeError> {
     let child = Command::new(program)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        // Timing out below drops the handle, which on its own neither kills
-        // nor reaps the process; without this a daemon that hangs before
-        // reporting outlives every client that tried to start it.
+        // A dropped handle neither kills nor reaps: without this a daemon
+        // hanging before it reports outlives every client that tried.
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| BusybeeError::DaemonUnreachable {
@@ -408,19 +362,14 @@ mod tests {
         });
     }
 
-    /// All of the state-directory rules in one test: the environment is
-    /// process-wide, so splitting them would race across test threads.
+    /// One test because the environment is process-wide.
     #[tokio::test]
     async fn state_dir_resolves_the_environment_in_order() {
         temp_env(&[("BUSYBEE_STATE_DIR", Some("/tmp/override"))], || {
             assert_eq!(state_dir().unwrap(), PathBuf::from("/tmp/override"));
         });
 
-        // An empty or relative override is a misconfiguration, not a request
-        // for the default: falling back silently would hide it, and a relative
-        // one would resolve per working directory, so callers started from
-        // different directories would each reach a different socket and
-        // auto-start a daemon of their own.
+        // A misconfiguration, not a request for the default.
         for value in ["", "relative/state"] {
             temp_env(&[("BUSYBEE_STATE_DIR", Some(value))], || {
                 let err = state_dir().unwrap_err().to_string();
@@ -441,9 +390,7 @@ mod tests {
             },
         );
 
-        // An empty or relative XDG value counts as unset. Honouring a relative
-        // one would put the socket in a different place per working directory,
-        // and each of those would auto-start its own daemon.
+        // An empty or relative XDG value counts as unset.
         for value in ["", "relative/state"] {
             temp_env(
                 &[
@@ -461,8 +408,6 @@ mod tests {
             );
         }
 
-        // The home-relative default needs an absolute HOME for the same
-        // reason: `.local/state/busybee` would resolve per working directory.
         for home in [None, Some(""), Some("relative/home")] {
             temp_env(
                 &[
@@ -522,9 +467,8 @@ mod tests {
         assert!(events.next().await.unwrap().is_none());
     }
 
-    /// `Finished` carries the exit code, so a stream that stops before it lost
-    /// the lease. Reporting that as a normal end of stream would let a
-    /// `while let Some(..)` consumer exit as if the command had succeeded.
+    /// A normal end here would let a `while let Some(..)` consumer exit as if
+    /// the command had succeeded.
     #[tokio::test]
     async fn events_report_a_stream_that_ends_before_the_lease_finishes() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -545,10 +489,6 @@ mod tests {
         assert!(context.contains("finish"), "{context}");
     }
 
-    /// Only a socket nothing is listening on means "no daemon". A daemon that
-    /// accepted the connection and then failed is running and broken, and a
-    /// caller that reads every failure as absence — `busybee status` reporting
-    /// an idle pool — would hide it.
     #[tokio::test]
     async fn connect_if_listening_separates_an_absent_daemon_from_a_broken_one() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -576,12 +516,7 @@ mod tests {
         assert!(err.to_string().contains("bzbd"), "{err}");
     }
 
-    /// A wedged daemon accepts the connection and then says nothing. A one-shot
-    /// command has no deadline of its own, so without one here `busybee status`
-    /// would wait on the pong for as long as the daemon stays wedged.
-    ///
-    /// Time is paused: the runtime advances the clock to the timeout once every
-    /// task is blocked, so this asserts the deadline without waiting for it.
+    /// Paused clock: the runtime jumps to the timeout once every task blocks.
     #[tokio::test(start_paused = true)]
     async fn connect_if_listening_gives_up_on_a_daemon_that_never_answers() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -599,10 +534,6 @@ mod tests {
         assert!(context.contains("handshake"), "{context}");
     }
 
-    /// A daemon that answered and refused our version is reachable: reporting
-    /// it as unreachable would send `connect_or_spawn_bzbd` off to spawn a
-    /// replacement that immediately exits as "already running", hiding the
-    /// real reason behind a startup timeout.
     #[tokio::test]
     async fn a_refused_handshake_is_a_protocol_error_not_an_unreachable_daemon() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -625,9 +556,6 @@ mod tests {
         );
     }
 
-    /// A transport failure on a bzbd socket must name bzbd. The shared
-    /// `Network` variant reads "pueue-lib I/O error", which points the user at
-    /// a daemon that had nothing to do with it.
     #[tokio::test]
     async fn a_broken_bzbd_connection_names_bzbd() {
         let (ours, _theirs) = UnixStream::pair().unwrap();
@@ -649,9 +577,6 @@ mod tests {
         assert!(context.contains("bzbd"), "{context}");
     }
 
-    /// The daemon caps what it reads at [`MAX_LINE_BYTES`]; a client that does
-    /// not cap what it reads back is the same unbounded buffer with the roles
-    /// swapped, so a stale or buggy daemon could hang or exhaust it.
     #[tokio::test]
     async fn an_oversized_response_line_is_rejected_instead_of_buffered() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -683,9 +608,6 @@ mod tests {
         );
     }
 
-    /// A rejection that came from bzbd has to name bzbd: `EnqueueRejected`
-    /// reads "pueued rejected our request", which sends the user to the logs of
-    /// a daemon that was never involved.
     #[tokio::test]
     async fn a_rejected_lease_names_bzbd() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -712,11 +634,6 @@ mod tests {
         );
     }
 
-    /// The limit binds what we write as well as what we read. The daemon stops
-    /// reading at [`MAX_LINE_BYTES`] and closes the connection, so a client
-    /// that writes past it races its own `EPIPE` against the daemon's framing
-    /// error and reports an unreachable daemon instead of the oversized
-    /// message.
     #[tokio::test]
     async fn an_oversized_request_is_refused_before_it_reaches_the_socket() {
         let (ours, theirs) = UnixStream::pair().unwrap();
@@ -756,10 +673,6 @@ mod tests {
         assert!(written.is_empty(), "the refused request was still written");
     }
 
-    /// A daemon that answers with bytes that are not UTF-8 is reachable and
-    /// breaking the protocol. Calling that unreachable would send
-    /// `connect_or_spawn_bzbd` off to spawn a replacement, which exits as
-    /// "already running", and the real reason would never be reported.
     #[tokio::test]
     async fn an_invalid_utf8_reply_is_a_protocol_error_not_an_unreachable_daemon() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -779,8 +692,6 @@ mod tests {
         assert!(message.contains("utf-8"), "message was {message:?}");
     }
 
-    /// A daemon that accepts connections but never answers must not hang the
-    /// client past its startup deadline.
     #[tokio::test]
     async fn a_stalled_daemon_fails_the_handshake_at_the_deadline() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -799,10 +710,6 @@ mod tests {
         assert!(Instant::now() < deadline + Duration::from_secs(1));
     }
 
-    /// A hung daemon must not survive the client that gave up on it. Timing
-    /// out only drops the `Child` handle, and a dropped handle neither kills
-    /// nor reaps the process on its own, so the forking parent would linger
-    /// while later clients time out against it in turn.
     #[tokio::test]
     async fn a_daemon_that_never_reports_is_killed_at_the_deadline() {
         use std::os::unix::fs::PermissionsExt;
@@ -829,7 +736,6 @@ mod tests {
         assert!(!survived.exists(), "the timed-out daemon was left running");
     }
 
-    /// Sets environment variables around `body`, restoring them afterwards.
     fn temp_env(vars: &[(&str, Option<&str>)], body: impl FnOnce()) {
         let saved: Vec<_> = vars
             .iter()

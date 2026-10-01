@@ -1,47 +1,11 @@
-//! Admission state machine (pure; no IO, no time source).
+//! Admission state machine (pure; no IO, no time source): FIFO, head only,
+//! driven by [`Event`]s and answering with [`Action`]s. See
+//! `docs/design/bzbd.md` §Admission policy.
 //!
-//! See `docs/design/bzbd.md` § "Admission policy". Restated here so the daemon
-//! can integrate without re-deriving the rules:
-//!
-//! Queue is FIFO and only the head is considered. A lease at the head is
-//! admitted when:
-//!
-//! 1. `admitted_count < max_concurrent` (default 4). Needed because
-//!    make/ninja/cargo each run one job *without* a token (the implicit
-//!    token), so unbounded admission would add one uncounted job per task.
-//! 2. Class-specific:
-//!    - [`Class::Jobserver`]: admitted as soon as (1) holds; takes no tokens
-//!      up front (`drain_target` 0).
-//!    - [`Class::Static`]: `drain_target = clamp(cores_wanted, 1, fair)` where
-//!      `fair = ceil(pool_size / (admitted_count + 1))` — fair share at the
-//!      moment of admission. `cores_wanted` defaults to `fair`.
-//!    - [`Class::None`]: static with `cores_wanted = pool_size`, and
-//!      additionally only when nothing at all is admitted (exclusive: today's
-//!      whole-machine behaviour; admitted jobserver leases block it too).
-//!
-//! Head-of-line blocking is intentional: a `none` lease waits for the pool to
-//! be fully free, and everything behind it waits too. Priorities, preemption
-//! and reordering are out of scope.
-//!
-//! `drain_target` is a target, not a grant: the daemon drains up to that many
-//! tokens within its deadline and starts the task with whatever it collected,
-//! the implicit token providing the minimum of one. The `{cores}` number a
-//! static or none task is told is therefore the *collected* count, which only
-//! the daemon knows — so [`Action::Admit`] carries `cores: None` for those,
-//! and `Some(fair)` only for jobserver, which drains nothing. See
-//! [`Action::Admit`].
-//!
-//! The machine is driven by [`Event`]s and answers with [`Action`]s; the
-//! daemon performs the IO (draining fifo tokens, submitting to pueued,
-//! notifying clients) and reports back with `Started`/`Finished`.
-//!
-//! Token accounting contract: the machine tracks tokens but never moves them.
-//! An ending lease's tokens must be back in the fifo before the daemon
-//! performs the actions returned for that event, because the next
-//! [`Action::Admit`] is sized as if they were already free. After
-//! [`Event::Finished`] the daemon has done that itself (the task exited), so
-//! no [`Action::Drop`] accompanies it; [`Event::Cancel`] and
-//! [`Event::DrainFailed`] need teardown, so they get one first.
+//! The machine tracks tokens but never moves them: an ending lease's tokens
+//! must be back in the fifo before the daemon performs the actions returned
+//! for that event, because the next [`Action::Admit`] is sized as if they
+//! were already free.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -49,8 +13,7 @@ use std::collections::{BTreeMap, VecDeque};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LeaseId(pub u64);
 
-/// How a task shares the token pool, as decided by [`crate::classify`].
-pub use crate::classify::Class;
+use crate::classify::Class;
 
 /// A queued lease request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,8 +22,6 @@ pub struct Request {
     pub class: Class,
     /// Static/none target; defaults to the fair share when absent.
     pub cores_wanted: Option<u32>,
-    /// Human-readable label, surfaced by `busybee status`.
-    pub label: String,
 }
 
 /// Admission parameters, from the config file.
@@ -86,16 +47,9 @@ pub enum Event {
     /// The task exited or was killed. The daemon has already returned the
     /// lease's tokens to the fifo, so no [`Action::Drop`] is emitted for it.
     Finished(LeaseId),
-    /// The daemon could not launch the task at all — the fifo was unreadable,
-    /// or the submission to pueued failed. The lease ends without ever
-    /// running; keeps the machine honest.
-    ///
-    /// A drain that collects fewer tokens than `drain_target`, or none at all,
-    /// is *not* this: a static task starts with whatever it collected, the
-    /// implicit token providing the minimum of one, and the daemon reports
-    /// [`Event::Started`] with the count it got (possibly 0). Ending the lease
-    /// there would mean a second static task never runs whenever the first one
-    /// already drained the pool.
+    /// The daemon could not launch the task at all (fifo unreadable, pueued
+    /// submission failed). A short drain is *not* this: the task starts with
+    /// what it collected and the daemon reports [`Event::Started`].
     DrainFailed(LeaseId),
 }
 
@@ -110,23 +64,10 @@ pub enum Action {
         id: LeaseId,
         class: Class,
         drain_target: u32,
-        /// The value the daemon substitutes for the `{cores}` placeholder (and
-        /// `{cores-1}`, `BUSYBEE_CORES`, `RUST_TEST_THREADS`) — when the
-        /// machine is the one that knows it.
-        ///
-        /// `Some(ceil(pool_size / (admitted_count + 1)))` for
-        /// [`Class::Jobserver`]: it drains nothing, so this fair share is the
-        /// only number available, and its threads that do not speak the
-        /// protocol still need bounding. It is reported per admission because
-        /// it is count-sensitive — one batch can admit leases whose shares
-        /// differ, so the daemon cannot recover it from the queue afterwards.
-        ///
-        /// `None` for [`Class::Static`]/[`Class::None`]: those are told the
-        /// tokens the drain actually collected, `max(1, collected)` with the
-        /// implicit token as the minimum, which only the daemon knows.
-        /// `drain_target` is that number's upper bound, not a substitute for
-        /// it: a drain that comes up short and still reports `drain_target`
-        /// would let the running tasks demand more cores than the pool has.
+        /// The `{cores}` value: the fair share for [`Class::Jobserver`], which
+        /// drains nothing (per admission, since one batch can admit leases
+        /// with different shares); `None` for static/none, which are told
+        /// what the drain collected (`drain_target` is only its upper bound).
         cores: Option<u32>,
     },
     /// The lease's queue position changed; tell the client `ahead` tasks
@@ -146,25 +87,19 @@ pub struct AdmittedLease {
     /// Tokens the daemon actually collected, 0 until [`Event::Started`]
     /// arrives (and permanently 0 for [`Class::Jobserver`]).
     pub cores_held: u32,
-    pub label: String,
 }
 
-/// Read-only view for `busybee status`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
-    /// Waiting leases, head first.
+    /// Head first.
     pub queued: Vec<Request>,
-    /// Admitted leases, ordered by [`LeaseId`].
+    /// Ordered by [`LeaseId`].
     pub admitted: Vec<AdmittedLease>,
-    /// `pool_size − Σ cores_held`, saturating at 0. The daemon overlays the
-    /// real `FIONREAD` value; this is only an estimate.
-    pub free_estimate: u32,
 }
 
 struct Admitted {
     class: Class,
     cores_held: u32,
-    label: String,
 }
 
 /// FIFO admission state machine. Drive it with [`Scheduler::handle`].
@@ -187,22 +122,15 @@ impl Scheduler {
         }
     }
 
-    /// Feed one event, get the actions the daemon must perform.
-    ///
-    /// Terminal events naming a lease the machine does not know about are
-    /// ignored: the daemon and the machine can race on a lease that just
-    /// ended, and there is nothing left to account for. [`Event::Started`] is
-    /// not terminal — for an untracked lease it means a task went live after
-    /// its teardown, so it answers with another [`Action::Drop`].
+    /// Terminal events for unknown leases are ignored (the daemon can race a
+    /// lease that just ended). [`Event::Started`] for one is answered with
+    /// another [`Action::Drop`]: the task went live after its teardown.
     pub fn handle(&mut self, ev: Event) -> Vec<Action> {
         let mut actions = Vec::new();
         match ev {
             Event::Submit(r) => self.queue.push_back(r),
             Event::Started { id, cores_held } => match self.admitted.get_mut(&id) {
                 Some(lease) => lease.cores_held = cores_held,
-                // Torn down while its drain was still in flight, and the task
-                // launched anyway: it is live and holds tokens the machine no
-                // longer tracks. Ask for teardown again rather than leaking it.
                 None => actions.push(Action::Drop(id)),
             },
             Event::Finished(id) => {
@@ -228,26 +156,20 @@ impl Scheduler {
         actions
     }
 
-    /// Accounts for a lease that is already running: one a previous daemon
-    /// admitted and left behind (`docs/design/bzbd.md` §Failure and recovery,
-    /// "bzbd dies"). Admission is not consulted — the task is on the machine
-    /// whatever the policy would say now — so what matters is that its slot
-    /// and `cores_held` count against everything admitted from here on, and
-    /// come back with [`Event::Finished`] or [`Event::Cancel`] like any
-    /// other lease's.
+    /// Accounts for a lease a previous daemon left running (spec §Failure and
+    /// recovery). Policy is not consulted; its slot and tokens count against
+    /// everything admitted from here on.
     pub fn adopt(&mut self, r: Request, cores_held: u32) {
         self.admitted.insert(
             r.id,
             Admitted {
                 class: r.class,
                 cores_held,
-                label: r.label,
             },
         );
     }
 
     pub fn snapshot(&self) -> Snapshot {
-        let held: u32 = self.admitted.values().map(|l| l.cores_held).sum();
         Snapshot {
             queued: self.queue.iter().cloned().collect(),
             admitted: self
@@ -257,21 +179,13 @@ impl Scheduler {
                     id: *id,
                     class: l.class,
                     cores_held: l.cores_held,
-                    label: l.label.clone(),
                 })
                 .collect(),
-            free_estimate: self.params.pool_size.saturating_sub(held),
         }
     }
 
-    /// Config reload. Already-held tokens are never revoked: a shrunk
-    /// `pool_size` only affects future admissions and clamps
-    /// [`Snapshot::free_estimate`] at 0.
-    ///
-    /// Returns actions like [`Scheduler::handle`] does, because a raised
-    /// `max_concurrent` or `pool_size` can make the queue head eligible with
-    /// no other event in sight: without re-evaluating here the new capacity
-    /// would sit unused until a running task ends.
+    /// Config reload. Held tokens are never revoked. Returns actions because
+    /// raised limits can make the head eligible with no other event coming.
     pub fn set_params(&mut self, p: Params) -> Vec<Action> {
         self.params = p;
         let mut actions = self.admit_from_head();
@@ -279,7 +193,7 @@ impl Scheduler {
         actions
     }
 
-    /// Admit as long as the head qualifies. Only the head is ever considered.
+    /// Admit as long as the head qualifies.
     fn admit_from_head(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
         while let Some(head) = self.queue.front() {
@@ -288,7 +202,6 @@ impl Scheduler {
             };
             let cores = match head.class {
                 Class::Jobserver => Some(self.fair_share(None)),
-                // The drain decides this one; see [`Action::Admit::cores`].
                 Class::Static | Class::None => None,
             };
             let r = self.queue.pop_front().expect("front() just returned Some");
@@ -303,7 +216,6 @@ impl Scheduler {
                 Admitted {
                     class: r.class,
                     cores_held: 0,
-                    label: r.label,
                 },
             );
         }
@@ -323,9 +235,8 @@ impl Scheduler {
         match r.class {
             Class::Jobserver => Some(0),
             Class::Static => Some(self.fair_share(r.cores_wanted)),
-            // Exclusive. Note this is stricter than `Σ cores_held == 0`: a
-            // lease admitted but not yet `Started` holds no tokens *yet* but is
-            // about to, and admitted jobserver leases never hold any.
+            // Stricter than `Σ cores_held == 0`: admitted-but-not-started and
+            // jobserver leases hold no tokens yet still block exclusivity.
             Class::None if self.admitted.is_empty() => {
                 Some(self.fair_share(Some(self.params.pool_size)))
             }
@@ -344,7 +255,6 @@ impl Scheduler {
         cores_wanted.unwrap_or(fair).clamp(1, fair)
     }
 
-    /// One [`Action::Notify`] per queued lease whose position changed.
     fn notify_queue(&mut self) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut notified = BTreeMap::new();
@@ -375,11 +285,9 @@ mod tests {
             id: LeaseId(id),
             class,
             cores_wanted,
-            label: format!("task {id}"),
         }
     }
 
-    /// Submit, then report the drain finished with `cores_held` tokens.
     fn submit_and_start(s: &mut Scheduler, r: Request, cores_held: u32) -> Vec<Action> {
         let id = r.id;
         let actions = s.handle(Event::Submit(r));
@@ -507,7 +415,7 @@ mod tests {
             id: LeaseId(2),
             cores_held: 2,
         });
-        assert_eq!(s.snapshot().free_estimate, 0);
+        assert_eq!(s.snapshot().admitted[1].cores_held, 2);
     }
 
     #[test]
@@ -763,7 +671,7 @@ mod tests {
         assert_eq!(s.handle(Event::Finished(LeaseId(9))), vec![]);
         assert_eq!(s.handle(Event::Cancel(LeaseId(9))), vec![]);
         assert_eq!(s.handle(Event::DrainFailed(LeaseId(9))), vec![]);
-        assert_eq!(s.snapshot().free_estimate, 8);
+        assert!(s.snapshot().admitted.is_empty());
     }
 
     #[test]
@@ -804,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reports_queue_order_admitted_leases_and_free_estimate() {
+    fn snapshot_reports_queue_order_and_admitted_leases() {
         let mut s = Scheduler::new(params(8, 2));
         submit_and_start(&mut s, req(1, Class::Jobserver, None), 0);
         submit_and_start(&mut s, req(2, Class::Static, Some(3)), 3);
@@ -823,17 +731,14 @@ mod tests {
                     id: LeaseId(1),
                     class: Class::Jobserver,
                     cores_held: 0,
-                    label: "task 1".into(),
                 },
                 AdmittedLease {
                     id: LeaseId(2),
                     class: Class::Static,
                     cores_held: 3,
-                    label: "task 2".into(),
                 },
             ]
         );
-        assert_eq!(snap.free_estimate, 5);
     }
 
     #[test]
@@ -848,7 +753,6 @@ mod tests {
             snap.admitted[0].cores_held, 8,
             "held tokens are never revoked"
         );
-        assert_eq!(snap.free_estimate, 0, "free estimate saturates at 0");
 
         // The new pool size governs the next admission.
         s.handle(Event::Finished(LeaseId(1)));
@@ -919,19 +823,14 @@ mod tests {
                 cores: None,
             }]
         );
-        assert_eq!(s.snapshot().free_estimate, 8);
     }
 
-    /// A lease a previous daemon left running is on the machine whatever the
-    /// policy would say about admitting it now: it is counted — slot, tokens,
-    /// exclusivity — against everything admitted from here on, and releases
-    /// them like any other lease when it ends.
     #[test]
     fn an_adopted_lease_is_admitted_without_policy_and_counts_against_the_rest() {
         let mut s = Scheduler::new(params(4, 1));
         s.adopt(req(7, Class::Static, None), 3);
         // No `Started` to wait for: the tokens are already held.
-        assert_eq!(s.snapshot().free_estimate, 1);
+        assert_eq!(s.snapshot().admitted[0].cores_held, 3);
         // And a second one is taken on even though `max_concurrent` is 1.
         s.adopt(req(8, Class::None, None), 0);
 
@@ -955,7 +854,6 @@ mod tests {
                 cores: Some(4),
             }]
         );
-        assert_eq!(s.snapshot().free_estimate, 4);
     }
 
     #[test]

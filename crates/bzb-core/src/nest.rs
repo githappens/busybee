@@ -1,26 +1,18 @@
-//! Nested gating: a child `busybee` whose parent already holds a lease
-//! passes through instead of queueing behind its own ancestor.
-//!
-//! Pure: the client reads [`LEASE_ENV`] and a status snapshot, this decides
-//! whether to skip the daemon. See `docs/design/bzbd.md` §Nesting.
+//! Pure: a child `busybee` whose parent holds a live lease passes through
+//! instead of queueing behind its own ancestor (spec §Nesting).
 
 use crate::protocol::LeaseView;
 
-/// Written into every admitted task so a nested `busybee` can see that it is
-/// already running under a lease. The daemon fills the id at admission; the
-/// classifier never emits this variable, and a config row may not take it.
+/// Set by the daemon at admission in every task's environment.
 pub const LEASE_ENV: &str = "BUSYBEE_LEASE";
 
-/// The line a nested client prints before it `exec`s. Named so tests and the
-/// output contract quote the same string.
+/// What a nested client prints before it `exec`s.
 pub fn passthrough_line(id: u64) -> String {
     format!("busybee: nested under lease {id}, passing through")
 }
 
-/// Whether a blocking client that saw `marker` in [`LEASE_ENV`] should skip
-/// the queue and run the command itself. `None` means submit as normal: no
-/// marker, a marker that is not a lease id, or a lease that is not live
-/// (queued, or already gone — a stale export).
+/// The parent lease to pass through under, or `None` to submit as normal: no
+/// or unparseable marker, or a lease that is queued or gone (stale export).
 pub fn passthrough_parent(marker: Option<&str>, leases: &[LeaseView]) -> Option<u64> {
     let id = marker?.parse::<u64>().ok()?;
     leases
@@ -62,8 +54,6 @@ mod tests {
         assert_eq!(passthrough_parent(Some("3"), &leases), Some(3));
     }
 
-    /// An adopted lease is still on the machine; a child inside it would
-    /// deadlock the same way as under a connected parent.
     #[test]
     fn an_orphaned_parent_passes_through() {
         assert_eq!(
