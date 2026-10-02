@@ -417,14 +417,17 @@ The runner (`tests/scenarios/runner.py`):
   the runner's stdout.
 - **Result.** Diagnostics come first: the modes of everything under the root,
   config and daemon logs, and process masks. Then cleanup stops every marked
-  process, TERM then KILL, within its window. The result is one JSON document
+  process, TERM then KILL, within its window, then removes the root and checks
+  that it is gone. The result is one JSON document
   (`busybee.scenario.result/v1`). A failed assertion is `product_failure` and
-  stays one. A preflight or fixture fault, an unevaluated assertion, or a
-  surviving process is `environment_failure`. The deadline gives `timeout`.
+  stays one. A preflight or fixture fault, an unevaluated assertion, a
+  surviving process or a root that was not removed is `environment_failure`.
+  The deadline gives `timeout`.
 
 The controller checks that result against the runner's exit status and the
 declared assertions. Output that is not a valid result is an environment
-failure, never a product failure. It writes `runs/<run>/scenarios/<exec>/result.json`.
+failure, never a product failure. It writes `runs/<run>/scenarios/<exec>/result.json`;
+a scenario refused before its exec was queued ran nothing and leaves no record.
 Coverage takes the latest run in each mode: a scenario is verified only when
 every required mode's latest run passed, and a prepared pass is reported
 alongside a missing or failing cold run, never in its place. The runner covers
