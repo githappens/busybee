@@ -23,6 +23,7 @@ import registry
 import scenario
 import supervisor
 import template
+import terminal_ops
 import worker
 
 REPO = Path(__file__).resolve().parents[2]
@@ -32,10 +33,6 @@ EXIT_OK, EXIT_FAILED, EXIT_UNSUPPORTED = 0, 1, 3
 # Documented install location, used only when the tool is not on PATH and the
 # config names no path. Reported as the source so the choice is visible.
 APP_BUNDLE = Path("/Applications/Parallels Desktop.app/Contents/MacOS")
-
-# Operations this revision does not implement yet.
-UNSUPPORTED = {"terminal": ("open", "send", "resize", "capture")}
-
 
 class Host:
     """Read-only facts about the machine running the controller."""
@@ -265,13 +262,16 @@ def worker_operation(repo, args, host, operation):
             return None
         if operation == "worker create":
             return workers.create(args.name, args.revision, args.patch)
-        if operation == "exec":
+        if operation in ("exec", "terminal open"):
             malformed = [item for item in args.env if "=" not in item]
             if malformed:
                 raise worker.Refused("env_invalid", f"--env takes NAME=VALUE, not {', '.join(malformed)}")
             env = dict(item.partition("=")[::2] for item in args.env)
             timeout = config["deadlines"]["command"] if args.timeout is None else args.timeout
-            return workers.exec(args.run_id, args.command, args.cwd, env, timeout, args.detach)
+            if operation == "exec":
+                return workers.exec(args.run_id, args.command, args.cwd, env, timeout, args.detach)
+            return terminal_ops.open_terminal(workers, args.run_id, args.command, args.cols, args.rows, args.cwd,
+                                              env, timeout)
         if operation == "signal":
             return workers.signal(args.run_id, args.signal, args.pid)
         if operation == "status":
@@ -282,6 +282,12 @@ def worker_operation(repo, args, host, operation):
             return workers.read(args.run_id, args.exec, args.stream, args.offset, args.limit)
         if operation == "scenario":
             return scenario.run(workers, args.run_id, args.scenario, args.mode, args.bin_dir)
+        if operation == "terminal send":
+            return terminal_ops.send(workers, args.run_id, args.handle, args.text, args.key or (), args.bytes)
+        if operation == "terminal resize":
+            return terminal_ops.resize(workers, args.run_id, args.handle, args.cols, args.rows)
+        if operation == "terminal capture":
+            return terminal_ops.capture(workers, args.run_id, args.handle, args.expect, args.timeout)
         method = {"worker reset": workers.reset, "worker destroy": workers.destroy, "inspect": workers.inspect,
                   "collect": workers.collect, "console capture": workers.console_capture,
                   "export": workers.export}[operation]
@@ -293,13 +299,6 @@ def worker_operation(repo, args, host, operation):
     except (guest.GuestError, parallels.ParallelsError) as err:
         return contracts.result(operation, "environment_failure", "the worker did not answer",
                                 [contracts.finding("worker_unreachable", str(err))])
-
-
-def unsupported(operation):
-    return contracts.result(operation, "unsupported",
-                            f"{operation} is not implemented in this controller revision", [
-                                contracts.finding("operation_unsupported", f"{operation} has not shipped; "
-                                                  "see docs/design/agent-lab.md §Implementation sequence")])
 
 
 def summary(result):
@@ -379,10 +378,29 @@ def parser():
     ops.add_parser("collect", parents=[target], help="export source changes and log digests")
     ops.add_parser("console", help="capture a worker's display").add_subparsers(dest="action", required=True) \
         .add_parser("capture", parents=[target])
-    for group, names in UNSUPPORTED.items():
-        sub = ops.add_parser(group).add_subparsers(dest="action", required=True)
-        for name in names:
-            sub.add_parser(name).add_argument("args", nargs=argparse.REMAINDER)
+    term = ops.add_parser("terminal", help="a real PTY in a worker").add_subparsers(dest="action", required=True)
+    topen = term.add_parser("open", parents=[target],
+                            help="start argv in a terminal: terminal open RUN_ID [--cols C --rows R] -- ARGV...")
+    topen.add_argument("--cols", type=int, default=120)
+    topen.add_argument("--rows", type=int, default=40)
+    topen.add_argument("--cwd", default=worker.CHECKOUT)
+    topen.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
+                       help="TERM and LANG default to xterm-256color and C.UTF-8")
+    topen.add_argument("--timeout", type=int, help="seconds the terminal may live; default deadlines.command")
+    terminal_handle = argparse.ArgumentParser(add_help=False, parents=[target])
+    terminal_handle.add_argument("handle", help="terminal handle printed by terminal open")
+    tsend = term.add_parser("send", parents=[terminal_handle], help="input to the terminal's program")
+    what = tsend.add_mutually_exclusive_group(required=True)
+    what.add_argument("--text", help="characters, as typed")
+    what.add_argument("--key", action="append", help="a named key, e.g. Enter, Up, 'Ctrl c'; repeatable")
+    what.add_argument("--bytes", help="raw bytes as hex, e.g. 1b5b41")
+    tresize = term.add_parser("resize", parents=[terminal_handle], help="change the terminal's size")
+    tresize.add_argument("--cols", type=int, required=True)
+    tresize.add_argument("--rows", type=int, required=True)
+    tcapture = term.add_parser("capture", parents=[terminal_handle],
+                               help="settled screen text, cells and image, and the recording so far")
+    tcapture.add_argument("--expect", help="wait until the screen shows this text first")
+    tcapture.add_argument("--timeout", type=int, default=10, help="seconds to wait and settle")
     return root
 
 
@@ -396,8 +414,6 @@ def main(argv=None):
         outcome = doctor(REPO, args.config, Host())
     elif args.operation == "template":
         outcome = template_operation(REPO, args, Host())
-    elif args.operation in UNSUPPORTED:
-        outcome = unsupported(f"{args.operation} {args.action}")
     else:
         operation = " ".join(filter(None, (args.operation, getattr(args, "action", None))))
         outcome = worker_operation(REPO, args, Host(), operation)

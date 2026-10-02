@@ -343,19 +343,23 @@ class CliTests(unittest.TestCase):
     def run_cli(self, *args):
         return subprocess.run([sys.executable, str(self.SCRIPT), *args], capture_output=True, text=True)
 
-    def test_controller_reports_unimplemented_operations(self):
-        for argv in (["terminal", "open", "w"], ["terminal", "send", "w", "q"], ["terminal", "resize", "w"],
-                     ["terminal", "capture", "w"]):
-            with self.subTest(argv):
-                out = self.run_cli("--json", *argv)
-                self.assertEqual(out.returncode, vmctl.EXIT_UNSUPPORTED, out.stderr)
-                result = json.loads(out.stdout)
-                self.assertEqual(result["status"], "unsupported")
-                self.assertEqual(result["operation"], " ".join(argv[:2]))
-                self.assertNotEqual(result["status"], "success")
-                human = self.run_cli(*argv)
-                self.assertEqual(human.returncode, vmctl.EXIT_UNSUPPORTED)
-                self.assertIn("unsupported", human.stdout)
+    def test_terminal_operations_are_implemented(self):
+        # They parse and reach the controller: without a config they fail as an
+        # environment failure, never as an unimplemented operation.
+        run = "r-20261001T000000Z-abcdef"
+        with tempfile.TemporaryDirectory() as tmp:
+            config = ["--config", str(Path(tmp) / "absent.toml")]
+            for argv in (["terminal", "open", run, *config, "--", "true"],
+                         ["terminal", "send", run, "0001", "--text", "q", *config],
+                         ["terminal", "resize", run, "0001", "--cols", "80", "--rows", "24", *config],
+                         ["terminal", "capture", run, "0001", *config]):
+                with self.subTest(argv[:2]):
+                    out = self.run_cli("--json", *argv)
+                    self.assertEqual(out.returncode, vmctl.EXIT_FAILED, out.stderr)
+                    result = json.loads(out.stdout)
+                    self.assertEqual(result["operation"], " ".join(argv[:2]))
+                    self.assertEqual(result["status"], "environment_failure")
+                    self.assertEqual({f["code"] for f in result["findings"]}, {"config_missing"})
 
     def test_template_operations_need_a_valid_config(self):
         with tempfile.TemporaryDirectory() as tmp:

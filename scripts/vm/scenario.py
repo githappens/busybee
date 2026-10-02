@@ -18,12 +18,17 @@ scenario's required fixture modes.
 import hashlib
 import io
 import json
+import re
+import shlex
 import subprocess
 import sys
 import tarfile
 
 import contracts
 import evidence
+import guest
+import screen
+import template
 import worker
 
 SCENARIOS = "tests/scenarios"
@@ -32,6 +37,9 @@ RECORD_SCHEMA = "busybee.vm.scenario/v1"
 # The runner's own cleanup window, and the development shell's startup.
 CLEANUP_S = 30
 START_S = 60
+# What a runner may name as its terminal directory, and its terminals.
+TERMINAL_DIR = re.compile(r"^/var/tmp/bzt-[A-Za-z0-9_]+$")
+TERMINAL_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
 
 def _runner(repo):
@@ -62,6 +70,44 @@ def archive(repo):
                 tar.addfile(info, io.BytesIO(data))
     data = buf.getvalue()
     return data, hashlib.sha256(data).hexdigest()
+
+
+def stage_runner(workers, run_id, record):
+    """Stage the controller's runner, scenarios and terminal host into the
+    guest; returns the staged directory and the archive's digest."""
+    data, digest = archive(workers.repo)
+    stage = f"{STAGE}/{digest[:16]}"
+    with worker.locked(workers._lock(run_id)):
+        workers._window()
+        workers._guest(record).run(f"mkdir -p {stage} && tar -xf - -C {stage}", workers._bound("command"),
+                                   stdin=data)
+    return stage, digest
+
+
+def terminals(workers, run_id, record, name, reported):
+    """Fetch, render and summarise the terminals a scenario reported; returns
+    (summaries by handle, problems)."""
+    gdir, names = reported.get("dir"), reported.get("names")
+    if not isinstance(gdir, str) or not TERMINAL_DIR.match(gdir) or not isinstance(names, list) \
+            or not all(isinstance(n, str) and TERMINAL_NAME.match(n) for n in names):
+        return {}, ["the runner reported its terminals in an unexpected form"]
+    found, problems = {}, []
+    try:
+        workers._window()
+        g = workers._guest(record)
+        for terminal in names:
+            hdir = worker.run_dir(workers.state, run_id) / "terminal" / f"{name}-{terminal}"
+            try:
+                worker.fetch_terminal(g, workers._bound("command"), f"{gdir}/{terminal}", hdir)
+                screen.render_handle(hdir)
+            except (screen.RecordingError, screen.RenderError, tarfile.TarError, OSError) as err:
+                problems.append(f"terminal {terminal}: {worker._reason(err)}")
+            found[hdir.name] = screen.summary(hdir)
+        if not problems:  # otherwise the guest keeps the only copy
+            g.run(f"rm -rf {shlex.quote(gdir)}", workers._bound("command"))
+    except (guest.GuestError, worker.Refused, template.DeadlineExceeded) as err:
+        problems.append(f"terminals: {worker._reason(err)}")
+    return found, problems
 
 
 def _controller(repo):
@@ -112,12 +158,7 @@ def run(workers, run_id, scenario_id, mode, bin_dir="build/debug"):
     _, record = workers._owned(run_id)
     if record["status"] != "ready":
         raise worker.Refused("worker_not_ready", f"worker {run_id} is {record['status']}")
-    data, digest = archive(workers.repo)
-    stage = f"{STAGE}/{digest[:16]}"
-    with worker.locked(workers._lock(run_id)):
-        workers._window()
-        workers._guest(record).run(f"mkdir -p {stage} && tar -xf - -C {stage}", workers._bound("command"),
-                                   stdin=data)
+    stage, digest = stage_runner(workers, run_id, record)
     argv = ["nix", "develop", "-c", "python3", f"{stage}/runner.py", "run", scenario_id, "--mode", mode,
             "--bin-dir", bin_dir, "--cleanup-s", str(CLEANUP_S)]
     done = workers.exec(run_id, argv, worker.CHECKOUT, {}, timeout)
@@ -130,12 +171,17 @@ def run(workers, run_id, scenario_id, mode, bin_dir="build/debug"):
         return contracts.result("scenario", status, f"{scenario_id} ({mode}): {status}, nothing ran", findings, {
             "run_id": run_id, "scenario": scenario_id, "mode": mode, "exec": None, "path": None,
             "assertions": assertions, "coverage": None})
+    shown, problems = terminals(workers, run_id, record, name, parsed["terminals"]) \
+        if parsed and parsed.get("terminals") else ({}, [])
+    findings += [contracts.finding("terminal_evidence_missing", p) for p in problems]
+    if problems and status == "success":
+        status = "environment_failure"  # a pass needs its terminal evidence
     entry = {"schema": RECORD_SCHEMA, "scenario": scenario_id, "issue": meta.get("issue"), "mode": mode,
              "required_modes": meta["required_modes"], "status": status, "exec": name,
              "exec_status": done["status"], "findings": findings, "assertions": assertions,
              "failed": [a["name"] for a in assertions if a["status"] == "failed"],
              "source": record["source"], "provenance": done["data"].get("provenance"),
-             "runner": {"sha256": digest, **_controller(workers.repo)}, "result": parsed}
+             "runner": {"sha256": digest, **_controller(workers.repo)}, "terminals": shown, "result": parsed}
     path = worker.run_dir(workers.state, run_id) / "scenarios" / name / "result.json"
     evidence.durable(path, (json.dumps(entry, indent=2) + "\n").encode())
     covered = evidence.coverage(evidence.scenario_records(worker.run_dir(workers.state, run_id)))[scenario_id]

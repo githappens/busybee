@@ -17,6 +17,14 @@ env:
   PUEUE_VERSION: "4.0.4"
   # The jobserver tests need make >= 4.4's fifo jobserver; neither runner image ships it.
   MAKE_VERSION: "4.4.1"
+  # The VM lab renders terminal recordings on the host (scripts/vm/screen.py)
+  # with these; the development shell pins the same versions through nixpkgs.
+  PYTHON_VERSION: "3.13"
+  PYTE_VERSION: "0.8.2"
+  PILLOW_VERSION: "12.1.1"
+  FONTTOOLS_VERSION: "4.61.1"
+  AGG_VERSION: "1.7.0"
+  DEJAVU_VERSION: "2.37"
 
 jobs:
   check:
@@ -28,8 +36,10 @@ jobs:
         include:
           - os: ubuntu-latest
             pueued_asset: pueued-x86_64-unknown-linux-musl
+            agg_asset: agg-x86_64-unknown-linux-gnu
           - os: macos-latest
             pueued_asset: pueued-aarch64-apple-darwin
+            agg_asset: agg-aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
 
@@ -90,6 +100,24 @@ jobs:
           atleast pueued 4.0 "$(pueued --version | awk '{print $2}')"
 
       - run: cargo fmt --all --check
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install terminal rendering tools
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet "pyte==$PYTE_VERSION" "pillow==$PILLOW_VERSION" "fonttools==$FONTTOOLS_VERSION"
+          curl -fsSL -o "$HOME/.local/bin/agg" \
+            "https://github.com/asciinema/agg/releases/download/v$AGG_VERSION/${{ matrix.agg_asset }}"
+          chmod +x "$HOME/.local/bin/agg"
+          agg --version
+          fonts="$RUNNER_TEMP/dejavu"
+          mkdir -p "$fonts"
+          curl -fsSL "https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_${DEJAVU_VERSION//./_}/dejavu-fonts-ttf-$DEJAVU_VERSION.tar.bz2" \
+            | tar xj -C "$fonts" --strip-components=2 "dejavu-fonts-ttf-$DEJAVU_VERSION/ttf"
+          echo "BUSYBEE_TERMINAL_FONTS=$fonts" >> "$GITHUB_ENV"
 
       - name: Check agent harness
         run: |

@@ -361,7 +361,7 @@ class Lab:
         installed.run(f"cd {GUEST_CHECKOUT} && nix develop -c cargo fetch", self._bound("scenario"))
         tools = {}
         for tool, command in (("nixos", "nixos-version"), ("nix", "nix --version"), ("kernel", "uname -r"),
-                              ("rustc", f"cd {GUEST_CHECKOUT} && nix develop -c rustc --version")):
+                              ("zellij", "zellij --version"), ("rustc", f"cd {GUEST_CHECKOUT} && nix develop -c rustc --version")):
             tools[tool] = installed.run(command, self._bound("command"))[1].strip().splitlines()[-1]
         installed.run("bash -s", self._bound("command"), stdin=(self.repo / INFRA / "linux" / "clean.sh").read_bytes())
         return tools

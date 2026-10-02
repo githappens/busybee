@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 import base64
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -22,12 +23,14 @@ import re
 import shlex
 import shutil
 import subprocess
+import tarfile
 import time
 
 import contracts
 import evidence
 import guest
 import parallels
+import screen
 import template
 
 # One active worker until concurrency becomes a budgeted controller setting.
@@ -174,6 +177,17 @@ def _after_exec(status_path, pid_path):
             f'cd {CHECKOUT} || exit 0; printf "head: %s\\n" "$(git rev-parse HEAD)"; '
             f'printf "dirty: %s\\n" "$(git status --porcelain | wc -l)"; '
             f'for f in {binaries}; do [ -f "$f" ] && sha256sum "$f" | sed "s/^/binary: /"; done; true')
+
+
+# A guest terminal's files the host keeps (tests/scenarios/terminal.py).
+TERMINAL_FILES = ("state.json", "recording", "captures")
+
+
+def fetch_terminal(g, timeout, gdir, hdir):
+    """Copy a guest terminal's state, recording and captures into `hdir`."""
+    data = g.run(f"cd {shlex.quote(gdir)} && tar -cf - {' '.join(TERMINAL_FILES)}", timeout, raw=True)[1]
+    with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+        tar.extractall(hdir, filter="data")
 
 
 def parse_after_exec(text):
@@ -716,7 +730,8 @@ class Workers(template.Lab):
         kept = [n for n in ("source.json", "commits.bundle", "worktree.diff") if durable(n)]
         source = json.loads((cdir / "source.json").read_text()) if "source.json" in kept else None
         complete = source is not None and "worktree.diff" in kept and \
-            (source["head"] == source["base"] or "commits.bundle" in kept)
+            (source["head"] == source["base"] or "commits.bundle" in kept) and \
+            not any(m.startswith("terminal ") for m in previous.get("missing", []))
         for name in kept:
             artifacts[self._rel(cdir / name)] = saved[self._rel(cdir / name)]
             acknowledged.append(self._rel(cdir / name))
@@ -731,6 +746,7 @@ class Workers(template.Lab):
                 g = self._guest(record, boot=True)
                 outputs = [(n, p) for n, p in self._source_outputs(g, record) if n not in kept]
                 observations = self._observe(g)
+                missing += self._fetch_terminals(g, rdir)
             except Exception as err:  # unreachable guest: every source artifact is missing
                 missing.append(f"source: {_reason(err)}")
         for name, produce in outputs:
@@ -742,11 +758,12 @@ class Workers(template.Lab):
                 missing.append(f"{name}: {_reason(err)}")
         if self._rel(cdir / "source.json") in artifacts:
             source = json.loads((cdir / "source.json").read_text())
-        # Logs, results and checkpoints are already on the host; make them durable and digest them.
+        # Logs, results, checkpoints, console screenshots and terminals are
+        # already on the host; make them durable and digest them.
         on_host = sorted(rdir.glob("exec/*/*")) + sorted(rdir.glob("scenarios/*/*")) + sorted(rdir.glob("checkpoint/*")) \
-            + sorted(rdir.glob("console/*"))
+            + sorted(rdir.glob("console/*")) + sorted(p for p in rdir.glob("terminal/**/*") if p.is_file())
         for path in on_host:
-            if path.name not in EVIDENCE_FILES and path.parent.name != "console":
+            if path.name not in EVIDENCE_FILES and path.relative_to(rdir).parts[0] not in ("console", "terminal"):
                 continue
             try:
                 with open(path, "rb") as f:
@@ -767,7 +784,8 @@ class Workers(template.Lab):
                     "template": baseline, "allocation": record["allocation"], "deadline": record["deadline"],
                     "commands": self._commands(rdir), "observations": observations,
                     "cleanup": self.events(record["run_id"]), "artifacts": artifacts,
-                    "acknowledged": acknowledged, "missing": missing, "scenarios": self._scenarios(rdir)}
+                    "acknowledged": acknowledged, "missing": missing, "scenarios": self._scenarios(rdir),
+                    "terminals": screen.handles(rdir)}
         path = cdir / "collected.json"
         try:
             evidence.durable(path.with_suffix(".tmp"), (json.dumps(manifest, indent=2) + "\n").encode())
@@ -775,6 +793,20 @@ class Workers(template.Lab):
         except OSError as err:
             missing.append(f"collected.json: {_reason(err)}")
         return manifest, path, missing
+
+    def _fetch_terminals(self, g, rdir):
+        """Bring every `vmctl terminal` handle's recording and captures up to
+        date from the guest; returns what could not be fetched. Scenario
+        terminals were fetched when their scenario finished."""
+        missing = []
+        for meta_path in sorted(rdir.glob("terminal/*/handle.json")):
+            meta = json.loads(meta_path.read_text())
+            try:
+                fetch_terminal(g, self._bound("command"), meta["guest_dir"], meta_path.parent)
+                screen.render_handle(meta_path.parent)
+            except (guest.GuestError, tarfile.TarError, OSError, screen.RecordingError, screen.RenderError) as err:
+                missing.append(f"terminal {meta_path.parent.name}: {_reason(err)}")
+        return missing
 
     def checkpoint(self, g, record):
         """Replace the run's source checkpoint with what the guest holds now, so
@@ -954,6 +986,7 @@ class Workers(template.Lab):
         if record is None:
             raise Refused("target_not_owned", f"no recorded run {run_id}")
         out = evidence.export(self.repo, self.state, record)
-        return contracts.result("export", "success", f"public evidence for run {run_id}", data={
+        return contracts.result("export", "success", f"public evidence for run {run_id}",
+                                [contracts.finding("artifact_missing", m, "warning") for m in out["missing"]], {
             "run_id": run_id, "path": self._rel(out["path"]), "files": len(out["files"]),
-            "withheld": sorted(out["withheld"]), "redactions": out["redactions"]})
+            "withheld": sorted(out["withheld"]), "missing": out["missing"], "redactions": out["redactions"]})

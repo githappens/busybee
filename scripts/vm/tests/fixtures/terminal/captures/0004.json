@@ -1,0 +1,13 @@
+{
+  "schema": "busybee.terminal.capture/v1",
+  "capture": "0004",
+  "label": "closed",
+  "at": "2026-10-02T10:24:32Z",
+  "output_bytes": 561,
+  "settled": true,
+  "cols": 60,
+  "rows": 20,
+  "screen": null,
+  "ansi": null,
+  "pane": null
+}
