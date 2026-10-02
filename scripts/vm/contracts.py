@@ -11,8 +11,9 @@ import secrets
 
 CONFIG_SCHEMA = 1
 TEMPLATE_SCHEMA = "busybee.vm.template/v2"
-WORKER_SCHEMA = "busybee.vm.worker/v1"
+WORKER_SCHEMA = "busybee.vm.worker/v2"
 RESULT_SCHEMA = "busybee.vm.result/v1"
+EVIDENCE_SCHEMA = "busybee.vm.evidence/v1"
 
 # What a controller operation can end as. Only `success` is a pass.
 RESULT_STATES = ("success", "product_failure", "environment_failure", "timeout", "cancelled",
@@ -27,11 +28,18 @@ STATE_ROOT = Path("build/vm")
 DEADLINE_BOUNDS = {"command": (1, 6 * 3600), "scenario": (1, 12 * 3600), "run": (1, 24 * 3600),
                    "cleanup": (1, 3600)}
 BUDGET_BOUNDS = {"cpus": (1, 256), "memory_mib": (1024, 1024 * 1024), "storage_gib": (8, 16 * 1024)}
+# One worker's allocation: a share of the budget, plus the host storage its run's
+# logs and evidence may use.
+WORKER_BOUNDS = {**BUDGET_BOUNDS, "artifact_mib": (16, 1024 * 1024)}
 
 # provisioning: its source is not (or no longer) in the guest; ready: running
 # with its source; stopped: halted after guest control failed; retained:
-# collection failed, kept stopped; failed: creation did not finish.
-WORKER_STATES = ("provisioning", "ready", "stopped", "retained", "failed", "destroyed")
+# collection failed, kept stopped; expired: halted by the supervisor at the run
+# deadline; failed: creation or reset did not finish.
+WORKER_STATES = ("provisioning", "ready", "stopped", "retained", "expired", "failed", "destroyed")
+# Halted by the controller after a collection attempt: the guest cannot have
+# changed since, so a retry completes that collection instead of starting over.
+FROZEN_STATES = ("stopped", "retained", "expired")
 
 UUID = re.compile(r"^\{[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}\}$")
 RUN_ID = re.compile(r"^r-\d{8}T\d{6}Z-[0-9a-f]{6}$")
@@ -100,7 +108,7 @@ def config_errors(config, repo):
             errors.append(("config_invalid", "deadlines must nest: command <= scenario <= run"))
     _bounded("budget", config.get("budget"), BUDGET_BOUNDS, errors)
     # One worker's allocation; all active workers together stay within the budget.
-    _bounded("worker", config.get("worker"), BUDGET_BOUNDS, errors)
+    _bounded("worker", config.get("worker"), WORKER_BOUNDS, errors)
     budget, allocation = config.get("budget"), config.get("worker")
     if isinstance(budget, dict) and isinstance(allocation, dict):
         for key in BUDGET_BOUNDS:
@@ -188,8 +196,8 @@ def worker_errors(record):
         errors.append(f"status must be one of {', '.join(WORKER_STATES)}")
     if not isinstance(record["source"], dict) or not re.match(r"^[0-9a-f]{40}$", str(record["source"].get("revision"))):
         errors.append("source must record the full revision transferred")
-    if not isinstance(record["allocation"], dict) or set(record["allocation"]) != set(BUDGET_BOUNDS):
-        errors.append(f"allocation must name {', '.join(BUDGET_BOUNDS)}")
+    if not isinstance(record["allocation"], dict) or set(record["allocation"]) != set(WORKER_BOUNDS):
+        errors.append(f"allocation must name {', '.join(WORKER_BOUNDS)}")
     if record["template"] not in GUEST_OS or record["clone_strategy"] not in CLONE_STRATEGIES:
         errors.append("template or clone_strategy is not a supported value")
     try:
@@ -199,6 +207,28 @@ def worker_errors(record):
             errors.append("deadline must be after created_at")
     except (TypeError, ValueError):
         errors.append(f"timestamps must be {TIMESTAMP}")
+    return errors
+
+
+def evidence_errors(manifest):
+    """Problems with a run's evidence manifest (collected.json)."""
+    fields = {"schema", "run_id", "collected_at", "source", "template", "allocation", "deadline", "commands",
+              "observations", "cleanup", "artifacts", "acknowledged", "missing"}
+    if not isinstance(manifest, dict):
+        return ["manifest must be an object"]
+    errors = [f"unknown field {k!r}" for k in sorted(set(manifest) - fields)]
+    errors += [f"missing field {k!r}" for k in sorted(fields - set(manifest))]
+    if errors:
+        return errors
+    if manifest["schema"] != EVIDENCE_SCHEMA:
+        errors.append(f"schema must be {EVIDENCE_SCHEMA}")
+    if not valid_run_id(manifest["run_id"]):
+        errors.append("run_id is malformed")
+    for key in ("commands", "cleanup", "acknowledged", "missing"):
+        if not isinstance(manifest[key], list):
+            errors.append(f"{key} must be a list")
+    if not isinstance(manifest["artifacts"], dict):
+        errors.append("artifacts must map a path to its sha256")
     return errors
 
 
