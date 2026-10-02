@@ -28,7 +28,9 @@
     trusted-users = [ "root" ];
   };
 
-  environment.systemPackages = with pkgs; [ git ];
+  # zellij hosts the terminals `vmctl terminal` and the scenarios drive; its
+  # pane-id actions need 0.45 or later (scenario tools gate that version).
+  environment.systemPackages = with pkgs; [ git zellij ];
 
   users.mutableUsers = false;
   # Root logs in only with the key file above, which NixOS cannot see at

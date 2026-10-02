@@ -1,0 +1,18 @@
+# #77: the live monitor observed through a real terminal. Prepared daemons:
+# the monitor never starts one, and a cold start would meet #69 first.
+schema = "busybee.scenario/v1"
+id = "live-monitor"
+summary = "The workspace-built monitor shows idle, running and queued work at two sizes, marks unanswered status stale, reports a daemon that is gone, and quits on q and Ctrl-C"
+issue = 77
+platforms = ["linux"]
+modes = ["prepared"]
+required_modes = ["prepared"]
+deadline_s = 180
+procedure = "live_monitor"
+assertions = ["monitor_shows_idle_pool", "work_is_running_and_queued", "monitor_shows_running_and_queued_work", "monitor_matches_status", "narrow_monitor_shows_work", "monitor_marks_unanswered_status_stale", "quit_during_slow_status_exits", "monitor_reports_daemon_not_running", "ctrl_c_exits"]
+
+[tools]
+busybee = "workspace"
+bzbd = "workspace"
+pueued = ">=4.0"
+zellij = ">=0.45"

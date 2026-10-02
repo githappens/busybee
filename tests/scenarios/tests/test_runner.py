@@ -149,8 +149,8 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(runner.version_from_describe("0.1.0-5-gabcdef1"), "0.1.5")
         self.assertEqual(runner.version_from_describe("v1.4.7-3-gabcdef1"), "1.4.10")
         self.assertIsNone(runner.version_from_describe("release-5-gabcdef1"))
-        self.assertTrue(runner.at_least("4.0.4", "4.0"))
-        self.assertFalse(runner.at_least("3.9.9", "4.0"))
+        self.assertTrue(runner.terminal.at_least("4.0.4", "4.0"))
+        self.assertFalse(runner.terminal.at_least("3.9.9", "4.0"))
 
 
 class FakeProcesses:
@@ -343,6 +343,11 @@ class FakeFixture:
         self.test, self.mode, self.wedge, self.cold_ok = test, mode, wedge, cold_ok
         self.calls = []
         self.root = Path("/tmp/bzs-test")
+        self.terminals, self.terminal_dir = {}, None
+
+    def close_terminals(self, seconds):
+        self.calls.append("close_terminals")
+        return {name: {"forced": [], "remaining": []} for name in self.terminals}
 
     def write(self):
         self.calls.append("write")
@@ -437,6 +442,26 @@ class RunScenarioTests(unittest.TestCase):
         self.assertEqual(result["status"], "environment_failure")
         self.assertIn("runner_error", [f["code"] for f in result["findings"]])
         self.assertEqual(self.fixtures[0].calls[-1], "cleanup")
+
+    def test_terminals_are_closed_before_cleanup_and_reported(self):
+        def drove_a_terminal(fx, check, deadline):
+            fx.terminals["monitor"], fx.terminal_dir = object(), Path("/var/tmp/bzt-test")
+            for name in check.declared:
+                check.record(name, True, "seen")
+        result = self.run_scenario("cold", drove_a_terminal)
+        self.assertEqual(result["status"], "success", result["findings"])
+        calls = self.fixtures[0].calls
+        self.assertLess(calls.index("close_terminals"), calls.index("cleanup"))
+        self.assertEqual(result["terminals"], {"dir": "/var/tmp/bzt-test", "names": ["monitor"],
+                                               "closed": {"monitor": {"forced": [], "remaining": []}}})
+        self.assertNotIn("terminals", self.run_scenario("cold", wedged_procedure))
+
+    def test_a_terminal_that_cannot_be_provided_is_environment_failure(self):
+        def no_zellij(fx, check, deadline):
+            raise runner.terminal.TerminalError("tool_version_too_old", "zellij is 0.40.0")
+        result = self.run_scenario("cold", no_zellij)
+        self.assertEqual(result["status"], "environment_failure")
+        self.assertIn("tool_version_too_old", {f["code"] for f in result["findings"]})
 
     def test_result_is_one_json_document(self):
         result = self.run_scenario("cold", wedged_procedure)

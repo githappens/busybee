@@ -190,6 +190,53 @@ class ScenarioTests(unittest.TestCase):
         self.assertNotIn(self.run_id, (public / "scenarios" / "0001" / "result.json").read_text())
 
 
+class ScenarioTerminalTests(unittest.TestCase):
+    """A scenario that drove terminals: their recordings come back to the host."""
+
+    def setUp(self):
+        from test_terminal_ops import TerminalGuest
+        self.lab = Lab(self)
+        shutil.copytree(REPO / "tests" / "scenarios", self.lab.repo / "tests" / "scenarios",
+                        ignore=shutil.ignore_patterns("tests", "__pycache__"))
+        meta = self.lab.repo / "tests" / "scenarios" / "umask-startup.toml"
+        meta.write_text(meta.read_text().replace("deadline_s = 90", "deadline_s = 30"))
+        self.lab.guest = TerminalGuest()
+        self.lab.guest.hang = False
+        self.run_id = self.lab.create()
+
+    def scenario(self, status, exit_code, terminals):
+        self.lab.guest.stdout = runner_result(status, failed=("task_runs",) if status == "product_failure" else (),
+                                              terminals=terminals)
+        self.lab.guest.exit_code = exit_code
+        return scenario.run(self.lab.workers(), self.run_id, "umask-startup", "cold")
+
+    def test_terminals_are_fetched_rendered_and_removed_from_the_guest(self):
+        result = self.scenario("success", 0, {"dir": "/var/tmp/bzt-abc123", "names": ["monitor"], "closed": {}})
+        self.assertEqual(result["status"], "success", result["findings"])
+        record = json.loads((self.lab.state / result["data"]["path"]).read_text())
+        shown = record["terminals"]["0001-monitor"]
+        self.assertEqual([c["agrees"] for c in shown["captures"]], [True, True, True, None])
+        hdir = worker.run_dir(self.lab.state, self.run_id) / "terminal" / "0001-monitor"
+        self.assertTrue((hdir / "captures" / "0003.png").read_bytes().startswith(b"\x89PNG"))
+        commands = [c for c, _ in self.lab.guest.commands]
+        self.assertIn("cd /var/tmp/bzt-abc123/monitor && tar -cf - state.json recording captures", commands)
+        self.assertIn("rm -rf /var/tmp/bzt-abc123", commands)
+
+    def test_terminal_evidence_that_cannot_be_fetched_keeps_a_pass_from_passing(self):
+        for terminals in ({"dir": "/etc", "names": ["monitor"]}, {"dir": "/var/tmp/bzt-abc123", "names": ["../x"]}):
+            with self.subTest(terminals=terminals):
+                result = self.scenario("success", 0, terminals)
+                self.assertEqual(result["status"], "environment_failure")
+                self.assertIn("terminal_evidence_missing", codes(result))
+        # A product failure stays one; the missing evidence is said alongside it.
+        self.lab.guest.files = self.lab.state  # a directory without a recording
+        result = self.scenario("product_failure", 1, {"dir": "/var/tmp/bzt-abc123", "names": ["monitor"]})
+        self.assertEqual(result["status"], "product_failure")
+        self.assertIn("terminal_evidence_missing", codes(result))
+        # The guest keeps the only copy of what could not be fetched.
+        self.assertNotIn("rm -rf /var/tmp/bzt-abc123", [c for c, _ in self.lab.guest.commands])
+
+
 class CoverageTests(unittest.TestCase):
     def test_latest_result_per_mode_decides(self):
         records = [{"scenario": "s", "mode": "cold", "status": "success", "required_modes": ["cold"]},

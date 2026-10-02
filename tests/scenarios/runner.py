@@ -19,9 +19,13 @@ procedure (procedures.py) with the assertions it checks. The runner:
    root. Cold mode writes nothing else: busybee's own client path starts both
    daemons. Prepared mode starts them deliberately, under umask 0022.
 3. The procedure, as an unprivileged user (root would bypass the permission
-   checks a scenario is about), bounded by the scenario deadline.
-4. Diagnostics, then a cleanup bounded by --cleanup-s that stops every process
-   carrying the fixture's marker and removes the root.
+   checks a scenario is about), bounded by the scenario deadline. A procedure
+   that drives a terminal (terminal.py) opens it through the fixture: its
+   zellij runtime lives under the root, its recording in a separate terminal
+   directory the controller fetches afterwards.
+4. Diagnostics, then a cleanup bounded by --cleanup-s that closes the
+   terminals, stops every process carrying the fixture's marker and removes
+   the root.
 
 stdout carries exactly one JSON result (RESULT_SCHEMA); progress goes to stderr.
 Exit status: 0 success, 1 product_failure, 2 environment_failure, 3 timeout,
@@ -44,6 +48,7 @@ import tomllib
 import traceback
 
 import procedures
+import terminal
 
 HERE = Path(__file__).resolve().parent
 META_SCHEMA = "busybee.scenario/v1"
@@ -65,6 +70,8 @@ MARKER = "BUSYBEE_SCENARIO_ROOT"
 DAEMONS = ("bzbd", "pueued")
 TASK_UMASK = 0o022
 DAEMON_START_S = 10
+# Terminal recordings outlive the fixture root: the controller fetches them.
+TERMINAL_BASE = "/var/tmp"
 LOG_TAIL = 64 * 1024
 MAX_DEADLINE_S = 3600
 SCENARIO_ID = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -159,12 +166,6 @@ def version_from_describe(text):
     return f"{major}.{minor}.{patch + ahead}"
 
 
-def at_least(version, minimum):
-    def parts(v):
-        return [int(p) for p in re.findall(r"\d+", v)[:3]]
-    return parts(version) >= parts(minimum)
-
-
 def sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
@@ -231,7 +232,7 @@ def preflight(meta, bin_dir, checkout, probe):
             if expected is not None and fact["version"] != expected:
                 findings.append(finding("tool_version_mismatch", f"{name} is {fact['version']}; the checkout "
                                         f"builds {expected}"))
-        elif not at_least(fact["version"], requirement[2:]):
+        elif not terminal.at_least(fact["version"], requirement[2:]):
             findings.append(finding("tool_version_too_old", f"{name} is {fact['version']}; {meta['id']} needs "
                                     f"{requirement}"))
     return {"platform": platform, "expected_version": expected, "tools": tools}, findings
@@ -315,6 +316,8 @@ class Fixture:
         self.procs, self.kill = procs, kill
         self.root = None
         self.written = []
+        self.terminal_dir = None
+        self.terminals = {}
 
     @property
     def bin(self):
@@ -417,6 +420,26 @@ class Fixture:
             started.append({"name": name, "pid": running[0]["pid"] if running else None,
                             "umask": running[0]["umask"] if running else None})
         return started
+
+    def terminal(self, name, argv, cols, rows, deadline):
+        """Start argv as the scenario user in a terminal of cols x rows; its
+        recording goes to the fixture's terminal directory."""
+        if self.terminal_dir is None:
+            self.terminal_dir = Path(tempfile.mkdtemp(prefix="bzt-", dir=TERMINAL_BASE))
+            self.terminal_dir.chmod(0o755)
+        t = terminal.Terminal(self.terminal_dir / name, f"bzt-{name}-{os.urandom(3).hex()}", argv, cols, rows,
+                              self.root / "work", self.env(), self.root / "zj" / name, user=self.user.prefix,
+                              owner=(self.user.uid, self.user.gid))
+        self.terminals[name] = t
+        try:
+            t.start(min(deadline, monotonic() + terminal.START_S))
+        except terminal.TerminalError as err:
+            raise HarnessError(err.code, f"terminal {name}: {err}") from err
+        return t
+
+    def close_terminals(self, seconds):
+        """Close every terminal the procedure opened; returns what each needed."""
+        return {name: t.close(seconds) for name, t in self.terminals.items()}
 
     def diagnostics(self):
         """Modes of everything the run created, the routing config and the
@@ -539,7 +562,7 @@ def run_scenario(meta, mode, bin_dir, checkout, cleanup_s, probe, make_fixture, 
                 fixture["daemons"] = fx.prepare(deadline)
             print(f"runner: {meta['id']} ({mode}) running {meta['procedure']}", file=sys.stderr)
             procs[meta["procedure"]].fn(fx, check, deadline)
-        except HarnessError as err:
+        except (HarnessError, terminal.TerminalError) as err:
             harness.append(finding(err.code, str(err)))
         except Deadline as err:
             timed_out = finding("scenario_timeout", f"the {meta['deadline_s']}s deadline passed during {err}")
@@ -547,6 +570,9 @@ def run_scenario(meta, mode, bin_dir, checkout, cleanup_s, probe, make_fixture, 
             harness.append(finding("runner_error", "".join(traceback.format_exception(err))[-2000:]))
     if fx is not None:
         fixture.update(fx.describe())
+        if fx.terminals:
+            closed = fx.close_terminals(max(1, cleanup_s // 3))
+            result["terminals"] = {"dir": str(fx.terminal_dir), "names": sorted(fx.terminals), "closed": closed}
         try:
             result["diagnostics"] = fx.diagnostics()
         except Exception as err:  # the cleanup still runs

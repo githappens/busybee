@@ -8,9 +8,8 @@ macOS without asking a person to operate its development environment.
 **Status: design for implementation.** `doctor`, the Linux `template`
 operations, and Linux workers with `exec`, `inspect`, `signal`, `console
 capture`, `collect`, run supervision, exec handles (`status`, `wait`, `read`),
-the public `export` and Linux regression `scenario` runs
-(`scripts/vm/vmctl.py`, `tests/scenarios/`) have shipped; the `terminal`
-operations return `unsupported`.
+the public `export`, Linux regression `scenario` runs and the `terminal`
+operations (`scripts/vm/vmctl.py`, `tests/scenarios/`) have shipped.
 Until the rest lands, [CLAUDE.md](../../CLAUDE.md) and the
 [Sortie workflow](../../sortie/README.md) remain the operational instructions.
 
@@ -299,19 +298,25 @@ artifacts already saved with a matching digest are acknowledged and only the
 rest is fetched. A repeated destroy, or one whose VM is already gone, succeeds.
 
 `collected.json` is the versioned evidence manifest
-(`busybee.vm.evidence/v2`, `contracts.evidence_errors`): source base, head,
+(`busybee.vm.evidence/v3`, `contracts.evidence_errors`): source base, head,
 status and patch hash, the baseline's provisioning revision, lock hashes and
 tool versions, the allocation and deadline, every command with its argv,
 environment, timings, result and binary digests, process and daemon
 observations, the controller's cleanup events, artifact digests, acknowledged
-artifacts, what is missing, and `scenarios`: each scenario run's mode, status
+artifacts, what is missing, `scenarios`: each scenario run's mode, status
 and failed assertions, and per scenario the coverage of its required fixture
-modes (§Test the real startup path). `export RUN` writes a separate publishable copy
+modes (§Test the real startup path), and `terminals`: per terminal handle its
+command, terminal type and locale, sizes, how its program exited, and each
+capture with whether its two views agree (§Make UI behavior observable).
+`export RUN` writes a separate publishable copy
 to `runs/<run-id>/public/`: environment values outside an allowlist, tokens and
 keys, machine paths, user and host names, IP and MAC addresses, and VM,
 snapshot and run identities become labelled placeholders, while exit codes,
-timings and output keep their meaning. Bundles and images cannot be scanned,
-so the export lists them by digest instead of copying them.
+timings and output keep their meaning. Bundles and Parallels screenshots cannot
+be scanned, so the export lists them by digest instead of copying them. Terminal
+images are rendered from text, so the export redacts each terminal's recording
+and screens with placeholders of the same length, which keeps the timing log
+and the layout valid, and renders its cells and images again from that copy.
 
 `template prune linux` deletes each retained baseline that no registered worker
 was cloned from, and keeps and reports the rest.
@@ -319,8 +324,8 @@ was cloned from, and keeps and reports the rest.
 The unit tests under `scripts/vm/tests` need no Parallels. The acceptance tests
 that build, validate and compare real candidates, and drive real workers, run
 against the local config when opted in: `BUSYBEE_VM_LAB=1 python3 -m unittest
-test_real_template test_real_worker test_real_supervision test_real_scenarios`
-in that directory. The scenario runner's own tests need neither:
+test_real_template test_real_worker test_real_supervision test_real_scenarios
+test_real_terminal` in that directory. The scenario runner's own tests need neither:
 `python3 -m unittest discover -s tests/scenarios/tests`.
 
 Long commands return a run handle with status, elapsed time, last-output time,
@@ -441,6 +446,67 @@ It supports `q`, Ctrl-C, resize events, and screens captured before and after
 state changes. Preserve the raw terminal recording as well as decoded screen
 text and rendered images. Label images rendered from terminal cells separately
 from VM console screenshots.
+
+The guest template carries zellij, pinned through the lab flake; the terminal
+host is `tests/scenarios/terminal.py`, staged like the scenarios:
+
+- **Session.** Each terminal is one zellij session with a unique name and one
+  borderless pane, no bars and no session serialization; opening it checks the
+  pane runs the requested command, since reusing a name would silently attach
+  to an older session. A headless zellij session has a fixed size, so the host
+  attaches a zellij client through a PTY it owns: dimensions are that PTY's
+  window size, and a resize is a window-size change and SIGWINCH on it. No
+  zellij action is sent before the pane's command is running: an action is a
+  client connection, and one that ends before the session is set up crashes
+  zellij 0.45.1's server. zellij older than 0.45, which lacks pane-addressed
+  actions, is refused in preflight.
+- **Input.** Bytes, text and named keys reach the pane through zellij's
+  pane-addressed actions; named keys are encoded for the pane's current
+  terminal modes, as a terminal would.
+- **Recording.** The pane runs the command under util-linux `script`, whose
+  advanced timing log records every output and input chunk, each window-size
+  change and the exit code. zellij's own screen and its report of the pane
+  (`dump-screen`, `list-panes`) form a second, independent view.
+- **Captures.** A capture waits for the program's output to pause briefly,
+  takes zellij's screen, and is settled when no output arrived meanwhile, so
+  the screen belongs to a known point of the recording even for a program
+  that redraws on a timer. It is bounded by a deadline (an unsettled capture
+  is reported as such), optionally after waiting for expected text. Readiness is always such a
+  predicate with a deadline, never a fixed sleep.
+- **Cells and images, on the host.** `scripts/vm/screen.py` replays the
+  recording through pyte at the recorded sizes into a cell grid, checks its
+  text against zellij's screen of the same moment, and renders the grid with
+  agg in the development shell's pinned font. Each image records its font,
+  cell size, renderer and the characters the font lacks; pixel output may
+  differ between hosts, so no test compares pixels.
+- **Lifetime.** Every process a terminal starts carries a marker naming it,
+  and closing a terminal stops exactly those, within `timeout`'s kill grace.
+  zellij runs in sessions of its own, so a holder killed outright (SIGKILL)
+  leaves its terminal running until the worker is reset or destroyed. In a
+  scenario the zellij runtime lives under the fixture root, so the fixture's
+  cleanup is a second bound.
+
+`vmctl terminal open RUN [--cols C --rows R] [--cwd D] [--env N=V] [--timeout
+S] -- ARGV` starts the host as a detached exec, so the run's supervisor and
+deadlines bound the terminal like any command, and returns a handle. `terminal
+send RUN H (--text T | --key K... | --bytes HEX)`, `terminal resize RUN H
+--cols C --rows R` and `terminal capture RUN H [--expect TEXT] [--timeout S]`
+act on it; capturing a terminal whose program has exited replays the whole
+recording. The terminal ends with its program, at its timeout, or when the
+agent sends the holder pid that `open` reports a `signal`. Artifacts go to
+`runs/<run>/terminal/<handle>/`: the controller's `handle.json`, the guest's
+`state.json`, `recording/{output,input,timing}` and per capture `NNNN.json`
+(zellij's view), `NNNN.cells.json` (the replayed cells and text, and whether
+they agree) and `NNNN.png`. A scenario's terminals are fetched to
+`runs/<run>/terminal/<exec>-<name>/`. Parallels screenshots stay under
+`console/`. `collect` first brings each terminal's recording and captures up
+to date from the guest, listing any it cannot fetch as missing, and `export`
+carries both kinds of image apart; the capture result names the image an agent
+should inspect.
+
+The `live-monitor` scenario runs the workspace-built monitor in prepared mode
+(it never starts a daemon) through the cases below at 120x40 and 60x20, pairing
+each view with `busybee status --json`.
 
 Exercise running and queued work, an idle pool, unavailable or stale daemon
 data, long labels, narrow terminals, and quitting during a slow status request.

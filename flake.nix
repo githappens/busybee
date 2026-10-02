@@ -74,9 +74,13 @@
             # A missing jq makes the hook exit 127, which Claude Code does not
             # treat as a deny.
             pkgs.jq
-            # Agent review packets and harness tests.
-            pkgs.python3
+            # Agent review packets and harness tests; pyte replays VM lab
+            # terminal recordings into screen cells.
+            (pkgs.python3.withPackages (ps: [ ps.pyte ps.pillow ps.fonttools ]))
+            # Renders those recordings to images, with the pinned font below.
+            pkgs.asciinema-agg
           ];
+          BUSYBEE_TERMINAL_FONTS = "${pkgs.dejavu_fonts}/share/fonts/truetype";
         };
 
         # Optional orchestrator tools; no host profile or service activation.

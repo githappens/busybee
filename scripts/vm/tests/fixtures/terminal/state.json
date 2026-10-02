@@ -1,0 +1,39 @@
+{
+  "schema": "busybee.terminal/v1",
+  "status": "closed",
+  "session": "bzt-0008-5294ac",
+  "argv": [
+    "python3",
+    "/var/tmp/busybee-scenarios/bcf770aaaf9a052b/pty_fixture.py"
+  ],
+  "cwd": "/root/busybee",
+  "env": {
+    "TERM": "xterm-256color",
+    "LANG": "C.UTF-8"
+  },
+  "cols": 60,
+  "rows": 20,
+  "term": "xterm-256color",
+  "lang": "C.UTF-8",
+  "zellij": "0.45.1",
+  "runtime": "/var/tmp/busybee-terminal/r-20261001T000000Z-abcdef/0008/runtime",
+  "holder_pid": 16508,
+  "python": "/nix/store/9krbpcbnb766dk5s6mmwaplgs4vys6h1-python3-3.13.12-env/bin/python3",
+  "started_at": "2026-10-02T10:24:14.753546Z",
+  "pts": "/dev/pts/0",
+  "client_pid": 16518,
+  "pane": 0,
+  "ready_at": "2026-10-02T10:24:14.814205Z",
+  "app": {
+    "exited": true,
+    "exit_status": 130
+  },
+  "closed_at": "2026-10-02T10:24:28.985588Z",
+  "closed": {
+    "forced": [],
+    "remaining": []
+  },
+  "stopped_by": null,
+  "lost": null,
+  "drained_bytes": 296479
+}

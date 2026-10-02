@@ -6,7 +6,15 @@ environment values outside ENV_ALLOWLIST, credentials, machine paths, the
 user and host names, IP and MAC addresses, and VM, snapshot and run identities
 are replaced by labelled placeholders. Exit codes, timings, argv and logs keep
 their meaning. Binary artifacts cannot be scanned, so they are listed by
-digest instead of copied.
+digest instead of copied: commit bundles and the Parallels screenshots under
+`console/`.
+
+Terminal images are different: they are rendered from text. A terminal's
+recording and zellij's screens are redacted with placeholders of the same
+length, so the timing log's byte counts and the screen layout still hold, and
+its cells and images are rendered again from that redacted copy (screen.py);
+the private images are never copied. Text is scanned as written, so a value a
+terminal wrapped across lines is matched only as far as each line holds it.
 """
 import getpass
 import hashlib
@@ -18,6 +26,7 @@ import shutil
 import socket
 
 import contracts
+import screen
 
 PUBLIC_SCHEMA = "busybee.vm.public/v1"
 # Environment values that describe a run without identifying the host or
@@ -53,21 +62,32 @@ class Redactor:
         if n:
             self.counts[label] = self.counts.get(label, 0) + n
 
-    def bytes(self, data):
+    def bytes(self, data, keep_length=False):
+        """`data` with every secret replaced by `<label>`, or with `keep_length`
+        by a placeholder of the secret's own length, so offsets into it hold."""
+        def placeholder(found, label):
+            if not keep_length:
+                return f"<{label}>".encode()
+            tag = f"<{label}>".encode()
+            return tag + b"*" * (len(found) - len(tag)) if len(tag) <= len(found) else b"*" * len(found)
         for value, label in self.literals:
             self._count(label, data.count(value))
-            data = data.replace(value, f"<{label}>".encode())
+            data = data.replace(value, placeholder(value, label))
         for label, pattern in PATTERNS:
-            data, n = pattern.subn(f"<{label}>".encode(), data)
+            data, n = pattern.subn(lambda m, label=label: placeholder(m.group(0), label), data)
             self._count(label, n)
         return data
 
-    def json(self, value):
-        """A JSON document with every env value outside the allowlist replaced, then scanned as text."""
+    def json(self, value, keep_length=()):
+        """A JSON document with every env value outside the allowlist replaced,
+        then scanned as text; string values of the `keep_length` keys keep
+        their length."""
         def walk(node):
             if isinstance(node, dict):
                 return {k: ({n: v if n in ENV_ALLOWLIST else f"<redacted:{n}>" for n, v in node[k].items()}
-                            if k == "env" and isinstance(node[k], dict) else walk(node[k])) for k in node}
+                            if k == "env" and isinstance(node[k], dict) else
+                            self.bytes(node[k].encode(), keep_length=True).decode()
+                            if k in keep_length and isinstance(node[k], str) else walk(node[k])) for k in node}
             if isinstance(node, list):
                 return [walk(v) for v in node]
             return node
@@ -75,9 +95,10 @@ class Redactor:
 
 
 def _secrets(rdir):
-    """Every env value an exec was given outside the allowlist, labelled by name."""
+    """Every env value an exec or a terminal was given outside the allowlist,
+    labelled by name. A terminal's also travel in its holder's argv."""
     found = {}
-    for path in rdir.glob("exec/*/command.json"):
+    for path in [*rdir.glob("exec/*/command.json"), *rdir.glob("terminal/*/handle.json")]:
         for name, value in json.loads(path.read_text()).get("env", {}).items():
             if name not in ENV_ALLOWLIST:
                 found[value] = f"redacted:{name}"
@@ -108,6 +129,12 @@ def export(repo, state, record):
                and p.parent.name not in ("checkpoint.tmp", "checkpoint.old")]
     for path in sources:
         rel = path.relative_to(rdir)
+        if rel.parts[0] == "terminal":
+            clean = _terminal_file(redact, rel, path.read_bytes())
+            if clean is not None:
+                durable(out / rel, clean)
+                files[str(rel)] = hashlib.sha256(clean).hexdigest()
+            continue
         if rel.name not in TEXT:
             if rel.name == "commits.bundle" or rel.suffix == ".png":
                 withheld[str(rel)] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -116,13 +143,34 @@ def export(repo, state, record):
         clean = redact.json(data) if rel.name.endswith(".json") else redact.bytes(data)
         durable(out / rel, clean)
         files[str(rel)] = hashlib.sha256(clean).hexdigest()
+    missing = []
+    for hdir in sorted((out / "terminal").iterdir()) if (out / "terminal").is_dir() else ():
+        if not (hdir / "recording" / "timing").is_file():
+            missing.append(f"terminal/{hdir.name}: no recording was collected")
+            continue
+        for record in screen.render_handle(hdir):
+            for name in (f"{record['capture']}.cells.json", record["image"]):
+                files[str((hdir / "captures" / name).relative_to(out))] = \
+                    hashlib.sha256((hdir / "captures" / name).read_bytes()).hexdigest()
     run = redact.json(json.dumps(summary).encode())
     durable(out / "run.json", run)
     files["run.json"] = hashlib.sha256(run).hexdigest()
     manifest = {"schema": PUBLIC_SCHEMA, "evidence_schema": contracts.EVIDENCE_SCHEMA, "files": files,
-                "withheld": withheld, "redactions": redact.counts, "env_allowlist": list(ENV_ALLOWLIST)}
+                "withheld": withheld, "missing": missing, "redactions": redact.counts,
+                "env_allowlist": list(ENV_ALLOWLIST)}
     durable(out / "manifest.json", (json.dumps(manifest, indent=2) + "\n").encode())
-    return {"path": out, "files": files, "withheld": withheld, "redactions": redact.counts}
+    return {"path": out, "files": files, "withheld": withheld, "missing": missing, "redactions": redact.counts}
+
+
+def _terminal_file(redact, rel, data):
+    """A terminal file for publishing, or None for what is rendered again."""
+    if rel.name.endswith(".cells.json") or rel.suffix == ".png":
+        return None  # derived from the private recording: rendered again from the public one
+    if rel.parent.name == "recording" and rel.name in ("output", "input"):
+        return redact.bytes(data, keep_length=True)
+    if rel.suffix == ".json":
+        return redact.json(data, keep_length=("screen", "ansi"))
+    return redact.bytes(data)
 
 
 def scenario_records(rdir):
