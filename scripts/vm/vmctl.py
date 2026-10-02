@@ -20,6 +20,7 @@ import contracts
 import guest
 import parallels
 import registry
+import scenario
 import supervisor
 import template
 import worker
@@ -279,6 +280,8 @@ def worker_operation(repo, args, host, operation):
             return workers.wait(args.run_id, args.exec, args.timeout)
         if operation == "read":
             return workers.read(args.run_id, args.exec, args.stream, args.offset, args.limit)
+        if operation == "scenario":
+            return scenario.run(workers, args.run_id, args.scenario, args.mode, args.bin_dir)
         method = {"worker reset": workers.reset, "worker destroy": workers.destroy, "inspect": workers.inspect,
                   "collect": workers.collect, "console capture": workers.console_capture,
                   "export": workers.export}[operation]
@@ -363,6 +366,11 @@ def parser():
     read.add_argument("--offset", type=int, default=0)
     read.add_argument("--limit", type=int, default=worker.READ_LIMIT)
     ops.add_parser("export", parents=[target], help="write the run's sanitized public evidence")
+    run_scenario = ops.add_parser("scenario", parents=[target], help="run a tests/scenarios scenario in a worker")
+    run_scenario.add_argument("scenario", help="scenario id: tests/scenarios/<id>.toml")
+    run_scenario.add_argument("--mode", required=True, choices=("cold", "prepared"))
+    run_scenario.add_argument("--bin-dir", default="build/debug",
+                              help="the built busybee and bzbd, relative to the worker checkout")
     ops.add_parser("supervise", parents=[target], help="internal: the run's watchdog, started by the controller")
     sig = ops.add_parser("signal", parents=[target], help="signal a process in a worker")
     sig.add_argument("signal")

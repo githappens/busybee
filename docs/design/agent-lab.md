@@ -7,8 +7,9 @@ macOS without asking a person to operate its development environment.
 
 **Status: design for implementation.** `doctor`, the Linux `template`
 operations, and Linux workers with `exec`, `inspect`, `signal`, `console
-capture`, `collect`, run supervision, exec handles (`status`, `wait`, `read`)
-and the public `export` (`scripts/vm/vmctl.py`) have shipped; the `terminal`
+capture`, `collect`, run supervision, exec handles (`status`, `wait`, `read`),
+the public `export` and Linux regression `scenario` runs
+(`scripts/vm/vmctl.py`, `tests/scenarios/`) have shipped; the `terminal`
 operations return `unsupported`.
 Until the rest lands, [CLAUDE.md](../../CLAUDE.md) and the
 [Sortie workflow](../../sortie/README.md) remain the operational instructions.
@@ -298,12 +299,14 @@ artifacts already saved with a matching digest are acknowledged and only the
 rest is fetched. A repeated destroy, or one whose VM is already gone, succeeds.
 
 `collected.json` is the versioned evidence manifest
-(`busybee.vm.evidence/v1`, `contracts.evidence_errors`): source base, head,
+(`busybee.vm.evidence/v2`, `contracts.evidence_errors`): source base, head,
 status and patch hash, the baseline's provisioning revision, lock hashes and
 tool versions, the allocation and deadline, every command with its argv,
 environment, timings, result and binary digests, process and daemon
 observations, the controller's cleanup events, artifact digests, acknowledged
-artifacts and what is missing. `export RUN` writes a separate publishable copy
+artifacts, what is missing, and `scenarios`: each scenario run's mode, status
+and failed assertions, and per scenario the coverage of its required fixture
+modes (§Test the real startup path). `export RUN` writes a separate publishable copy
 to `runs/<run-id>/public/`: environment values outside an allowlist, tokens and
 keys, machine paths, user and host names, IP and MAC addresses, and VM,
 snapshot and run identities become labelled placeholders, while exit codes,
@@ -316,7 +319,9 @@ was cloned from, and keeps and reports the rest.
 The unit tests under `scripts/vm/tests` need no Parallels. The acceptance tests
 that build, validate and compare real candidates, and drive real workers, run
 against the local config when opted in: `BUSYBEE_VM_LAB=1 python3 -m unittest
-test_real_template test_real_worker test_real_supervision` in that directory.
+test_real_template test_real_worker test_real_supervision test_real_scenarios`
+in that directory. The scenario runner's own tests need neither:
+`python3 -m unittest discover -s tests/scenarios/tests`.
 
 Long commands return a run handle with status, elapsed time, last-output time,
 and artifact locations. Agents can await completion and read output from a byte
@@ -377,6 +382,53 @@ For example, starting Pueue from a test fixture can give its tasks a different
 umask from a Pueue started by bzbd. Permission regressions must cover cold
 startup, traversable newly created directories, and executable build output.
 A prepared-daemon pass cannot substitute for that check.
+
+`scenario RUN SCENARIO --mode cold|prepared [--bin-dir DIR]` runs one scenario
+in a ready worker. A scenario is `tests/scenarios/<id>.toml`
+(`busybee.scenario/v1`, checked by `runner.meta_errors`): its id, applicable
+platforms, the fixture modes it supports and those a verification requires,
+its tools (`workspace` for the built `busybee` and the `bzbd` beside it, or a
+minimum version), its deadline, and the procedure in
+`tests/scenarios/procedures.py` with exactly the assertions it checks. A
+scenario that reproduces a product issue records the issue and the affected
+revision its red run uses. The runner and scenarios come from the controller's
+checkout, staged into the guest by content digest, so a red run against an
+older revision uses the current scenario. They run as one exec in the worker
+checkout's development shell, bounded by the scenario deadline plus the
+runner's cleanup window and the shell's startup.
+
+The runner (`tests/scenarios/runner.py`):
+
+- **Preflight** checks the platform, `busybee --version` against the version
+  the checkout's `git describe` produces, that `bzbd` sits beside it (busybee
+  starts that one; it has no version flag, so its digest is recorded), and each
+  other tool's minimum version. Any failure is `environment_failure` before a
+  fixture exists.
+- **Fixture.** A short private root under `/tmp` holds copies of those
+  binaries, `BUSYBEE_CONFIG`, and a Pueue YAML file whose runtime directory and
+  socket sit inside its `pueue_directory`, since pueued creates that directory
+  but not a separate runtime one. Every process the scenario starts carries a
+  marker variable naming the root and a clean environment. Cold mode verifies
+  that no daemon of the scenario user runs and no runtime state exists before
+  the client starts; prepared mode starts pueued and bzbd itself under umask
+  0022.
+- **Procedure.** Steps run as an unprivileged user (root would bypass the
+  directory permissions under test), under umask 0022, with output kept out of
+  the runner's stdout.
+- **Result.** Diagnostics come first: the modes of everything under the root,
+  config and daemon logs, and process masks. Then cleanup stops every marked
+  process, TERM then KILL, within its window. The result is one JSON document
+  (`busybee.scenario.result/v1`). A failed assertion is `product_failure` and
+  stays one. A preflight or fixture fault, an unevaluated assertion, or a
+  surviving process is `environment_failure`. The deadline gives `timeout`.
+
+The controller checks that result against the runner's exit status and the
+declared assertions. Output that is not a valid result is an environment
+failure, never a product failure. It writes `runs/<run>/scenarios/<exec>/result.json`.
+Coverage takes the latest run in each mode: a scenario is verified only when
+every required mode's latest run passed, and a prepared pass is reported
+alongside a missing or failing cold run, never in its place. The runner covers
+Linux; on another platform it reports `platform_unsupported`.
 
 ## Make UI behavior observable
 

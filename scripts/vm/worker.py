@@ -683,6 +683,13 @@ class Workers(template.Lab):
                              "findings": [f["code"] for f in done["findings"]] if done else []})
         return commands
 
+    def _scenarios(self, rdir):
+        records = evidence.scenario_records(rdir)
+        results = [{"exec": r["exec"], "scenario": r["scenario"], "mode": r["mode"], "status": r["status"],
+                    "failed": r["failed"], "path": self._rel(rdir / "scenarios" / r["exec"] / "result.json")}
+                   for r in records]
+        return {"results": results, "coverage": evidence.coverage(records)}
+
     def collect_run(self, record, reachable=True):
         """Export source changes and evidence; return the manifest, its path and
         what is missing. A frozen worker has not changed since its last
@@ -736,7 +743,8 @@ class Workers(template.Lab):
         if self._rel(cdir / "source.json") in artifacts:
             source = json.loads((cdir / "source.json").read_text())
         # Logs, results and checkpoints are already on the host; make them durable and digest them.
-        on_host = sorted(rdir.glob("exec/*/*")) + sorted(rdir.glob("checkpoint/*")) + sorted(rdir.glob("console/*"))
+        on_host = sorted(rdir.glob("exec/*/*")) + sorted(rdir.glob("scenarios/*/*")) + sorted(rdir.glob("checkpoint/*")) \
+            + sorted(rdir.glob("console/*"))
         for path in on_host:
             if path.name not in EVIDENCE_FILES and path.parent.name != "console":
                 continue
@@ -759,7 +767,7 @@ class Workers(template.Lab):
                     "template": baseline, "allocation": record["allocation"], "deadline": record["deadline"],
                     "commands": self._commands(rdir), "observations": observations,
                     "cleanup": self.events(record["run_id"]), "artifacts": artifacts,
-                    "acknowledged": acknowledged, "missing": missing}
+                    "acknowledged": acknowledged, "missing": missing, "scenarios": self._scenarios(rdir)}
         path = cdir / "collected.json"
         try:
             evidence.durable(path.with_suffix(".tmp"), (json.dumps(manifest, indent=2) + "\n").encode())

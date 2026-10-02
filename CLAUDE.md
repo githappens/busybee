@@ -37,12 +37,14 @@ CI gates fmt, clippy and the tests on Linux and macOS. Format the files you
 touch; do not reformat the workspace as a side effect of something else.
 
 The VM lab controller (`docs/design/agent-lab.md`) is Python under
-`scripts/vm/`, outside the Cargo workspace. Its preflight and tests need no
+`scripts/vm/`, with its regression scenarios under `tests/scenarios/`, outside
+the Cargo workspace. Its preflight and tests need no
 Parallels; `doctor` reads the host's Parallels when one is installed:
 
 ```sh
 nix develop -c python3 scripts/vm/vmctl.py doctor
 nix develop -c python3 -m unittest discover -s scripts/vm/tests
+nix develop -c python3 -m unittest discover -s tests/scenarios/tests
 ```
 
 ## Crate layout
