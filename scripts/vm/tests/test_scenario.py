@@ -127,6 +127,18 @@ class ScenarioTests(unittest.TestCase):
         self.assertEqual(result["status"], "timeout")
         self.assertIn("scenario_timeout", codes(result))
 
+    def test_a_refused_exec_writes_no_record(self):
+        # The run deadline has passed: exec refuses before it queues anything.
+        self.lab.now += CONFIG["deadlines"]["run"] + 1
+        first = self.scenario(runner_result("success"), 0)
+        second = self.scenario(runner_result("success"), 0)
+        for result in (first, second):
+            self.assertEqual(result["status"], "timeout", result["findings"])
+            self.assertIn("run_deadline_passed", codes(result))
+            self.assertIsNone(result["data"]["exec"])
+            self.assertIsNone(result["data"]["path"])
+        self.assertFalse((worker.run_dir(self.lab.state, self.run_id) / "scenarios").exists())
+
     def test_prepared_fixture_is_explicit(self):
         result = self.scenario(runner_result("success", mode="prepared"), 0, mode="prepared")
         self.assertEqual(result["status"], "success")

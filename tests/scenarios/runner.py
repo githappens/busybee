@@ -441,16 +441,18 @@ class Fixture:
             while self.procs(self.root, self.user.uid) and monotonic() < min(step_until, until):
                 time.sleep(0.1)
         remaining = self.procs(self.root, self.user.uid) if self.root else []
-        removed = False
+        error = "scenario processes are still running" if remaining else None
         if not remaining:
-            self.remove()
-            removed = True
-        return {"stopped": stopped, "remaining": remaining, "removed": removed,
+            try:
+                self.remove()
+            except OSError as err:
+                error = f"{err.strerror}: {err.filename}"
+        return {"stopped": stopped, "remaining": remaining, "removed": error is None, "remove_error": error,
                 "elapsed_s": round(monotonic() - started, 3)}
 
     def remove(self):
-        if self.root is not None:
-            shutil.rmtree(self.root, ignore_errors=True)
+        if self.root is not None and self.root.exists():
+            shutil.rmtree(self.root)
 
 
 # Running a scenario
@@ -479,6 +481,10 @@ class Check:
                 for n in self.declared]
 
 
+# No fixture was written: nothing to stop or remove.
+NO_CLEANUP = {"stopped": [], "remaining": [], "removed": None, "remove_error": None, "elapsed_s": 0.0}
+
+
 def classify(harness, timed_out, assertions, declared, cleanup):
     """The scenario's status. A failed assertion stays a product failure;
     nothing that went unchecked becomes a pass."""
@@ -486,6 +492,8 @@ def classify(harness, timed_out, assertions, declared, cleanup):
     if cleanup.get("remaining"):
         findings.append(finding("cleanup_incomplete", f"{len(cleanup['remaining'])} scenario process(es) survived "
                                 "cleanup"))
+    elif cleanup["removed"] is False:
+        findings.append(finding("cleanup_incomplete", f"the fixture root was not removed: {cleanup['remove_error']}"))
     failed = [a["name"] for a in assertions if a["status"] == "failed"]
     unchecked = [n for n in declared if n not in {a["name"] for a in assertions if a["status"] == "passed"}]
     # An observed product failure stays one, whatever went wrong after it.
@@ -498,7 +506,7 @@ def classify(harness, timed_out, assertions, declared, cleanup):
     if unchecked:
         return "environment_failure", findings + [finding("assertion_not_evaluated",
                                                           f"not evaluated: {', '.join(unchecked)}")]
-    if cleanup.get("remaining"):
+    if cleanup["removed"] is False:
         return "environment_failure", findings
     return "success", findings
 
@@ -546,7 +554,7 @@ def run_scenario(meta, mode, bin_dir, checkout, cleanup_s, probe, make_fixture, 
         cleanup = fx.cleanup(cleanup_s)
     else:
         result["diagnostics"] = {}
-        cleanup = {"stopped": [], "remaining": [], "removed": False, "elapsed_s": 0.0}
+        cleanup = NO_CLEANUP
     assertions = check.listed()
     status, findings = classify(harness, bool(timed_out), assertions, meta["assertions"], cleanup)
     if timed_out:

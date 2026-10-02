@@ -124,7 +124,12 @@ def run(workers, run_id, scenario_id, mode, bin_dir="build/debug"):
     stdout_path = workers.state / done["data"]["stdout"] if "stdout" in done["data"] else None
     stdout = stdout_path.read_bytes() if stdout_path and stdout_path.is_file() else b""
     status, findings, assertions, parsed = interpret(_runner(workers.repo), meta, mode, done, stdout)
-    name = done["data"].get("exec") or "unfinished"
+    name = done["data"].get("exec")
+    if name is None:
+        # Refused before anything was queued: no exec ran, so there is no run to record.
+        return contracts.result("scenario", status, f"{scenario_id} ({mode}): {status}, nothing ran", findings, {
+            "run_id": run_id, "scenario": scenario_id, "mode": mode, "exec": None, "path": None,
+            "assertions": assertions, "coverage": None})
     entry = {"schema": RECORD_SCHEMA, "scenario": scenario_id, "issue": meta.get("issue"), "mode": mode,
              "required_modes": meta["required_modes"], "status": status, "exec": name,
              "exec_status": done["status"], "findings": findings, "assertions": assertions,

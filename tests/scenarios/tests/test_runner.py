@@ -261,6 +261,23 @@ class FixtureTests(unittest.TestCase):
         cleanup = stubborn.cleanup(1)
         self.assertEqual([p["pid"] for p in cleanup["remaining"]], [42])
 
+    @unittest.skipIf(os.geteuid() == 0, "root removes a directory whatever its mode")
+    def test_a_root_that_cannot_be_removed_is_reported(self):
+        fx = self.fixture()
+        fx.write()
+        locked = fx.root / "work" / "locked"
+        locked.mkdir()
+        (locked / "f").write_text("x")
+        locked.chmod(0o500)
+        self.addCleanup(locked.chmod, 0o700)  # runs before the fixture's own removal
+        cleanup = fx.cleanup(1)
+        self.assertFalse(cleanup["removed"])
+        self.assertIn("Permission denied", cleanup["remove_error"])
+        self.assertTrue(fx.root.exists())
+        status, findings = runner.classify([], False, [{"name": "a", "status": "passed"}], ["a"], cleanup)
+        self.assertEqual(status, "environment_failure")
+        self.assertIn("cleanup_incomplete", [f["code"] for f in findings])
+
     def test_diagnostics_record_modes_and_config(self):
         fx = self.fixture()
         fx.write()
@@ -276,8 +293,10 @@ class ClassifyTests(unittest.TestCase):
     declared = ["a", "b"]
 
     def classify(self, harness=(), timed_out=False, assertions=(), remaining=()):
+        # The shape Fixture.cleanup returns: a survivor keeps the root.
         return runner.classify(list(harness), timed_out, list(assertions), self.declared,
-                               {"remaining": list(remaining)})
+                               {"remaining": list(remaining), "removed": not remaining,
+                                "remove_error": "scenario processes are still running" if remaining else None})
 
     def passed(self, *names):
         return [{"name": n, "status": "passed"} for n in names]
@@ -304,6 +323,12 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(self.classify(timed_out=True, assertions=self.passed("a"))[0], "timeout")
         self.assertEqual(self.classify(assertions=self.passed("a", "b"), remaining=[{"pid": 9}])[0],
                          "environment_failure")
+
+    def test_no_fixture_means_nothing_to_remove(self):
+        status, findings = runner.classify([{"code": "tool_missing", "message": "m"}], False, [], self.declared,
+                                           runner.NO_CLEANUP)
+        self.assertNotIn("cleanup_incomplete", [f["code"] for f in findings])
+        self.assertIsNone(runner.NO_CLEANUP["removed"])
 
     def test_an_unevaluated_assertion_is_not_a_pass(self):
         status, findings = self.classify(assertions=self.passed("a"))
