@@ -1,0 +1,16 @@
+# The harness's own check: a task that never finishes ends at the scenario
+# deadline as a timeout, with its diagnostics kept and its processes stopped.
+schema = "busybee.scenario/v1"
+id = "wedged-task"
+summary = "A task that never finishes is ended by the scenario deadline and reported as a timeout"
+platforms = ["linux", "macos"]
+modes = ["prepared"]
+required_modes = ["prepared"]
+deadline_s = 20
+procedure = "wedged_task"
+assertions = ["task_completes"]
+
+[tools]
+busybee = "workspace"
+bzbd = "workspace"
+pueued = ">=4.0"

@@ -95,6 +95,7 @@ jobs:
         run: |
           python3 -m unittest discover -s sortie/tests
           python3 -m unittest discover -s scripts/vm/tests
+          python3 -m unittest discover -s tests/scenarios/tests
           bash sortie/test-machine-safety-hook.sh
           bash sortie/test-harness-docs.sh
 

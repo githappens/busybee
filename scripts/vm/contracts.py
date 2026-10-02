@@ -13,7 +13,7 @@ CONFIG_SCHEMA = 1
 TEMPLATE_SCHEMA = "busybee.vm.template/v2"
 WORKER_SCHEMA = "busybee.vm.worker/v2"
 RESULT_SCHEMA = "busybee.vm.result/v1"
-EVIDENCE_SCHEMA = "busybee.vm.evidence/v1"
+EVIDENCE_SCHEMA = "busybee.vm.evidence/v2"
 
 # What a controller operation can end as. Only `success` is a pass.
 RESULT_STATES = ("success", "product_failure", "environment_failure", "timeout", "cancelled",
@@ -213,7 +213,7 @@ def worker_errors(record):
 def evidence_errors(manifest):
     """Problems with a run's evidence manifest (collected.json)."""
     fields = {"schema", "run_id", "collected_at", "source", "template", "allocation", "deadline", "commands",
-              "observations", "cleanup", "artifacts", "acknowledged", "missing"}
+              "observations", "cleanup", "artifacts", "acknowledged", "missing", "scenarios"}
     if not isinstance(manifest, dict):
         return ["manifest must be an object"]
     errors = [f"unknown field {k!r}" for k in sorted(set(manifest) - fields)]
@@ -229,6 +229,10 @@ def evidence_errors(manifest):
             errors.append(f"{key} must be a list")
     if not isinstance(manifest["artifacts"], dict):
         errors.append("artifacts must map a path to its sha256")
+    scenarios = manifest["scenarios"]
+    if not isinstance(scenarios, dict) or set(scenarios) != {"results", "coverage"} \
+            or not isinstance(scenarios["results"], list) or not isinstance(scenarios["coverage"], dict):
+        errors.append("scenarios must hold a results list and a coverage map")
     return errors
 
 

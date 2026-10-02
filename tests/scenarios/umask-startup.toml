@@ -1,0 +1,20 @@
+# #69: bzbd's restrictive umask must not reach the Pueue it starts, or the
+# tasks Pueue runs. Cold startup is the case that matters; a prepared Pueue,
+# started under the caller's umask, cannot stand in for it.
+schema = "busybee.scenario/v1"
+id = "umask-startup"
+summary = "A task started through busybee's cold startup path creates traversable directories and runnable executables, and its lease is released"
+issue = 69
+platforms = ["linux", "macos"]
+modes = ["cold", "prepared"]
+required_modes = ["cold"]
+deadline_s = 90
+procedure = "task_permissions"
+assertions = ["task_runs", "task_directory_traversable", "task_executable_output_runs", "lease_released"]
+# main when #69 was reproduced; the red run uses this revision.
+affected_revision = "d60e06202cc98b3700b4a762d93850941fe80f52"
+
+[tools]
+busybee = "workspace"
+bzbd = "workspace"
+pueued = ">=4.0"

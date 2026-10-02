@@ -125,6 +125,27 @@ def export(repo, state, record):
     return {"path": out, "files": files, "withheld": withheld, "redactions": redact.counts}
 
 
+def scenario_records(rdir):
+    """Every scenario run recorded in a run directory, in exec order."""
+    return [json.loads(p.read_text()) for p in sorted(Path(rdir).glob("scenarios/*/result.json"))]
+
+
+def coverage(records):
+    """Per scenario: the latest status in each fixture mode it ran in, and
+    whether the latest run in every required mode passed. A required mode with
+    no run is missing; a result in another mode does not stand in for it."""
+    out = {}
+    for record in records:
+        entry = out.setdefault(record["scenario"], {"modes": {}})
+        entry["required_modes"] = record["required_modes"]
+        entry["modes"][record["mode"]] = record["status"]
+    for entry in out.values():
+        entry["missing"] = [m for m in entry["required_modes"] if m not in entry["modes"]]
+        entry["failing"] = [m for m in entry["required_modes"] if entry["modes"].get(m, "success") != "success"]
+        entry["verified"] = not entry["missing"] and not entry["failing"]
+    return out
+
+
 def durable(path, data):
     """Write `path` and flush it to disk before returning."""
     path.parent.mkdir(parents=True, exist_ok=True)
