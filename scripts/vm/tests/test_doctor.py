@@ -34,6 +34,7 @@ storage_gib = 64
 cpus = 2
 memory_mib = 4096
 storage_gib = 32
+artifact_mib = 1024
 
 [templates.linux]
 manifest = "templates/linux/manifest.json"
@@ -273,7 +274,9 @@ class ConfigTests(unittest.TestCase):
             "unknown key": VALID_CONFIG.replace("[budget]", "[budget]\ngpus = 1"),
             "worker over budget": VALID_CONFIG.replace("memory_mib = 4096", "memory_mib = 16384"),
             "missing worker allocation": VALID_CONFIG.replace("[worker]\ncpus = 2\nmemory_mib = 4096\n"
-                                                              "storage_gib = 32\n", ""),
+                                                              "storage_gib = 32\nartifact_mib = 1024\n", ""),
+            "missing artifact budget": VALID_CONFIG.replace("artifact_mib = 1024\n", ""),
+            "tiny artifact budget": VALID_CONFIG.replace("artifact_mib = 1024", "artifact_mib = 1"),
             "wrong schema": VALID_CONFIG.replace("schema = 1", "schema = 2"),
             "state outside build/vm": VALID_CONFIG.replace('"build/vm"', '"build/other"'),
             "absolute state": VALID_CONFIG.replace('"build/vm"', '"/tmp/vm"'),
@@ -319,7 +322,7 @@ class ContractTests(unittest.TestCase):
                   "snapshot_id": "{66666666-7777-8888-9999-000000000000}", "clone_strategy": "linked",
                   "candidate": "r-20261001T000000Z-abcdef", "baseline_vm_id": "{22222222-2222-3333-4444-555555555555}",
                   "reset_snapshot_id": "{77777777-7777-8888-9999-000000000000}", "status": "ready",
-                  "allocation": {"cpus": 2, "memory_mib": 4096, "storage_gib": 32},
+                  "allocation": {"cpus": 2, "memory_mib": 4096, "storage_gib": 32, "artifact_mib": 1024},
                   "source": {"revision": "0" * 40, "patch_sha256": None},
                   "created_at": "2026-10-01T00:00:00Z", "deadline": "2026-10-01T02:00:00Z"}
         self.assertEqual(contracts.worker_errors(record), [])
@@ -370,7 +373,9 @@ class CliTests(unittest.TestCase):
             for argv in (["worker", "create", "linux", "--revision", "HEAD"], ["worker", "reset", run_id],
                          ["worker", "destroy", run_id], ["exec", run_id, "--cwd", "/", "--timeout", "5"],
                          ["inspect", run_id], ["signal", run_id, "TERM", "42"], ["console", "capture", run_id],
-                         ["collect", run_id], ["template", "prune", "linux"]):
+                         ["collect", run_id], ["template", "prune", "linux"], ["status"], ["status", run_id],
+                         ["status", run_id, "0001"], ["wait", run_id, "0001"], ["read", run_id, "0001", "stdout"],
+                         ["export", run_id], ["exec", run_id, "--cwd", "/", "--detach"]):
                 with self.subTest(argv):
                     out = self.run_cli("--json", *argv, "--config", absent)
                     self.assertEqual(out.returncode, vmctl.EXIT_FAILED, out.stderr)

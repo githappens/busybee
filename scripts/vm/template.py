@@ -49,7 +49,8 @@ def manifest_path(state, name):
 
 def _write_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    # Per process: the controller and a run's supervisor write the same records.
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(json.dumps(value, indent=2) + "\n")
     os.replace(tmp, path)
 

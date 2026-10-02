@@ -1,11 +1,14 @@
 from pathlib import Path
+import base64
 import hashlib
 import json
+import os
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 
@@ -14,6 +17,7 @@ import contracts
 import guest
 import parallels
 import registry
+import supervisor
 import template
 import worker
 
@@ -25,7 +29,7 @@ BASELINE_VM = f"busybee-lab-tpl-linux-{CANDIDATE}"
 CONFIG = {"state_dir": "build/vm", "clone_strategy": "linked",
           "deadlines": {"command": 60, "scenario": 120, "run": 600, "cleanup": 30},
           "budget": {"cpus": 4, "memory_mib": 8192, "storage_gib": 64},
-          "worker": {"cpus": 4, "memory_mib": 8192, "storage_gib": 32}}
+          "worker": {"cpus": 4, "memory_mib": 8192, "storage_gib": 32, "artifact_mib": 64}}
 
 
 class Prlctl:
@@ -39,8 +43,13 @@ class Prlctl:
 
     def __call__(self, argv, timeout=None, stdin=None):
         command, name, rest = argv[1], argv[2], argv[3:]
+        if argv[1:] == ["list", "--all", "--json"]:
+            return json.dumps([{"uuid": vm["id"].strip("{}"), "status": vm["state"], "name": n}
+                               for n, vm in self.vms.items()])
         self.calls.append([command, name, *rest])
         vm = self.vms.get(name)
+        if command == "list" and vm is None:
+            raise parallels.ParallelsError(f"prlctl list exited 255: {name} could not be found")
         if command == "clone":
             self.vms[rest[rest.index("--name") + 1]] = {"id": "{" + str(uuid.uuid4()) + "}", "state": "stopped",
                                                          "snapshots": []}
@@ -53,6 +62,8 @@ class Prlctl:
         elif command == "stop":
             vm["state"] = "stopped"
         elif command == "delete":
+            if vm is None:
+                raise parallels.ParallelsError(f"prlctl delete exited 255: {name} could not be found")
             del self.vms[name]
         elif command == "snapshot":
             snap = "{" + str(uuid.uuid4()) + "}"
@@ -68,6 +79,40 @@ class Prlctl:
         return [c for c in self.calls if c[1] == name and c[0] != "list"]
 
 
+class FakeProc:
+    """The ssh process of one exec: `chunks` reach its stdout one poll at a time."""
+    pids = iter(range(50000, 60000))
+
+    def __init__(self, fake, stdout, stderr, chunks, exit_code):
+        self.fake, self.out, self.err = fake, stdout, stderr
+        self.chunks, self.exit_code = list(chunks), exit_code
+        self.pid = next(self.pids)
+        self.returncode = None
+        fake.live.add(self.pid)
+
+    def poll(self):
+        if self.returncode is None and self.chunks:
+            with open(self.out, "ab") as f:
+                f.write(self.chunks.pop(0))
+        if self.returncode is None and not self.chunks and not self.fake.hang:
+            self.end(self.exit_code)
+        return self.returncode
+
+    def end(self, code):
+        self.returncode = code
+        self.fake.status = code
+        self.fake.live.discard(self.pid)
+
+    def kill(self):
+        # ssh dies; what it ran in the guest is not told.
+        if self.returncode is None:
+            self.returncode = -9
+            self.fake.live.discard(self.pid)
+
+    def wait(self):
+        return self.returncode
+
+
 class FakeGuest:
     """A guest that answers the controller's commands from a script."""
 
@@ -76,15 +121,26 @@ class FakeGuest:
         self.exit_code, self.stdout, self.stderr = exit_code, stdout, stderr
         self.head = None
         self.fail_on = None
+        self.hang = False  # a command that never ends by itself
+        self.chunks = None  # stdout delivered over several polls
+        self.status = None  # what the guest's status file holds
+        self.live = set()
+        self.procs = []
+        self.elapse = lambda: None
 
     def run(self, command, timeout, stdin=None, tty=False, check=True, raw=False):
         self.commands.append((command, stdin))
-        if self.fail_on and self.fail_on in command:
-            raise guest.GuestError(f"`{self.fail_on}` failed")
+        if self.fail_on is not None and self.fail_on in command:
+            # As Guest.run does: a failure raises only when checked, else ssh's 255 comes back.
+            if check:
+                raise guest.GuestError(f"`{self.fail_on}` failed")
+            return 255, b"" if raw else "", "ssh: connect to host port 22: Operation timed out"
         if "rev-parse HEAD" in command and "printf" not in command:
             out = self.head.encode()
         elif command.startswith("printf \"status:"):
-            out = (f"status: {self.exit_code}\nhead: {self.head}\ndirty: 0\n"
+            status = "" if self.status is None else self.status
+            self.status = None
+            out = (f"status: {status}\nhead: {self.head}\ndirty: 0\n"
                    f"binary: {'a' * 64}  build/debug/busybee\n").encode()
         elif "git status --porcelain" in command:
             out = b" M crates/bzb/src/main.rs\n"
@@ -92,17 +148,25 @@ class FakeGuest:
             out = b"diff --git a/x b/x\n"
         elif command.startswith("ps "):
             out = b"    1     0 root     Ss       42 /run/current-system/systemd/lib/systemd/systemd\n"
+        elif command.startswith("p=$(cat") and "kill -s KILL" in command:
+            for proc in self.procs:
+                if proc.returncode is None:
+                    proc.end(137)
+            out = b""
         else:
             out = b""
         if "checkout -q --detach" in command:
             self.head = command.split("--detach ")[1].split()[0]
         return 0, out if raw else out.decode(), ""
 
-    def stream(self, command, timeout, stdout, stderr):
+    def spawn(self, command, stdout, stderr):
         self.commands.append((command, None))
-        stdout.write(self.stdout)
         stderr.write(self.stderr)
-        return self.exit_code
+        chunks = self.chunks if self.chunks is not None else [self.stdout]
+        self.elapse()
+        proc = FakeProc(self, stdout.name, stderr.name, chunks, self.exit_code)
+        self.procs.append(proc)
+        return proc
 
 
 class Lab:
@@ -137,10 +201,35 @@ class Lab:
         self.prl = parallels.Parallels("prlctl", "prlsrvctl", self.prlctl, owned=self.reg)
         self.guest = FakeGuest()
         self.free_gib = 500
+        self.now = time.time()  # the controller's clock, which tests move
+        self.supervisors = {}
+        self.supervising = True  # off: every supervisor process is dead
+
+    def clock(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def supervise(self, run_id):
+        """In place of a detached supervisor process: one tick of this run's."""
+        if self.supervising:
+            self.supervisor(run_id).tick()
+
+    def supervisor(self, run_id):
+        if run_id not in self.supervisors:
+            self.supervisors[run_id] = supervisor.Supervisor(self.workers(), run_id,
+                                                             alive=lambda pid: pid in self.guest.live)
+        return self.supervisors[run_id]
+
+    def restart_supervisors(self):
+        """The supervisor processes die; their ssh children live on."""
+        self.supervisors = {}
 
     def workers(self):
         return worker.Workers(self.repo, CONFIG, self.prl, self.reg, lambda path: self.free_gib,
-                              connect=lambda record, info, deadline: self.guest)
+                              connect=lambda record, info, deadline: self.guest, supervise=self.supervise,
+                              clock=self.clock, sleep=self.sleep)
 
     def create(self):
         result = self.workers().create("linux", self.revision)
@@ -279,7 +368,8 @@ class ExecTests(unittest.TestCase):
 
     def test_worker_exec_round_trips_argv_and_exit(self):
         argv = ["printf", "%s\\n", "two words", "$HOME", "a;b|c&d", "*", "'quoted'", ""]
-        command = worker.exec_command(argv, "/tmp/a dir", {"GREETING": "hi there; $USER"}, 30, "/var/tmp/s")
+        command = worker.exec_command(argv, "/tmp/a dir", {"GREETING": "hi there; $USER"}, 30, "/var/tmp/s",
+                                      "/var/tmp/p")
         # Split as a shell does: operators are their own tokens, quoted text is not.
         words = list(shlex.shlex(command, posix=True, punctuation_chars=True))
         self.assertEqual(words[:2], ["cd", "/tmp/a dir"])
@@ -301,15 +391,18 @@ class ExecTests(unittest.TestCase):
 
     def test_a_timed_out_command_is_a_timeout(self):
         self.lab.guest.exit_code = 124
-        clock = iter([0.0, 31.0])
-        result = self.lab.workers().exec(self.run_id, ["sleep", "60"], "/", {}, 30, clock=lambda: next(clock))
+
+        def thirty_one_seconds():
+            self.lab.now += 31
+        self.lab.guest.elapse = thirty_one_seconds
+        result = self.lab.workers().exec(self.run_id, ["sleep", "60"], "/", {}, 30)
         self.assertEqual(result["status"], "timeout")
         self.assertIn("command_timeout", codes(result))
 
     def test_an_unresponsive_guest_is_stopped_and_kept(self):
-        def hang(command, timeout, stdout, stderr):
+        def hang(command, stdout, stderr):
             raise guest.GuestError("ssh exceeded its deadline")
-        self.lab.guest.stream = hang
+        self.lab.guest.spawn = hang
         result = self.lab.workers().exec(self.run_id, ["true"], "/", {}, 5)
         self.assertEqual(result["status"], "timeout")
         self.assertIn("guest_unresponsive", codes(result))
@@ -491,6 +584,504 @@ class PruneTests(unittest.TestCase):
         self.assertEqual(result["status"], "environment_failure")
         self.assertIn("retained_not_owned", codes(result))
         self.assertIn(BASELINE_VM, self.lab.prlctl.vms)
+
+
+def outcome(lab, run_id, name):
+    return json.loads((worker.run_dir(lab.state, run_id) / "exec" / name / "result.json").read_text())
+
+
+class WatchdogTests(unittest.TestCase):
+    def setUp(self):
+        self.lab = Lab(self)
+        self.run_id = self.lab.create()
+        self.vm = contracts.worker_name(self.run_id)
+
+    def test_watchdog_survives_agent_and_cli_exit(self):
+        # The guest's own bound has failed (its timeout(1) is stopped), so only
+        # the controller's deadline can end the command.
+        self.lab.guest.hang = True
+
+        def killed(seconds):
+            raise KeyboardInterrupt  # the submitting process dies while it waits
+        w = self.lab.workers()
+        w.sleep = killed
+        with self.assertRaises(KeyboardInterrupt):
+            w.exec(self.run_id, ["sh", "-c", "kill -STOP $PPID; sleep 600"], "/", {}, 30)
+        name = "0001"
+        self.assertEqual(self.lab.workers().status(self.run_id, name)["data"]["state"], "running")
+
+        # Nobody waits for it; the supervisor alone keeps the deadline.
+        self.lab.now += 30 + worker.HOST_MARGIN_S - 1
+        self.lab.supervise(self.run_id)
+        self.assertFalse((worker.run_dir(self.lab.state, self.run_id) / "exec" / name / "result.json").exists())
+        self.lab.now += 2
+        self.lab.supervise(self.run_id)
+        result = outcome(self.lab, self.run_id, name)
+        self.assertEqual(result["status"], "timeout")
+        self.assertIn("watchdog_deadline", codes(result))
+        self.assertEqual(result["data"]["enforced_by"], "supervisor")
+        self.assertTrue(any(c.startswith("p=$(cat") and f"{self.run_id}-{name}.pid" in c
+                            for c, _ in self.lab.guest.commands))
+        # The guest answered the kill, so the worker stays usable.
+        self.assertEqual(self.lab.prlctl.vms[self.vm]["state"], "running")
+        self.lab.guest.hang = False
+        self.assertEqual(self.lab.workers().exec(self.run_id, ["true"], "/", {}, 5)["status"], "success")
+
+    def test_watchdog_handles_unreachable_guest(self):
+        first = self.lab.workers().exec(self.run_id, ["true"], "/", {}, 5)
+        self.assertEqual(first["status"], "success")
+        # The guest stops answering mid-command: ssh ends, and so does every later command.
+        self.lab.guest.hang = True
+        handle = self.lab.workers().exec(self.run_id, ["sleep", "600"], "/", {}, 30, detach=True)["data"]
+        self.lab.guest.fail_on = ""  # every guest command fails
+        self.lab.guest.procs[-1].end(255)
+        self.lab.supervise(self.run_id)
+        result = outcome(self.lab, self.run_id, handle["exec"])
+        self.assertEqual(result["status"], "timeout")
+        self.assertIn("guest_unresponsive", codes(result))
+        self.assertEqual(self.lab.prlctl.vms[self.vm]["state"], "stopped")
+        self.assertIsNotNone(self.lab.reg.get(self.vm))
+        record = json.loads((worker.run_dir(self.lab.state, self.run_id) / "worker.json").read_text())
+        self.assertEqual(record["status"], "stopped")
+        # Bounded diagnostics: the console, and the evidence the host already had, without waiting on the guest.
+        rdir = worker.run_dir(self.lab.state, self.run_id)
+        self.assertTrue(any(c[0] == "capture" for c in self.lab.prlctl.mutations(self.vm)))
+        manifest = json.loads(next(rdir.glob("collect/*/collected.json")).read_text())
+        self.assertIn("exec/0001/stdout", " ".join(manifest["artifacts"]))
+        self.assertIn("checkpoint", " ".join(manifest["artifacts"]))
+        self.assertEqual(manifest["missing"], ["source: the guest is not answering"])
+        self.assertIn("guest_unresponsive", [e["event"] for e in self.lab.workers().events(self.run_id)])
+        # The supervisor has nothing left to watch.
+        self.assertFalse(self.lab.supervisor(self.run_id).tick())
+
+    def test_a_hung_guest_that_cannot_be_killed_is_stopped(self):
+        self.lab.guest.hang = True
+        handle = self.lab.workers().exec(self.run_id, ["sleep", "600"], "/", {}, 30, detach=True)["data"]
+        self.lab.guest.fail_on = ""
+        self.lab.now += 30 + worker.HOST_MARGIN_S + 1
+        self.lab.supervise(self.run_id)
+        result = outcome(self.lab, self.run_id, handle["exec"])
+        self.assertIn("guest_unresponsive", codes(result))
+        self.assertEqual(self.lab.prlctl.vms[self.vm]["state"], "stopped")
+
+    def test_the_run_deadline_is_enforced_by_the_supervisor(self):
+        self.lab.guest.hang = True
+        handle = self.lab.workers().exec(self.run_id, ["sleep", "600"], "/", {}, 60, detach=True)["data"]
+        self.lab.now += CONFIG["deadlines"]["run"] + 1
+        self.lab.supervise(self.run_id)
+        result = outcome(self.lab, self.run_id, handle["exec"])
+        self.assertEqual(result["status"], "timeout")
+        self.assertIn("run_deadline", codes(result))
+        record = json.loads((worker.run_dir(self.lab.state, self.run_id) / "worker.json").read_text())
+        self.assertEqual(record["status"], "expired")
+        self.assertEqual(self.lab.prlctl.vms[self.vm]["state"], "stopped")
+        events = [e["event"] for e in self.lab.workers().events(self.run_id)]
+        self.assertEqual(events[-1], "expired")
+        self.assertFalse(self.lab.supervisor(self.run_id).tick())
+        with self.assertRaises(worker.Refused):
+            self.lab.workers().exec(self.run_id, ["true"], "/", {}, 5)
+        # Collected at expiry: destroy acknowledges that, and need not start the VM again.
+        starts = len([c for c in self.lab.prlctl.mutations(self.vm) if c[0] == "start"])
+        result = self.lab.workers().destroy(self.run_id)
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(len([c for c in self.lab.prlctl.calls if c[1] == self.vm and c[0] == "start"]), starts)
+
+    def test_an_exec_that_outgrows_its_artifact_budget_is_stopped(self):
+        self.lab.guest.hang = True
+        self.lab.guest.chunks = [b"x" * (CONFIG["worker"]["artifact_mib"] * 1024 * 1024 + 1)]
+        handle = self.lab.workers().exec(self.run_id, ["yes"], "/", {}, 60, detach=True)["data"]
+        self.lab.supervise(self.run_id)
+        result = outcome(self.lab, self.run_id, handle["exec"])
+        self.assertEqual(result["status"], "environment_failure")
+        self.assertIn("artifact_budget_exceeded", codes(result))
+        with self.assertRaises(worker.Refused) as caught:
+            self.lab.workers().exec(self.run_id, ["true"], "/", {}, 5)
+        self.assertEqual(caught.exception.code, "artifact_budget_exceeded")
+        self.assertIn("artifact_budget_exceeded", codes(self.lab.workers().collect(self.run_id)))
+
+
+class RecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.lab = Lab(self)
+        # A lab VM this controller did not create: it must never be touched.
+        self.sentinel = "busybee-lab-sentinel"
+        self.lab.prlctl.vms[self.sentinel] = {"id": "{" + str(uuid.uuid4()) + "}", "state": "running",
+                                              "snapshots": []}
+
+    def untouched(self):
+        self.assertEqual(self.lab.prlctl.mutations(self.sentinel), [])
+        # The baseline is only ever cloned from.
+        self.assertEqual({c[0] for c in self.lab.prlctl.mutations(BASELINE_VM)} - {"clone"}, set())
+        self.assertEqual(self.lab.prlctl.vms[self.sentinel]["state"], "running")
+
+    def test_restart_reconciles_owned_workers(self):
+        w = self.lab.workers
+        # 1. Killed between the claim and the record.
+        run_id = contracts.new_run_id()
+        vm = contracts.worker_name(run_id)
+        (worker.run_dir(self.lab.state, run_id)).mkdir(parents=True)
+        self.lab.reg.claim(vm, "worker", "linux", run_id, "2026-10-01T00:00:00Z", parent=BASELINE_ID)
+        status = w().status()
+        self.assertEqual([(x["run_id"], x["status"], x["vm_state"]) for x in status["data"]["workers"]],
+                         [(run_id, "claimed", "missing")])
+        self.assertIn("interrupted_create", codes(status))
+        blocked = w().create("linux", self.lab.revision)
+        self.assertIn("worker_limit", codes(blocked))
+        self.assertIn("interrupted_create", codes(blocked))
+        self.assertEqual(w().destroy(run_id)["status"], "success")
+
+        # 2. Killed during the transfer: the supervisor halts the half-made worker.
+        def interrupted(command, timeout, stdin=None, **kwargs):
+            raise KeyboardInterrupt
+        run = self.lab.guest.run
+        self.lab.guest.run = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            w().create("linux", self.lab.revision)
+        self.lab.guest.run = run
+        run_id = next(e["run_id"] for e in self.lab.reg.entries().values() if e["role"] == "worker")
+        self.lab.restart_supervisors()
+        status = w().status()
+        self.assertEqual(status["data"]["workers"][0]["status"], "failed")
+        self.assertEqual(status["data"]["workers"][0]["vm_state"], "stopped")
+        self.assertEqual(status["data"]["resources"]["allocated"]["cpus"], CONFIG["worker"]["cpus"])
+        self.assertEqual(w().destroy(run_id)["status"], "success")
+
+        # 3. The supervisor dies mid-command; its successor adopts the command.
+        run_id = self.lab.create()
+        self.lab.guest.hang = True
+        handle = w().exec(run_id, ["make"], "/", {}, 60, detach=True)["data"]
+        self.lab.restart_supervisors()
+        self.lab.supervise(run_id)
+        self.assertEqual(w().status(run_id, handle["exec"])["data"]["state"], "running")
+        self.lab.guest.procs[-1].end(0)  # the adopted ssh ends, and the guest recorded the status
+        self.lab.restart_supervisors()
+        result = w().wait(run_id, handle["exec"])
+        self.assertEqual((result["status"], result["data"]["exit_code"]), ("success", 0))
+        self.lab.guest.hang = False
+
+        # 4. Killed while destroy was collecting: still owned and accounted, and a retry finishes.
+        self.lab.guest.fail_on = "diff --cached"
+        real = self.lab.guest.run
+
+        def dies(command, timeout, stdin=None, **kwargs):
+            if "diff --cached" in command:
+                raise KeyboardInterrupt
+            return real(command, timeout, stdin, **kwargs)
+        self.lab.guest.run = dies
+        with self.assertRaises(KeyboardInterrupt):
+            w().destroy(run_id)
+        self.lab.guest.run, self.lab.guest.fail_on = real, None
+        status = w().status()
+        self.assertEqual([(x["run_id"], x["status"]) for x in status["data"]["workers"]], [(run_id, "ready")])
+        self.assertEqual(w().destroy(run_id)["status"], "success")
+        # And a destroy repeated after it finished is not an error.
+        self.assertEqual(w().destroy(run_id)["status"], "success")
+
+        self.assertEqual(w().status()["data"]["workers"], [])
+        self.assertEqual(sorted(self.lab.reg.entries()), [BASELINE_VM])
+        self.assertEqual(sorted(self.lab.prlctl.vms), sorted([BASELINE_VM, self.sentinel]))
+        self.untouched()
+
+    def test_a_destroy_interrupted_after_the_delete_is_finished_by_its_retry(self):
+        run_id = self.lab.create()
+        vm = contracts.worker_name(run_id)
+        del self.lab.prlctl.vms[vm]  # deleted, but the process died before releasing the claim
+        result = self.lab.workers().destroy(run_id)
+        self.assertEqual(result["status"], "success", result)
+        self.assertIsNone(self.lab.reg.get(vm))
+        self.untouched()
+
+
+class CollectionTests(unittest.TestCase):
+    def setUp(self):
+        self.lab = Lab(self)
+        self.run_id = self.lab.create()
+        self.vm = contracts.worker_name(self.run_id)
+        self.rdir = worker.run_dir(self.lab.state, self.run_id)
+
+    def test_collect_preserves_work_on_failure(self):
+        self.lab.guest.stdout = b"built\n"
+        self.assertEqual(self.lab.workers().exec(self.run_id, ["cargo", "build"], "/", {}, 30)["status"], "success")
+        # Each finished command checkpoints the source outside the guest.
+        self.assertEqual(sorted(p.name for p in (self.rdir / "checkpoint").iterdir()),
+                         ["source.json", "worktree.diff"])
+
+        self.lab.guest.fail_on = "diff --cached"
+        failed = self.lab.workers().destroy(self.run_id)
+        self.assertEqual(failed["status"], "incomplete_collection")
+        self.assertEqual(self.lab.prlctl.vms[self.vm]["state"], "stopped")
+        self.assertIsNotNone(self.lab.reg.get(self.vm))
+        first = json.loads(next(self.rdir.glob("collect/*/collected.json")).read_text())
+        self.assertEqual(contracts.evidence_errors(first), [])
+        saved = set(first["artifacts"])
+        self.assertTrue({f"runs/{self.run_id}/exec/0001/stdout", f"runs/{self.run_id}/checkpoint/worktree.diff"}
+                        <= saved, saved)
+        self.assertTrue(any("worktree.diff" in m for m in first["missing"]))
+
+        # The retry completes that collection: what was durable is acknowledged, only the rest is fetched.
+        self.lab.guest.fail_on = None
+        self.lab.guest.commands.clear()
+        result = self.lab.workers().collect(self.run_id)
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(len(list(self.rdir.glob("collect/*"))), 1)
+        self.assertLessEqual(saved, set(result["data"]["acknowledged"]))
+        self.assertEqual(sum("diff --cached" in c for c, _ in self.lab.guest.commands), 1)
+        self.assertEqual(self.lab.prlctl.vms[self.vm]["state"], "stopped")
+        # Once complete, a further retry fetches nothing and changes nothing.
+        self.lab.guest.commands.clear()
+        again = self.lab.workers().collect(self.run_id)
+        self.assertEqual(again["data"]["artifacts"], result["data"]["artifacts"])
+        self.assertEqual(self.lab.guest.commands, [])
+        self.assertEqual(self.lab.workers().destroy(self.run_id)["status"], "success")
+
+    def test_a_tampered_artifact_is_fetched_again(self):
+        self.lab.guest.fail_on = "diff --cached"
+        self.lab.workers().destroy(self.run_id)
+        source = next(self.rdir.glob("collect/*/source.json"))
+        source.write_text("{}")
+        self.lab.guest.fail_on = None
+        result = self.lab.workers().collect(self.run_id)
+        self.assertEqual(result["status"], "success", result)
+        self.assertNotIn(self.lab._rel(source) if hasattr(self.lab, "_rel") else str(source.relative_to(self.lab.state)),
+                         result["data"]["acknowledged"])
+        self.assertEqual(json.loads(source.read_text())["base"], self.lab.revision)
+
+    def test_the_evidence_manifest_is_versioned_and_complete(self):
+        self.lab.workers().exec(self.run_id, ["cargo", "build"], "/", {"RUST_LOG": "debug"}, 30)
+        result = self.lab.workers().collect(self.run_id)
+        manifest = json.loads((self.lab.state / result["data"]["manifest"]).read_text())
+        self.assertEqual(contracts.evidence_errors(manifest), [])
+        self.assertEqual(manifest["schema"], contracts.EVIDENCE_SCHEMA)
+        self.assertEqual(manifest["source"]["base"], self.lab.revision)
+        self.assertEqual(manifest["template"]["candidate"], CANDIDATE)
+        command = manifest["commands"][0]
+        self.assertEqual((command["argv"], command["exit_code"], command["status"]), (["cargo", "build"], 0, "success"))
+        self.assertEqual(command["provenance"]["binaries"], {"build/debug/busybee": "a" * 64})
+        self.assertEqual(manifest["observations"]["processes"][0]["pid"], 1)
+        self.assertEqual(manifest["allocation"], CONFIG["worker"])
+        self.assertTrue(contracts.evidence_errors({**manifest, "schema": "busybee.vm.evidence/v0"}))
+
+
+class LogTests(unittest.TestCase):
+    def setUp(self):
+        self.lab = Lab(self)
+        self.run_id = self.lab.create()
+
+    def read_all(self, name, stream, limit, offset=0):
+        """Read to the end of what is there the way an agent would: from each
+        next_offset, one call at a time. Returns the bytes and whether that was eof."""
+        data = b""
+        while True:
+            result = self.lab.workers().read(self.run_id, name, stream, offset, limit)
+            self.assertEqual(result["status"], "success", result)
+            chunk = base64.b64decode(result["data"]["content_b64"])
+            self.assertEqual(result["data"]["offset"], offset)
+            data += chunk
+            offset = result["data"]["next_offset"]
+            if result["data"]["eof"] or not chunk:
+                return data, result["data"]["eof"]
+
+    def test_incremental_logs_are_lossless(self):
+        chunks = [b"line one\r\n", b"\x00\xff binary \xfe", b"", "unicode é\n".encode(), b"tail without newline"]
+        self.lab.guest.chunks, self.lab.guest.exit_code = list(chunks), 3
+        self.lab.guest.hang = True
+        handle = self.lab.workers().exec(self.run_id, ["make"], "/", {}, 60, detach=True)["data"]
+        name = handle["exec"]
+        seen = b""
+        for i in range(len(chunks)):
+            if i:
+                self.lab.guest.procs[-1].poll()  # the guest sends more, whoever watches
+            self.lab.restart_supervisors()  # every read is a fresh client and a fresh supervisor
+            self.lab.supervise(self.run_id)
+            part, eof = self.read_all(name, "stdout", limit=3, offset=len(seen))
+            seen += part
+            self.assertFalse(eof)  # still running: the end of what is there is not the end
+            status = self.lab.workers().status(self.run_id, name)["data"]
+            self.assertEqual((status["state"], status["stdout_bytes"]), ("running", len(seen)))
+            # Read again from where the agent stopped: nothing is repeated.
+            again = self.lab.workers().read(self.run_id, name, "stdout", len(seen))["data"]
+            self.assertEqual(again["content_b64"], "")
+        self.lab.guest.procs[-1].end(3)
+        self.lab.supervise(self.run_id)
+        rest, eof = self.read_all(name, "stdout", limit=3, offset=len(seen))
+        seen += rest
+        self.assertTrue(eof)
+        self.assertEqual(seen, b"".join(chunks))
+        self.assertEqual(outcome(self.lab, self.run_id, name)["status"], "product_failure")
+        # The final collection digests exactly those bytes.
+        collected = self.lab.workers().collect(self.run_id)["data"]["artifacts"]
+        self.assertEqual(collected[f"runs/{self.run_id}/exec/{name}/stdout"], hashlib.sha256(seen).hexdigest())
+        with self.assertRaises(worker.Refused):
+            self.lab.workers().read(self.run_id, name, "stdout", len(seen) + 1)
+        for bad in ("stdin", "../worker.json"):
+            with self.assertRaises(worker.Refused):
+                self.lab.workers().read(self.run_id, name, bad, 0)
+        for bad in ("../../worker", "1", "9999"):
+            with self.assertRaises(worker.Refused):
+                self.lab.workers().read(self.run_id, bad, "stdout", 0)
+
+    def test_exec_handles_report_progress(self):
+        self.lab.guest.hang = True
+        self.lab.guest.chunks = [b"compiling\n"]
+        handle = self.lab.workers().exec(self.run_id, ["cargo", "build"], "/", {}, 60, detach=True)
+        self.assertEqual(handle["status"], "success")
+        self.lab.now += 12
+        status = self.lab.workers().status(self.run_id, handle["data"]["exec"])["data"]
+        self.assertEqual((status["state"], status["stdout_bytes"]), ("running", len(b"compiling\n")))
+        self.assertEqual(status["elapsed_s"], 12)
+        self.assertIsNotNone(status["last_output_at"])
+        # Quiet output alone is never treated as a hang.
+        self.lab.now += 50
+        self.lab.supervise(self.run_id)
+        self.assertEqual(self.lab.workers().status(self.run_id, handle["data"]["exec"])["data"]["state"], "running")
+        waited = self.lab.workers().wait(self.run_id, handle["data"]["exec"], timeout=3)
+        self.assertEqual(waited["status"], "timeout")
+        self.assertIn("still_running", codes(waited))
+        run = self.lab.workers().status(self.run_id)["data"]
+        self.assertEqual(run["execs"], {handle["data"]["exec"]: "running"})
+
+
+class ExportTests(unittest.TestCase):
+    def setUp(self):
+        self.lab = Lab(self)
+        self.run_id = self.lab.create()
+
+    def test_public_export_removes_private_values(self):
+        record = json.loads((worker.run_dir(self.lab.state, self.run_id) / "worker.json").read_text())
+        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        secret = "s3cr3t-session-value"
+        home = str(Path.home())
+        private = [secret, token, home, str(self.lab.repo), str(self.lab.state), "192.0.2.17", "00:1C:42:AB:CD:EF",
+                   "001C42ABCDEF", record["vm_id"], record["vm_id"].strip("{}"), record["reset_snapshot_id"],
+                   record["worker"], self.run_id, "-----BEGIN OPENSSH PRIVATE KEY-----"]
+        self.lab.guest.stdout = (
+            f"token {token} for {secret}\nhome {home}/.config\nrepo {self.lab.repo}/build\nguest 192.0.2.17 "
+            f"mac 00:1C:42:AB:CD:EF / 001C42ABCDEF\nvm {record['vm_id']} {record['worker']}\n"
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+            "test result: FAILED. 3 passed; 1 failed\n").encode()
+        self.lab.guest.exit_code = 101
+        self.lab.workers().exec(self.run_id, ["cargo", "test", f"--token={secret}"], "/root/busybee",
+                                {"API_TOKEN": secret, "RUST_LOG": "debug"}, 30)
+        self.lab.workers().console_capture(self.run_id)
+        self.lab.workers().collect(self.run_id)
+        result = self.lab.workers().export(self.run_id)
+        self.assertEqual(result["status"], "success", result)
+        out = self.lab.state / result["data"]["path"]
+        blob = b"".join(p.read_bytes() for p in sorted(out.rglob("*")) if p.is_file())
+        for value in private:
+            with self.subTest(value=value):
+                self.assertNotIn(value.encode(), blob)
+        # The diagnosis survives: what ran, how it ended, what it printed.
+        command = json.loads((out / "exec/0001/command.json").read_text())
+        self.assertEqual(command["env"], {"API_TOKEN": "<redacted:API_TOKEN>", "RUST_LOG": "debug"})
+        self.assertEqual(command["argv"][:2], ["cargo", "test"])
+        self.assertEqual(json.loads((out / "exec/0001/result.json").read_text())["data"]["exit_code"], 101)
+        stdout = (out / "exec/0001/stdout").read_bytes()
+        self.assertIn(b"test result: FAILED. 3 passed; 1 failed", stdout)
+        for label in (b"<token>", b"<redacted:API_TOKEN>", b"<home>", b"<ip>", b"<mac>", b"<vm-id>", b"<vm-name>",
+                      b"<private-key>"):
+            self.assertIn(label, stdout)
+        manifest = json.loads((out / "manifest.json").read_text())
+        self.assertTrue(manifest["withheld"])
+        self.assertTrue(all(name.endswith((".png", ".bundle")) for name in manifest["withheld"]))
+        self.assertNotIn("worker.json", manifest["files"])
+        self.assertIn("collect/0001/collected.json", manifest["files"])
+        # The raw evidence is untouched.
+        raw = worker.run_dir(self.lab.state, self.run_id) / "exec/0001/stdout"
+        self.assertIn(secret.encode(), raw.read_bytes())
+
+
+class FrozenSupervisionTests(unittest.TestCase):
+    """A halted worker started again by the controller stays bounded if that controller dies."""
+
+    def setUp(self):
+        self.lab = Lab(self)
+        self.run_id = self.lab.create()
+        self.vm = contracts.worker_name(self.run_id)
+        self.rdir = worker.run_dir(self.lab.state, self.run_id)
+        # Collection fails: the worker is retained, stopped, and its supervisor has nothing to watch.
+        self.lab.guest.fail_on = "diff --cached"
+        self.assertEqual(self.lab.workers().destroy(self.run_id)["status"], "incomplete_collection")
+        self.assertFalse(self.lab.supervisor(self.run_id).tick())
+        self.lab.restart_supervisors()
+
+    def dies_during(self, needle):
+        real = self.lab.guest.run
+
+        def dies(command, timeout, stdin=None, **kwargs):
+            if needle in command:
+                raise KeyboardInterrupt
+            return real(command, timeout, stdin, **kwargs)
+        self.lab.guest.run = dies
+        return real
+
+    def test_a_reset_of_a_halted_worker_is_supervised(self):
+        self.lab.guest.fail_on = None
+        self.dies_during("source.bundle")
+        with self.assertRaises(KeyboardInterrupt):
+            self.lab.workers().reset(self.run_id)
+        self.assertEqual(self.lab.prlctl.vms[self.vm]["state"], "running")
+        # The supervisor the reset started halts the half-reset worker on its own.
+        self.assertIn(self.run_id, self.lab.supervisors)
+        self.lab.supervise(self.run_id)
+        self.assertEqual(self.lab.prlctl.vms[self.vm]["state"], "stopped")
+        record = json.loads((self.rdir / "worker.json").read_text())
+        self.assertEqual(record["status"], "failed")
+
+    def test_a_collection_that_boots_a_halted_worker_is_supervised(self):
+        self.lab.guest.fail_on = None
+        self.dies_during("diff --cached")
+        with self.assertRaises(KeyboardInterrupt):
+            self.lab.workers().collect(self.run_id)
+        self.assertEqual(self.lab.prlctl.vms[self.vm]["state"], "running")
+        self.assertIn(self.run_id, self.lab.supervisors)
+        self.lab.supervise(self.run_id)
+        self.assertEqual(self.lab.prlctl.vms[self.vm]["state"], "stopped")
+        self.assertEqual(json.loads((self.rdir / "worker.json").read_text())["status"], "retained")
+
+    def test_reconciliation_halts_a_running_halted_worker(self):
+        # Booted by a controller that died before it could start a supervisor.
+        self.lab.prl.start(self.vm)
+        status = self.lab.workers().status()
+        self.assertEqual(status["data"]["workers"][0]["vm_state"], "stopped")
+
+
+class EnsureTests(unittest.TestCase):
+    """The detached supervisor process, started for real (no Parallels involved)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = Path(tmp.name)
+        self.run_id = contracts.new_run_id()
+        worker.run_dir(self.state, self.run_id).mkdir(parents=True)
+        self.lock = worker.run_dir(self.state, self.run_id) / "supervisor.lock"
+
+    def child(self, body):
+        return [sys.executable, "-c", f"import fcntl, os, sys, time\n{body}"]
+
+    def test_a_supervisor_outlives_its_starter_in_its_own_session(self):
+        hold = f"f = open({str(self.lock)!r}, 'a'); fcntl.flock(f, fcntl.LOCK_EX)\n" \
+               "print(os.getsid(0), flush=True); time.sleep(30)"
+        supervisor.ensure(self.state, self.run_id, self.child(hold))
+        self.assertTrue(worker.held(self.lock))
+        log = worker.run_dir(self.state, self.run_id) / "supervisor.log"
+        for _ in range(100):
+            if log.read_text().strip():
+                break
+            time.sleep(0.05)
+        self.assertNotEqual(int(log.read_text().split()[0]), os.getsid(0))
+        # A second call finds it alive and starts nothing.
+        supervisor.ensure(self.state, self.run_id, self.child("sys.exit(7)"))
+        subprocess.run(["pkill", "-f", str(self.lock)])
+
+    def test_a_supervisor_with_nothing_to_watch_is_not_a_failure(self):
+        supervisor.ensure(self.state, self.run_id, self.child("sys.exit(0)"))
+
+    def test_a_supervisor_that_cannot_start_is_loud(self):
+        with self.assertRaises(worker.Refused) as caught:
+            supervisor.ensure(self.state, self.run_id, self.child("sys.exit(1)"))
+        self.assertEqual(caught.exception.code, "supervisor_unavailable")
 
 
 if __name__ == "__main__":

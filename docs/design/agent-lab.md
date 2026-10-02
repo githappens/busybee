@@ -7,7 +7,8 @@ macOS without asking a person to operate its development environment.
 
 **Status: design for implementation.** `doctor`, the Linux `template`
 operations, and Linux workers with `exec`, `inspect`, `signal`, `console
-capture` and `collect` (`scripts/vm/vmctl.py`) have shipped; the `terminal`
+capture`, `collect`, run supervision, exec handles (`status`, `wait`, `read`)
+and the public `export` (`scripts/vm/vmctl.py`) have shipped; the `terminal`
 operations return `unsupported`.
 Until the rest lands, [CLAUDE.md](../../CLAUDE.md) and the
 [Sortie workflow](../../sortie/README.md) remain the operational instructions.
@@ -253,9 +254,61 @@ collection is incomplete they stop the clone and keep it registered, and the
 result is `incomplete_collection`. Reset then restores the snapshot recorded at
 creation and transfers the source again; destroy deletes the clone. Until its
 source is in the guest a worker is `provisioning`: exec refuses it, and reset
-and destroy have nothing to collect from it. These
-deadlines hold while the controller process runs; supervision that outlives it
-is not provided yet.
+and destroy have nothing to collect from it. Collection
+and the cleanup it precedes run within `deadlines.cleanup`.
+
+Every worker has a supervisor (`scripts/vm/supervisor.py`): a detached
+controller process, started in its own session by `worker create` and restarted
+by any later call that finds it gone, holding a lock in the run directory. It
+needs no host service or system configuration. `exec` only queues the command;
+the supervisor runs it, so killing the calling process or agent ends nothing.
+In the guest, `timeout(1)` leads the command's process group and records its
+pid. The supervisor enforces, independently of the guest and of busybee:
+
+- the command deadline: a command still running `timeout -k` plus a margin
+  after its deadline means the guest's own bound failed, and its process group
+  is killed (`watchdog_deadline`);
+- the artifact budget: `[worker] artifact_mib` caps the run's logs and
+  evidence; a command that outgrows it is killed (`artifact_budget_exceeded`)
+  and later commands are refused;
+- the run deadline: unfinished commands are killed (`run_deadline`), the worker
+  is collected within the cleanup window and halted, and it becomes `expired`;
+- guest control: if the guest stops answering, its console and the evidence
+  already on the host are kept and the VM is stopped (`guest_unresponsive`).
+
+A supervisor that dies leaves its ssh processes writing the logs; its
+successor adopts them and reads each exit status from the guest. Each finished
+command checkpoints the guest's source changes to `checkpoint/`.
+
+`exec --detach` returns a handle. `status RUN EXEC` reports its state, elapsed
+time, last-output time and log sizes; quiet output alone is never treated as a
+hang. `read RUN EXEC stdout|stderr --offset N` returns bytes from an offset and
+the next offset, with `eof` only once the command has finished and nothing is
+left; `wait RUN EXEC` returns its result. `status` with no run reconciles the
+registry: it accounts for every owned worker and its allocation, restarts any
+missing supervisor, and reports claims an interrupted creation never recorded.
+`worker create` reconciles the same way, under a controller lock, before it
+admits a worker. A creation or reset interrupted before the source was in
+place is stopped and marked `failed`. Workers halted by the controller after a
+collection attempt (`stopped`, `retained`, `expired`) cannot have changed: an
+operation that starts one again hands it to the supervisor first, which halts
+it once no operation holds it, and reconciliation does the same for one found
+running. So a retried `collect`, `reset` or `destroy` completes that collection in place:
+artifacts already saved with a matching digest are acknowledged and only the
+rest is fetched. A repeated destroy, or one whose VM is already gone, succeeds.
+
+`collected.json` is the versioned evidence manifest
+(`busybee.vm.evidence/v1`, `contracts.evidence_errors`): source base, head,
+status and patch hash, the baseline's provisioning revision, lock hashes and
+tool versions, the allocation and deadline, every command with its argv,
+environment, timings, result and binary digests, process and daemon
+observations, the controller's cleanup events, artifact digests, acknowledged
+artifacts and what is missing. `export RUN` writes a separate publishable copy
+to `runs/<run-id>/public/`: environment values outside an allowlist, tokens and
+keys, machine paths, user and host names, IP and MAC addresses, and VM,
+snapshot and run identities become labelled placeholders, while exit codes,
+timings and output keep their meaning. Bundles and images cannot be scanned,
+so the export lists them by digest instead of copying them.
 
 `template prune linux` deletes each retained baseline that no registered worker
 was cloned from, and keeps and reports the rest.
@@ -263,7 +316,7 @@ was cloned from, and keeps and reports the rest.
 The unit tests under `scripts/vm/tests` need no Parallels. The acceptance tests
 that build, validate and compare real candidates, and drive real workers, run
 against the local config when opted in: `BUSYBEE_VM_LAB=1 python3 -m unittest
-test_real_template test_real_worker` in that directory.
+test_real_template test_real_worker test_real_supervision` in that directory.
 
 Long commands return a run handle with status, elapsed time, last-output time,
 and artifact locations. Agents can await completion and read output from a byte

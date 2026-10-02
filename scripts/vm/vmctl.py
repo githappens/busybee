@@ -6,6 +6,7 @@ otherwise a short summary. Exit status: 0 success, 1 any other result, 2 usage,
 3 an operation this revision does not implement yet.
 """
 import argparse
+import base64
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ import contracts
 import guest
 import parallels
 import registry
+import supervisor
 import template
 import worker
 
@@ -253,8 +255,13 @@ def worker_operation(repo, args, host, operation):
     if failed:
         return failed
     config, reg, prl = ready
-    workers = worker.Workers(repo, config, prl, reg, host.free_storage_gib)
+    state = contracts.state_dir(config, repo)
+    workers = worker.Workers(repo, config, prl, reg, host.free_storage_gib, supervise=lambda run_id: supervisor.ensure(
+        state, run_id, supervisor.argv(repo, args.config, run_id)))
     try:
+        if operation == "supervise":
+            supervisor.serve(workers, args.run_id)
+            return None
         if operation == "worker create":
             return workers.create(args.name, args.revision, args.patch)
         if operation == "exec":
@@ -263,11 +270,18 @@ def worker_operation(repo, args, host, operation):
                 raise worker.Refused("env_invalid", f"--env takes NAME=VALUE, not {', '.join(malformed)}")
             env = dict(item.partition("=")[::2] for item in args.env)
             timeout = config["deadlines"]["command"] if args.timeout is None else args.timeout
-            return workers.exec(args.run_id, args.command, args.cwd, env, timeout)
+            return workers.exec(args.run_id, args.command, args.cwd, env, timeout, args.detach)
         if operation == "signal":
             return workers.signal(args.run_id, args.signal, args.pid)
+        if operation == "status":
+            return workers.status(args.run_id, args.exec)
+        if operation == "wait":
+            return workers.wait(args.run_id, args.exec, args.timeout)
+        if operation == "read":
+            return workers.read(args.run_id, args.exec, args.stream, args.offset, args.limit)
         method = {"worker reset": workers.reset, "worker destroy": workers.destroy, "inspect": workers.inspect,
-                  "collect": workers.collect, "console capture": workers.console_capture}[operation]
+                  "collect": workers.collect, "console capture": workers.console_capture,
+                  "export": workers.export}[operation]
         return method(args.run_id)
     except worker.Refused as err:
         return contracts.result(operation, "environment_failure", "refused", [contracts.finding(err.code, str(err))])
@@ -335,6 +349,21 @@ def parser():
     run.add_argument("--cwd", required=True)
     run.add_argument("--env", action="append", default=[], metavar="NAME=VALUE")
     run.add_argument("--timeout", type=int, help="seconds, at most deadlines.scenario; default deadlines.command")
+    run.add_argument("--detach", action="store_true", help="return the exec's handle instead of waiting for it")
+    handle = argparse.ArgumentParser(add_help=False, parents=[target])
+    handle.add_argument("exec", help="exec number printed by exec")
+    status = ops.add_parser("status", help="owned workers after reconciling them, or one worker or exec")
+    status.add_argument("run_id", nargs="?")
+    status.add_argument("exec", nargs="?")
+    status.add_argument("--config", type=Path, default=REPO / DEFAULT_CONFIG)
+    ops.add_parser("wait", parents=[handle], help="wait for an exec's result") \
+        .add_argument("--timeout", type=int, help="seconds; default as long as the supervisor may take")
+    read = ops.add_parser("read", parents=[handle], help="an exec's output from a byte offset")
+    read.add_argument("stream", choices=worker.STREAMS)
+    read.add_argument("--offset", type=int, default=0)
+    read.add_argument("--limit", type=int, default=worker.READ_LIMIT)
+    ops.add_parser("export", parents=[target], help="write the run's sanitized public evidence")
+    ops.add_parser("supervise", parents=[target], help="internal: the run's watchdog, started by the controller")
     sig = ops.add_parser("signal", parents=[target], help="signal a process in a worker")
     sig.add_argument("signal")
     sig.add_argument("pid")
@@ -364,6 +393,12 @@ def main(argv=None):
     else:
         operation = " ".join(filter(None, (args.operation, getattr(args, "action", None))))
         outcome = worker_operation(REPO, args, Host(), operation)
+        if outcome is None:  # the supervisor, which reports through the run's events
+            return EXIT_OK
+    if args.operation == "read" and not args.json and outcome["status"] == "success":
+        # Plain `read` is the bytes themselves, so output can be piped.
+        sys.stdout.buffer.write(base64.b64decode(outcome["data"]["content_b64"]))
+        return EXIT_OK
     print(json.dumps(outcome, indent=2) if args.json else summary(outcome))
     if outcome["status"] == "unsupported":
         return EXIT_UNSUPPORTED
