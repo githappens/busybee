@@ -370,6 +370,26 @@ class CreateTests(unittest.TestCase):
         self.assertIn("storage_exhausted", codes(result))
         self.assertEqual([c for c in self.lab.prlctl.calls if c[0] != "list"], [])
 
+    def test_second_admission_counts_the_first_workers_allocation(self):
+        # Free storage covers exactly one worker's allocation.  After the first
+        # worker is admitted, the second sees that space as reserved and is
+        # refused storage_exhausted at once, without waiting for a free slot.
+        self.lab.free_gib = self.lab.config["worker"]["storage_gib"]
+        self.lab.create()
+        self.lab.wait_s = 600
+        started = self.lab.now
+        result = self.lab.workers().create("linux", self.lab.revision)
+        self.assertIn("storage_exhausted", codes(result))
+        self.assertEqual(self.lab.now, started)
+
+    def test_admission_with_room_for_two_succeeds(self):
+        # Free storage covers two workers' allocations.  With one active worker
+        # the reserved space still leaves room for a second admission.
+        self.lab.free_gib = 2 * self.lab.config["worker"]["storage_gib"]
+        self.lab.create()
+        result = self.lab.workers().create("linux", self.lab.revision)
+        self.assertEqual(result["status"], "success", result)
+
     def test_a_clone_with_host_devices_is_disposed(self):
         self.lab.prlctl.devices.append("usb")
         result = self.lab.workers().create("linux", self.lab.revision)

@@ -285,7 +285,8 @@ runs. Admission and the claim are one step under `controller.lock`, so two
 controller processes cannot both take the last place. Only the limit is
 waited out: a storage or baseline refusal returns at once. Each worker's
 `storage_gib` must cover the baseline's disk, which a clone can grow to, and
-the host must have that storage free when it is admitted. `doctor` reports
+the host must have that storage free above what every already-active Linux
+worker has reserved at its full `storage_gib` when it is admitted. `doctor` reports
 the cap and the peak the configured workers need together (Linux workers and
 the macOS slot, each with the allocation; the slot's disk is its baseline's
 own) and warns (`concurrency_exceeds_host`) when the host has less.
