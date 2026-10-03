@@ -26,7 +26,10 @@ and its base:
 `evaluate` runs or reuses the two matrices and writes the result to
 `gates/<id>/gate.json`, with a redacted `gate.public.json` beside it; `comment`
 renders that public copy for the pull request. Unchanged evidence is reused
-rather than verified again; incomplete evidence never is.
+rather than verified again: a verified candidate, and a complete base whether
+it passed or failed. A refused candidate is verified again when asked again,
+so a flaky check does not stick to its head; incomplete evidence never is
+reused.
 """
 import getpass
 import hashlib
@@ -225,7 +228,10 @@ def _reusable(ops, role, expect, platforms):
         _bound(role, m, expect, problems)
         if not problems:
             _complete(role, m, expect, ops.metas(), exists, ops.worker_status, problems)
-        if not [f for f in problems if f["severity"] == "error"] and m.get("verdict") in ("verified", "failed") \
+        # A refused candidate is verified again on request, so a flaky check does
+        # not stick to its head; a base, red on main by design, is reused.
+        settled = ("verified",) if role == "candidate" else ("verified", "failed")
+        if not [f for f in problems if f["severity"] == "error"] and m.get("verdict") in settled \
                 and set(platforms) <= set(m.get("required_platforms", ())):
             found.append((m["id"], path))
     return max(found)[1] if found else None

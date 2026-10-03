@@ -243,11 +243,17 @@ class EvaluateTests(unittest.TestCase):
         # A new head is verified; the base it shares is not.
         gate.evaluate(self.ops, ISSUE, "d" * 40, BASE)
         self.assertEqual(self.ops.runs[2:], [("candidate", "d" * 40)])
+        # A refused candidate is verified again when asked again (a flaky check
+        # must not stick to an unchanged head); its base, red on main, is reused.
+        self.ops.candidate = lambda rev: dict(matrix("candidate", rev), verdict="failed")
+        gate.evaluate(self.ops, ISSUE, "f" * 40, BASE)
+        gate.evaluate(self.ops, ISSUE, "f" * 40, BASE)
+        self.assertEqual(self.ops.runs[3:], [("candidate", "f" * 40)] * 2)
         # Evidence that could not complete is never reused.
         self.ops.candidate = lambda rev: dict(matrix("candidate", rev), verdict="incomplete")
         gate.evaluate(self.ops, ISSUE, "e" * 40, BASE)
         gate.evaluate(self.ops, ISSUE, "e" * 40, BASE)
-        self.assertEqual(self.ops.runs[3:], [("candidate", "e" * 40)] * 2)
+        self.assertEqual(self.ops.runs[5:], [("candidate", "e" * 40)] * 2)
 
     def test_pilot_replays_red_base_and_green_candidate(self):
         # #69's red run, recorded by the lab on both platforms (the sanitized

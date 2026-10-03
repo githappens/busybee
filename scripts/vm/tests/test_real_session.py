@@ -73,6 +73,9 @@ class RealSessionTests(unittest.TestCase):
         git("init", "-q", "--bare", str(origin))
         # main is this revision, so the guard sees only what the agent changes.
         git("-C", str(REPO), "push", "-q", str(origin), f"{self.head}:refs/heads/main", f"{self.head}:refs/heads/seed")
+        # A task checkout clones the repository with its tags, which `git describe`
+        # versions the build from; the scenarios' preflight checks that version.
+        git("-C", str(REPO), "push", "-q", str(origin), "--tags")
         self.workspace = self.tmp / "ws"
         git("clone", "-q", "--branch", "main", str(origin), str(self.workspace))
         git("-C", str(self.workspace), "checkout", "-q", "-b", BRANCH, "origin/seed")

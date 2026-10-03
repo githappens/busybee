@@ -784,7 +784,10 @@ to two platform matrices, the candidate's and its base's:
 `verified` and `preexisting_failures` pass. The gate reads its evidence and
 changes none of it, so a refusal keeps every matrix and run for diagnosis.
 Complete matrices bound to the same evidence are reused, so unchanged
-evidence is not verified twice; incomplete ones are not. The pull-request
+evidence is not verified twice: a verified candidate, and a base whether it
+passed or failed. A refused candidate is verified again when its handoff is
+asked for again, so a flaky check does not stick to an unchanged head;
+incomplete matrices are never reused. The pull-request
 comment that carries the public record starts with `<!-- busybee-lab-evidence:v1
 {head, base, issue, verdict, evidence_id} -->`; the CI review gate requires one
 by the PR's author, for the current head, with a passing verdict, before it
