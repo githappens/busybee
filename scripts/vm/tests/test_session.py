@@ -627,6 +627,15 @@ class ExitTests(Harness):
         self.assertIn("1 worker(s) may be active", end["reason"])
         self.assertIsNone(self.sessions.load(ISSUE)["attempt"])
 
+    def test_claude_runs_as_the_worker_root_it_is_given(self):
+        # The agent is root in its disposable guest; Claude Code refuses to skip
+        # its permission prompts as root unless told it runs in a sandbox.
+        self.sessions = self.make_sessions(env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-secret-value"})
+        self.start()
+        self.assertEqual(self.sessions.agent(self.workspace, ["claude", "-c", 'test "$IS_SANDBOX" = 1']), 0,
+                         self.err.getvalue())
+        self.assertEqual(self.turn('test -z "${IS_SANDBOX-}"'), 0, self.err.getvalue())
+
     def test_credentials_reach_the_turn_and_never_its_records(self):
         self.sessions = self.make_sessions(env={"CLAUDE_CODE_OAUTH_TOKEN": "sk-secret-value",
                                                 "GITHUB_TOKEN": "gh-secret-value", "SORTIE_X": "1"})

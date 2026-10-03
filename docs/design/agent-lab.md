@@ -466,7 +466,9 @@ Model credentials named for the runner (`CLAUDE_CODE_OAUTH_TOKEN`,
 `CODEX_API_KEY`) reach the turn through a mode-0600 file under `/run` (tmpfs)
 that the turn deletes before the runner starts; a runner without one fails the
 turn (`credentials_missing`) rather than running unauthenticated. Nothing
-else from the dispatcher's environment enters the guest. No
+else from the dispatcher's environment enters the guest. The agent is root in
+its guest, so a Claude turn runs with `IS_SANDBOX=1`, without which Claude
+Code refuses to skip its permission prompts as root. No
 credential is written to the worker's disk, its snapshots, the run's evidence
 or the session's records. Sortie's generated `--mcp-config` names a host-side
 tool server and is dropped, with a notice. A turn is bounded by `timeout(1)`

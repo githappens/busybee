@@ -78,6 +78,10 @@ CREDENTIALS = {"claude": ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHR
                "codex": ("OPENAI_API_KEY", "CODEX_API_KEY")}
 # The development shell each runner's command runs in; others use the default one.
 AGENT_SHELL = {"claude": ".#worker-agent", "codex": ".#worker-agent"}
+# What a runner needs to be told about the guest it runs in. The agent is root
+# there, and Claude Code skips its permission prompts as root only when told
+# it runs in a sandbox, which a disposable worker is.
+RUNNER_ENV = {"claude": {"IS_SANDBOX": "1"}}
 PROTOCOL_LIMIT = 64 * 1024 * 1024
 MARGIN_S = worker.KILL_GRACE_S + 30
 LAB_CLIENT = Path(__file__).resolve().parent / "lab_client.py"
@@ -609,7 +613,7 @@ class Sessions:
             self._forget(gdir, attempt)
             return finish("adapter_failure", 1, f"the worker did not take the turn: {err}")
         exports = {"BUSYBEE_SORTIE_WORKER": "1", "BUSYBEE_LAB_SOCKET": f"{gdir}/broker.sock",
-                   "BUSYBEE_LAB_ISSUE": str(issue), "BUSYBEE_LAB_RUN": run_id}
+                   "BUSYBEE_LAB_ISSUE": str(issue), "BUSYBEE_LAB_RUN": run_id, **RUNNER_ENV.get(runner, {})}
         if session["pr"]:
             exports["BUSYBEE_LAB_PR"] = str(session["pr"])
         command = (f"d={q(gdir)}; set -a; . \"$d/env\"; set +a; rm -f \"$d/env\"; "
