@@ -24,9 +24,8 @@ polling:
   interval_ms: 60000
 
 hooks:
-  # Sortie runs hooks with only a system allowlist and SORTIE_* variables, so
-  # each hook first sources the trusted sortie/hook-env.sh, which restores the
-  # launcher's settings from their SORTIE_BUSYBEE_* copies or stops loudly.
+  # Each hook first sources the trusted sortie/hook-env.sh: Sortie passes hooks
+  # only SORTIE_* and a system allowlist (sortie/README.md, "What hooks see").
   # HTTPS clones with the dispatcher's gh identity; an SSH URL (an operator's
   # deploy-key host alias) uses its own key, never prompting.
   after_create: |

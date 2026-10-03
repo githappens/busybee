@@ -183,6 +183,17 @@ it. Preserve workspaces and reports when escalating; remove `needs-human` and
 re-enable an issue only after its blocker is resolved. Restart a stopped
 controller to adopt a newly merged policy snapshot.
 
+```sh
+nix develop .#agent -c python3 -m unittest discover -s sortie/tests
+nix develop .#agent -c bash sortie/test-machine-safety-hook.sh
+nix develop .#agent -c bash sortie/test-isolated-launcher.sh
+bash sortie/test-harness-docs.sh
+```
+
+The ordinary Linux/macOS workflow also runs these harness checks. See the
+review contract for the OAuth secret, Actions approval setting, evidence
+artifacts and transcripts, and the pinned one-PR bootstrap procedure.
+
 ### Resetting an issue whose retries a harness failure burned
 
 A hook or launcher failure fails every attempt before a turn runs, yet each
@@ -204,14 +215,3 @@ It deletes the issues' rows from Sortie's per-issue tables in
 checkout without a `.git` directory under the workspace root, remove it so
 `after_create` clones afresh. Reset only issues whose runs never reached
 the agent: a reset discards real attempt history too.
-
-```sh
-nix develop .#agent -c python3 -m unittest discover -s sortie/tests
-nix develop .#agent -c bash sortie/test-machine-safety-hook.sh
-nix develop .#agent -c bash sortie/test-isolated-launcher.sh
-bash sortie/test-harness-docs.sh
-```
-
-The ordinary Linux/macOS workflow also runs these harness checks. See the
-review contract for the OAuth secret, Actions approval setting, evidence
-artifacts and transcripts, and the pinned one-PR bootstrap procedure.

@@ -75,8 +75,7 @@ class Lab:
         (self.trusted / "sortie").mkdir(parents=True)
         (self.trusted / "scripts/vm").mkdir(parents=True)
         for name in ("hook-env.sh", "prepare-workspace.sh"):
-            if (SORTIE / name).exists():
-                shutil.copy(SORTIE / name, self.trusted / "sortie" / name)
+            shutil.copy(SORTIE / name, self.trusted / "sortie" / name)
         for name in ("machine-safety-hook.sh", "claude-settings.json", "isolated.sh"):
             (self.trusted / "sortie" / name).write_text("trusted guard\n")
         for rel, up in (("sortie/lab.py", 1), ("sortie/review-triage.py", 1), ("scripts/vm/vmctl.py", 2)):
@@ -159,6 +158,15 @@ class HookEnvironment(unittest.TestCase):
             self.assertIn("run-lab.sh", done.stderr, name)
             self.assertNotIn("repository ''", done.stderr, name)
         self.assertEqual(self.lab.calls(), [])
+
+    def test_each_missing_setting_is_named(self):
+        for name in ("LAB_ROOT", "CLONE_URL", "AGENT_KIND", "GITHUB_TOKEN"):
+            env = self.lab.launcher_env()
+            del env[f"SORTIE_BUSYBEE_{name}"]
+            done = self.lab.hook("after_create", env)
+            self.assertNotEqual(done.returncode, 0, name)
+            self.assertIn(f"SORTIE_BUSYBEE_{name}", done.stderr, name)
+            self.assertFalse((self.lab.workspace / ".git").exists(), name)
 
     def test_the_launcher_exports_every_setting_the_hooks_require(self):
         names = set(re.findall(r"SORTIE_BUSYBEE_[A-Z_]+", (SORTIE / "hook-env.sh").read_text()))
