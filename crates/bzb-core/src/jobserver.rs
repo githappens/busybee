@@ -6,10 +6,14 @@
 //! macOS a fifo is a socket pair and `FIONREAD` on a read-write descriptor
 //! reports the always-empty write side.
 //!
-//! Token acquisition uses a third handle opened without `O_NONBLOCK`.  A
-//! blocking read places the daemon in the kernel's wait queue alongside the
-//! jobserver build's own readers, so they compete on equal terms.  The
-//! non-blocking handle (`fd_r`) is kept for `FIONREAD` only.
+//! Token acquisition uses a third handle (`fd_b`).  It is opened with
+//! `O_NONBLOCK` (so the open never hangs on macOS socket-pair FIFOs where an
+//! `O_RDWR` fd does not satisfy the "writer present" requirement for a
+//! blocking `O_RDONLY` open), then `fcntl(F_SETFL)` clears the flag so reads
+//! block.  A blocking `read` places the daemon in the kernel's exclusive
+//! `rd_wait` queue alongside the jobserver build's own readers, so they
+//! compete on equal terms.  The non-blocking handle (`fd_r`) is kept for
+//! `FIONREAD` only.
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -79,9 +83,22 @@ impl Jobserver {
         }
         let handles = open_nonblocking(&path, true).and_then(|rw| {
             let r = open_nonblocking(&path, false)?;
-            // Blocking open succeeds immediately: fd_rw (O_RDWR) is already
-            // open, satisfying the "writer exists" requirement for O_RDONLY.
-            let b = fs::OpenOptions::new().read(true).open(&path)?;
+            // Open with O_NONBLOCK first so the call never hangs (on macOS,
+            // which implements FIFOs as socket pairs, an O_RDWR fd may not
+            // satisfy the "writer exists" requirement for a blocking O_RDONLY
+            // open).  Then clear O_NONBLOCK via fcntl so subsequent reads
+            // block, placing the daemon in the kernel's exclusive rd_wait
+            // queue alongside make's own readers.
+            let b = open_nonblocking(&path, false)?;
+            // SAFETY: b is a valid open fd; F_GETFL / F_SETFL are
+            // well-defined for any file descriptor.
+            let flags = unsafe { libc::fcntl(b.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if unsafe { libc::fcntl(b.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
             Ok((rw, r, b))
         });
         let (fd_rw, fd_r, fd_b) = match handles {
@@ -179,6 +196,12 @@ impl Jobserver {
             }
             if ret == 0 {
                 break; // deadline elapsed
+            }
+            // On macOS socket-pair FIFOs, poll can return with POLLHUP set
+            // and POLLIN clear when the pipe is empty.  Guard against that
+            // so we never attempt a blocking read with no data available.
+            if pfd.revents & libc::POLLIN == 0 {
+                break;
             }
             // poll(2) reported POLLIN.  Read from the blocking handle so that
             // if another reader consumed the byte first, we stay in the
