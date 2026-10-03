@@ -182,8 +182,14 @@ class RealSupervisionTests(unittest.TestCase):
         status = until(lambda: (lambda s: s if s["data"]["workers"][0]["status"] in ("claimed", "failed") else None)(
             vmctl("status")), 120, "the interrupted creation was not reconciled")
         self.assertEqual([w["run_id"] for w in status["data"]["workers"]], [run_id])
-        blocked = vmctl("worker", "create", "linux", "--revision", head())
+        # The interrupted claim holds one of the Linux workers' places until it is destroyed.
+        cap = vmctl("doctor")["data"]["config"]["concurrency"]["linux_workers"]
+        others = [self.create() for _ in range(cap - 1)]
+        blocked = vmctl("worker", "create", "linux", "--revision", head(), "--wait", "0")
         self.assertIn("worker_limit", codes(blocked))
+        self.assertIn(run_id, blocked["findings"][0]["message"])
+        for other in others:
+            self.assertEqual(vmctl("worker", "destroy", other)["status"], "success")
         # Parallels may still be finishing the interrupted clone; a destroy retried until then removes it.
         until(lambda: vmctl("worker", "destroy", run_id)["status"] == "success", 120, "destroy never succeeded")
         self.assertEqual(workers(), set())

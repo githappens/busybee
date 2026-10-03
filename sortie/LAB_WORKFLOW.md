@@ -1,11 +1,14 @@
 ---
-# Launch with run-lab.sh. It selects a native adapter, pins the executing
-# scripts outside issue workspaces, and uses the repo-owned agent dev shell.
+# The only dispatch profile. Launch with run-lab.sh. It selects a native
+# adapter, pins the executing scripts outside issue workspaces, and uses the
+# repo-owned agent dev shell.
 tracker:
   kind: github
   project: githappens/busybee
   api_key: $GITHUB_TOKEN
-  query_filter: 'label:sortie milestone:"agent lab: autonomous VM development"'
+  # Any marked issue in the repository; lab.py's release sidecar hands out
+  # the marker when an issue's blocked-by prerequisites are merged.
+  query_filter: 'label:sortie'
   active_states: [sortie:ready, sortie:working]
   in_progress_state: sortie:working
   handoff_state: sortie:review
@@ -13,15 +16,22 @@ tracker:
   handoff_evidence: strict
 
 workspace:
-  root: $BUSYBEE_SORTIE_STATE/workspaces
+  # launch.sh: the lab state, or an operator's BUSYBEE_SORTIE_WORKSPACES.
+  root: $BUSYBEE_SORTIE_WORKSPACE_ROOT
 db_path: $BUSYBEE_SORTIE_STATE/sortie.db
 
 polling:
   interval_ms: 60000
 
 hooks:
+  # HTTPS clones with the dispatcher's gh identity; an SSH URL (an operator's
+  # deploy-key host alias) uses its own key, never prompting.
   after_create: |
-    git -c credential.helper= -c credential.helper='!gh auth git-credential' clone "$BUSYBEE_SORTIE_CLONE_URL" .
+    case "$BUSYBEE_SORTIE_CLONE_URL" in
+      http://* | https://*)
+        git -c credential.helper= -c credential.helper='!gh auth git-credential' clone "$BUSYBEE_SORTIE_CLONE_URL" . ;;
+      *) git -c core.sshCommand='ssh -o BatchMode=yes' clone "$BUSYBEE_SORTIE_CLONE_URL" . ;;
+    esac
   # Each attempt runs in a fresh Linux worker from the trusted controller:
   # before_run closes an unclosed attempt and opens one; after_run checkpoints,
   # collects, destroys and accounts for the worker. Agent turns run there via
@@ -42,7 +52,9 @@ agent:
   # overrides. These fields do not expand arbitrary environment variables.
   kind: codex
   command: codex app-server
-  max_concurrent_agents: 1
+  # Two sessions, each in its own Linux worker; the controller admits at most
+  # its configured number of active Linux workers and queues the rest.
+  max_concurrent_agents: 2
   max_turns: 20
   max_sessions: 20
   turn_timeout_ms: 7200000
@@ -161,6 +173,39 @@ Pueue/bzbd state even in your worker, and the startup path under test must not
 be prepared by hand: do not work around a cold startup bug by creating its
 runtime directories.
 
+## Ground rules
+
+1. **Read first.** `CLAUDE.md` (build, test, layout), then the specification the issue names: `docs/design/bzbd.md` for the broker, `docs/design/agent-lab.md` for the lab (`AGENTS.md` §Conform to the specification).
+2. **Scope.** The issue's scope and acceptance criteria are the whole scope (`AGENTS.md` §Stay within the issue's scope).
+3. **TDD.** Failing test first; never weaken, skip, or delete an existing test to get green (`CLAUDE.md` §Conventions).
+4. **No silent fallbacks.** Errors propagate with context; degraded paths stay loud (`CLAUDE.md` §Conventions, `AGENTS.md` §No silent fallbacks).
+5. **Isolation.** Tests spawn their own `pueued`/`bzbd`, even in your worker (`CLAUDE.md` §Integration tests).
+6. **Public repo hygiene.** Generic examples only, no machine or user names or local paths, no AI co-author trailers (`AGENTS.md` §Public repository hygiene).
+
+## Show the regression
+
+Review sees a product change only with a regression the controller saw fail
+on the base and pass on your head. Write it first, as TDD asks, in one of two
+forms:
+
+- **A test overlay** (the usual form, for a bug fix or a feature): new test
+  code in files that hold only tests, for example a new
+  `crates/<crate>/tests/<name>.rs` or new test-only files, named with
+  `lab handoff --overlay PATH...`. The base runs `cargo test` with those files
+  applied, so they must fail there (a missing API that does not compile
+  counts) and pass on your head. Do not name a source file that also carries
+  the fix: the overlay would bring the fix to the base.
+- **A scenario** under `tests/scenarios/` whose `issue` is this issue's
+  number, for behaviour only a running daemon or terminal shows.
+
+A handoff with neither is `checks_only`, which only an infrastructure
+(`area:harness`) issue may hand to review. If the issue's change genuinely
+cannot fail on the base (documentation, a pure refactor), do not invent a
+test: write that reason to `.sortie/blocker.md`, set `.sortie/status` to
+`blocked`, and stop.
+
+## Delivery
+
 When implementation and required checks are ready:
 
 1. Commit, `lab push`, and create/reuse a draft PR with `Closes #{{ .issue.identifier }}`
@@ -174,9 +219,8 @@ When implementation and required checks are ready:
    controller releases your worker and verifies the head and its merge base
    with main in fresh Linux and macOS workers (required checks, the issue's
    regression scenarios red on the base and green on the head, terminal
-   evidence, cleanup). A product fix must show its regression: a scenario
-   naming the issue, or the regression test files you added, named with
-   `lab handoff --overlay PATH...` so the base's red run includes them. Only
+   evidence, cleanup). A product fix must show its regression (§Show the
+   regression). Only
    an accepted head is handed to review, with the evidence posted on the PR;
    then the trusted `$BUSYBEE_SORTIE_TRUSTED/sortie/reviews.py handoff`
    writes `.sortie/scm.json` and `.sortie/status`. Otherwise your next turn starts in a fresh worker: read

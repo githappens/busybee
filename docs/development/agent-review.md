@@ -27,11 +27,11 @@ early feedback; they do not grant approval or replace either CI session.
    Implement the assigned scope and named regressions. Infrastructure issues
    may change the controller/runner files explicitly in scope; ordinary product
    tasks do not gain authority over dispatch or approval policy.
-2. Commit and push on the task branch (`sortie/<issue>` for product tasks,
-   `sortie-lab/<issue>` for lab tasks), then create/reuse a draft PR. Include
-   `Closes #<issue>`, the concrete behavior change, and verification evidence.
-   Task checkouts use local Git configuration to route credentials through
-   `gh`; no global credential change is needed.
+2. Commit and push on the task branch (`sortie-lab/<issue>`), then
+   create/reuse a draft PR. Include `Closes #<issue>`, the concrete behavior
+   change, and verification evidence. Task checkouts use local Git
+   configuration: HTTPS clones route credentials through `gh`, SSH clones use
+   the operator's deploy-key host alias; no global credential change is needed.
 3. Once implementation and local checks are ready, run `gh pr ready`. Hand off
    immediately using the trusted helper; do not keep an agent waiting for CI:
 
@@ -164,14 +164,13 @@ conversation IDs do not transfer between providers. CI review remains the same.
 
 | Implementer | Sortie adapter and command | Qualification |
 |---|---|---|
-| Claude | `claude-code`, `claude` | Sortie 1.24 requires `bypassPermissions`; allowed only in the lab profile, whose turns run in an allocated worker. |
-| Codex | `codex`, `codex app-server` | Host bootstrap default for the product profile; in the lab profile it runs in the worker. |
-| Cursor | `agent-client-protocol`, `agent acp` | Pinned Sortie 1.24.1 supports the adapter; not yet qualified inside workers, so the lab profile refuses it. |
+| Claude | `claude-code`, `claude` | Sortie 1.24 requires `bypassPermissions`; acceptable because every turn runs in an allocated worker. |
+| Codex | `codex`, `codex app-server` | The launcher's default; runs in the worker. |
+| Cursor | `agent-client-protocol`, `agent acp` | Pinned Sortie 1.24.1 supports the adapter; not yet qualified inside workers, so the launcher refuses it. |
 
-Lab turns run in the worker through `vmctl session agent`
+Every turn runs in the worker through `vmctl session agent`
 ([agent sessions](../design/agent-lab.md#agent-sessions)), which sets
-`BUSYBEE_SORTIE_WORKER=1` inside the guest. Do not set it on a shared host to
-bypass the environment check. Sortie's
+`BUSYBEE_SORTIE_WORKER=1` inside the guest. Sortie's
 `self_review` uses the author's context and does not replace these CI sessions.
 
 Sources: [Claude Actions](https://code.claude.com/docs/en/github-actions),

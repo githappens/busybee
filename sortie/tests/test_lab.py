@@ -11,7 +11,7 @@ import lab
 
 class DependencyTests(unittest.TestCase):
     def setUp(self):
-        self.issue = {"number": 72, "state": "open", "milestone": {"title": lab.MILESTONE},
+        self.issue = {"number": 72, "state": "open", "milestone": {"title": "agent lab: autonomous VM development"},
                       "labels": [{"name": "sortie:ready"}]}
 
     def test_only_explicitly_ready_lab_tasks_are_eligible(self):
@@ -21,11 +21,17 @@ class DependencyTests(unittest.TestCase):
             self.issue["labels"] = labels
             self.assertTrue(lab.task_error(self.issue))
 
-    def test_wrong_milestone_and_closed_tasks_are_rejected(self):
-        self.issue["milestone"] = {"title": "another milestone"}
+    def test_any_milestone_or_none_is_eligible(self):
+        # Dispatch is repository-wide: ordering comes from blocked-by relations only.
+        for milestone in ({"title": "another milestone"}, None):
+            self.issue["milestone"] = milestone
+            self.assertEqual(lab.task_error(self.issue), "")
+
+    def test_closed_tasks_and_pull_requests_are_rejected(self):
+        self.issue["state"] = "closed"
         self.assertTrue(lab.task_error(self.issue))
         self.setUp()
-        self.issue["state"] = "closed"
+        self.issue["pull_request"] = {"url": "https://example.test/pr/1"}
         self.assertTrue(lab.task_error(self.issue))
 
     def test_closed_not_planned_does_not_release_a_dependent(self):
@@ -47,9 +53,9 @@ class DependencyTests(unittest.TestCase):
         self.assertFalse(lab.completed_by_merge(blocker))
 
 
-def lab_issue(number, labels=("sortie:ready",), body="", milestone=None):
+def lab_issue(number, labels=("sortie:ready",), body="", milestone="agent lab: autonomous VM development"):
     return {"number": number, "state": "open", "body": body,
-            "milestone": {"title": milestone or lab.MILESTONE},
+            "milestone": {"title": milestone} if milestone else None,
             "labels": [{"name": name} for name in labels]}
 
 
@@ -91,8 +97,10 @@ class DispatchTests(unittest.TestCase):
             [lab_issue(10), lab_issue(11), lab_issue(12, body="**Lab requires:** controller:terminal"),
              lab_issue(13, body="Lab requires: worker:windows"),
              lab_issue(14, milestone="another milestone"), lab_issue(15, labels=("sortie:ready", "epic")),
+             lab_issue(17, milestone=None, body="Lab requires: controller:verify"),
+             lab_issue(18, milestone="another milestone"),
              lab_issue(16, labels=("sortie:ready", "sortie"), body="Lab requires: controller:terminal, controller:verify")],
-            blocked_by={11: [9], 10: [8]}, merged={8})
+            blocked_by={11: [9], 10: [8], 18: [11]}, merged={8})
         self.original = lab.api, lab.available_capabilities
         lab.api = self.tracker
         lab.available_capabilities = lambda: self.capabilities
@@ -112,7 +120,10 @@ class DispatchTests(unittest.TestCase):
             "#11: waiting for merged prerequisites [9]",
             "#12: capability controller:terminal is unavailable: no terminal support in this controller",
             "#13: unsupported capability worker:windows",
+            "#14: eligible",
             "#16: capability controller:terminal is unavailable: no terminal support in this controller",
+            "#17: eligible",
+            "#18: waiting for merged prerequisites [11]",
         ])
         # A dry run changes nothing, and unrelated issues are never touched.
         self.assertEqual(self.tracker.writes, [])
@@ -120,8 +131,10 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(sorted((m, p) for m, p, _ in self.tracker.writes), [
             ("DELETE", f"repos/{lab.REPO}/issues/16/labels/sortie"),
             ("POST", f"repos/{lab.REPO}/issues/10/labels"),
+            ("POST", f"repos/{lab.REPO}/issues/14/labels"),
+            ("POST", f"repos/{lab.REPO}/issues/17/labels"),
         ])
-        for issue in (14, 15):
+        for issue in (15, 18):
             self.assertFalse(any(f"/issues/{issue}/" in p for _, p, _ in self.tracker.writes))
 
     def test_a_closed_blocker_is_not_enough_when_its_capability_is_missing(self):

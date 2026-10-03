@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Check lab task eligibility and release only merged prerequisites whose
-worker capabilities are available. See docs/design/agent-lab.md §Agent sessions."""
+worker capabilities are available. Any open `sortie:ready` issue in the
+repository is a candidate, whatever its milestone; its GitHub *blocked by*
+relations are the only ordering. See docs/design/agent-lab.md §Agent sessions."""
 import argparse
 import functools
 import json
@@ -13,7 +15,6 @@ import sys
 from reviews import api
 
 REPO = "githappens/busybee"
-MILESTONE = "agent lab: autonomous VM development"
 # The trusted snapshot this file runs from: its controller and guard policy.
 ROOT = Path(__file__).resolve().parents[1]
 # Every dispatched agent runs in a Linux worker through a controller session,
@@ -24,9 +25,8 @@ REQUIRES = re.compile(r"^[\s*_]*lab requires:[\s*_]*(.+)$", re.IGNORECASE | re.M
 
 def task_error(issue):
     labels = {label["name"] for label in issue.get("labels", [])}
-    if (issue.get("pull_request") or issue.get("state") != "open"
-            or (issue.get("milestone") or {}).get("title") != MILESTONE):
-        return "not an open lab issue"
+    if issue.get("pull_request") or issue.get("state") != "open":
+        return "not an open issue"
     if "epic" in labels or "needs-human" in labels:
         return "tracking or parked issue"
     if not labels.intersection({"sortie:ready", "sortie:working"}):

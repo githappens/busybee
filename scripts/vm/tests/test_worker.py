@@ -1,6 +1,8 @@
 from pathlib import Path
 import base64
+import contextlib
 import hashlib
+import io
 import json
 import os
 import shlex
@@ -15,6 +17,7 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import contracts
 import guest
+import lease
 import parallels
 import registry
 import supervisor
@@ -204,12 +207,17 @@ class Lab:
         self.now = time.time()  # the controller's clock, which tests move
         self.supervisors = {}
         self.supervising = True  # off: every supervisor process is dead
+        self.config = CONFIG
+        self.wait_s = 0  # how long a create waits in line for a Linux worker
+        self.slept = []  # called with the fake clock's time on every sleep
 
     def clock(self):
         return self.now
 
     def sleep(self, seconds):
         self.now += seconds
+        for hook in self.slept:
+            hook()
 
     def supervise(self, run_id):
         """In place of a detached supervisor process: one tick of this run's."""
@@ -227,9 +235,9 @@ class Lab:
         self.supervisors = {}
 
     def workers(self):
-        return worker.Workers(self.repo, CONFIG, self.prl, self.reg, lambda path: self.free_gib,
+        return worker.Workers(self.repo, self.config, self.prl, self.reg, lambda path: self.free_gib,
                               connect=lambda record, info, deadline: self.guest, supervise=self.supervise,
-                              clock=self.clock, sleep=self.sleep)
+                              clock=self.clock, sleep=self.sleep, slot_wait_s=self.wait_s)
 
     def create(self):
         result = self.workers().create("linux", self.revision)
@@ -239,6 +247,11 @@ class Lab:
 
 def codes(result):
     return {f["code"] for f in result["findings"]}
+
+
+def linux_workers(n):
+    """CONFIG with at most `n` active Linux workers."""
+    return {**CONFIG, "concurrency": {"linux_workers": n}}
 
 
 class CreateTests(unittest.TestCase):
@@ -266,12 +279,84 @@ class CreateTests(unittest.TestCase):
         self.assertEqual((allocate[allocate.index("--cpus") + 1], allocate[allocate.index("--memsize") + 1]),
                          ("4", "8192"))
 
-    def test_only_one_worker_is_active(self):
-        first = self.lab.create()
+    def test_two_linux_workers_are_active_by_default(self):
+        first, second = self.lab.create(), self.lab.create()
+        self.assertNotEqual(first, second)
         result = self.lab.workers().create("linux", self.lab.revision)
         self.assertEqual(result["status"], "environment_failure")
         self.assertIn("worker_limit", codes(result))
+        message = result["findings"][0]["message"]
+        self.assertIn("2 Linux worker(s)", message)
+        self.assertIn(first, message)
+        self.assertIn(second, message)
+        # Each worker has its own allocation, which fits the per-worker budget.
+        clones = [c for c in self.lab.prlctl.calls if c[0] == "set" and "--cpus" in c]
+        self.assertEqual(len(clones), 2)
+
+    def test_the_linux_cap_is_configured(self):
+        self.lab.config = linux_workers(1)
+        first = self.lab.create()
+        result = self.lab.workers().create("linux", self.lab.revision)
+        self.assertIn("worker_limit", codes(result))
         self.assertIn(first, result["findings"][0]["message"])
+        self.lab.config = linux_workers(3)
+        self.lab.create()
+        self.lab.create()
+
+    def test_a_full_lab_makes_a_creation_wait_for_a_free_worker(self):
+        first = self.lab.create()
+        self.lab.create()
+        self.lab.wait_s = 600
+        waited = []
+
+        def free_one():
+            waited.append(self.lab.now)
+            if len(waited) == 3:
+                self.assertEqual(self.lab.workers().destroy(first)["status"], "success")
+        self.lab.slept.append(free_one)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            result = self.lab.workers().create("linux", self.lab.revision)
+        self.assertEqual(result["status"], "success", result)
+        self.assertEqual(len(waited), 3)
+        self.assertIn("queued for a Linux worker", err.getvalue())
+        self.assertEqual(len([e for e in self.lab.reg.entries().values() if e["role"] == "worker"]), 2)
+
+    def test_a_wait_for_a_linux_worker_is_bounded(self):
+        self.lab.create()
+        self.lab.create()
+        self.lab.wait_s = 30
+        started = self.lab.now
+        with contextlib.redirect_stderr(io.StringIO()):
+            result = self.lab.workers().create("linux", self.lab.revision)
+        self.assertEqual(result["status"], "environment_failure")
+        self.assertIn("worker_limit", codes(result))
+        self.assertIn("within 30s", result["findings"][0]["message"])
+        self.assertGreaterEqual(self.lab.now - started, 30)
+        self.assertEqual(len([e for e in self.lab.reg.entries().values() if e["role"] == "worker"]), 2)
+
+    def test_linux_waiters_are_served_in_arrival_order(self):
+        # An earlier waiter (another live process) is ahead in line: a free
+        # worker is not taken out from under it.
+        line = lease.Queue(self.lab.state / "queues" / "linux")
+        ticket = line.join("r-earlier")
+        self.lab.wait_s = 10
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            result = self.lab.workers().create("linux", self.lab.revision)
+        self.assertIn("worker_limit", codes(result))
+        self.assertIn("1 waiter(s) ahead", result["findings"][0]["message"])
+        self.assertIn("1 ahead", err.getvalue())
+        self.assertEqual([c for c in self.lab.prlctl.calls if c[0] == "clone"], [])
+        line.leave(ticket)
+        self.lab.create()
+
+    def test_storage_is_refused_without_waiting(self):
+        self.lab.wait_s = 600
+        self.lab.free_gib = 10
+        started = self.lab.now
+        result = self.lab.workers().create("linux", self.lab.revision)
+        self.assertIn("storage_exhausted", codes(result))
+        self.assertEqual(self.lab.now, started)
 
     def test_allocation_must_fit_the_host(self):
         self.lab.free_gib = 10
@@ -299,6 +384,7 @@ class CreateTests(unittest.TestCase):
         vm = contracts.worker_name(run_id)
         self.lab.reg.claim(vm, "worker", "linux", run_id, "2026-10-01T00:00:00Z", parent=BASELINE_ID)
         self.lab.prlctl.vms[vm] = {"id": "{" + str(uuid.uuid4()) + "}", "state": "stopped", "snapshots": []}
+        self.lab.config = linux_workers(1)
         blocked = self.lab.workers().create("linux", self.lab.revision)
         self.assertIn("worker_limit", codes(blocked))
         result = self.lab.workers().destroy(run_id)
@@ -756,6 +842,7 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual([(x["run_id"], x["status"], x["vm_state"]) for x in status["data"]["workers"]],
                          [(run_id, "claimed", "missing")])
         self.assertIn("interrupted_create", codes(status))
+        self.lab.config = linux_workers(1)
         blocked = w().create("linux", self.lab.revision)
         self.assertIn("worker_limit", codes(blocked))
         self.assertIn("interrupted_create", codes(blocked))

@@ -1,7 +1,7 @@
 """Verify one source identity on every required platform: the platform matrix.
 
 See docs/design/agent-lab.md §Run an issue from reproduction to review, step 5.
-For each platform in turn (one worker is active at a time), a fresh worker
+For each platform in turn, a fresh worker
 of the promoted baseline gets the revision (and patch), builds it, and runs
 the repository's required checks (fmt, clippy, workspace tests) and every
 applicable regression scenario in its required fixture modes. The matrix

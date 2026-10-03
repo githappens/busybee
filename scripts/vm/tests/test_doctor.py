@@ -208,6 +208,35 @@ class DoctorTests(unittest.TestCase):
         self.repo.write_config(VALID_CONFIG.replace("cpus = 4", "cpus = 64"))
         self.assertIn("budget_exceeds_host", codes(self.repo.doctor()))
 
+    def test_doctor_reports_the_linux_worker_cap(self):
+        self.repo.write_config()
+        result = self.repo.doctor()
+        self.assertEqual(result["data"]["config"]["concurrency"], {"linux_workers": 2})
+        self.repo.write_config(VALID_CONFIG + "\n[concurrency]\nlinux_workers = 3\n")
+        result = self.repo.doctor()
+        self.assertEqual(result["data"]["config"]["concurrency"], {"linux_workers": 3})
+        # [budget] bounds one worker; the peak is every Linux worker at once.
+        self.assertEqual(result["data"]["config"]["peak"], {"cpus": 6, "memory_mib": 12288, "storage_gib": 96})
+        self.assertNotIn("concurrency_exceeds_host", codes(result))
+        self.assertIn("workers: up to 3 Linux at once, each within the per-worker budget of 4 cpus, 8192 MiB, "
+                      "64 GiB; together 6 cpus, 12288 MiB, 96 GiB", vmctl.summary(result))
+
+    def test_more_concurrent_workers_than_the_host_holds_is_a_warning(self):
+        # 2 cpus per worker, 12 on the host: seven Linux workers need 14.
+        self.repo.write_config(VALID_CONFIG + "\n[concurrency]\nlinux_workers = 7\n")
+        result = self.repo.doctor()
+        found = [f for f in result["findings"] if f["code"] == "concurrency_exceeds_host"]
+        self.assertEqual([f["severity"] for f in found], ["warning"])
+        self.assertIn("cpus", found[0]["message"])
+        self.assertIn("7 Linux worker(s)", found[0]["message"])
+
+    def test_the_macos_slot_counts_toward_the_peak(self):
+        self.repo.write_config(VALID_CONFIG + '\n[templates.macos]\nmanifest = "templates/macos/manifest.json"\n'
+                               'clone_strategy = "full"\n')
+        peak = self.repo.doctor()["data"]["config"]["peak"]
+        # The slot guest's disk is the baseline's own, reverted at each grant.
+        self.assertEqual(peak, {"cpus": 6, "memory_mib": 12288, "storage_gib": 64})
+
     def test_unlicensed_or_signed_out_parallels_fails(self):
         self.repo.write_config()
         server = {"Version": "Desktop 27.0.0-1", "License": {"state": "expired"}, "Signed In": "no"}
@@ -277,6 +306,9 @@ class ConfigTests(unittest.TestCase):
                                                               "storage_gib = 32\nartifact_mib = 1024\n", ""),
             "missing artifact budget": VALID_CONFIG.replace("artifact_mib = 1024\n", ""),
             "tiny artifact budget": VALID_CONFIG.replace("artifact_mib = 1024", "artifact_mib = 1"),
+            "no linux workers": VALID_CONFIG + "\n[concurrency]\nlinux_workers = 0\n",
+            "unbounded linux workers": VALID_CONFIG + "\n[concurrency]\nlinux_workers = 100\n",
+            "unknown concurrency key": VALID_CONFIG + "\n[concurrency]\nlinux_workers = 2\nmacos_workers = 2\n",
             "wrong schema": VALID_CONFIG.replace("schema = 1", "schema = 2"),
             "state outside build/vm": VALID_CONFIG.replace('"build/vm"', '"build/other"'),
             "absolute state": VALID_CONFIG.replace('"build/vm"', '"/tmp/vm"'),
@@ -383,6 +415,14 @@ class CliTests(unittest.TestCase):
                     self.assertEqual(result["operation"], " ".join(argv[:2]))
                     self.assertEqual(result["status"], "environment_failure")
                     self.assertEqual({f["code"] for f in result["findings"]}, {"config_missing"})
+
+    def test_worker_create_takes_a_bounded_wait(self):
+        args = vmctl.parser().parse_args(["worker", "create", "linux", "--revision", "x", "--wait", "30"])
+        self.assertEqual(args.wait, 30)
+        self.assertIsNone(vmctl.parser().parse_args(["worker", "create", "linux", "--revision", "x"]).wait)
+        out = self.run_cli("worker", "create", "linux", "--revision", "x", "--wait", "-1")
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("--wait", out.stderr)
 
     def test_verify_is_implemented(self):
         with tempfile.TemporaryDirectory() as tmp:

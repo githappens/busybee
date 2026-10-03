@@ -15,8 +15,7 @@ spec.loader.exec_module(triage)
 
 class ReviewTriageTests(unittest.TestCase):
     def test_bot_feedback_is_rendered_without_human_review_comments(self):
-        for name in ("LAB_WORKFLOW.md", "WORKFLOW.md"):
-            self.check_bot_feedback(name)
+        self.check_bot_feedback("LAB_WORKFLOW.md")
 
     def check_bot_feedback(self, name):
         workflow = (Path(__file__).resolve().parents[1] / name).read_text()

@@ -212,12 +212,12 @@ else
 fi
 rm -rf "$root/build/sortie-agent-state/busybee" "$escape" "$fake_bin"
 
-if ! grep -q '\$BUSYBEE_SORTIE_TRUSTED/sortie/prepare-workspace.sh' "$root/sortie/WORKFLOW.md" ||
+if ! grep -q '\$BUSYBEE_SORTIE_TRUSTED/sortie/prepare-workspace.sh' "$root/sortie/LAB_WORKFLOW.md" ||
    ! grep -q 'ref=${BUSYBEE_SORTIE_TRUSTED_REF:-origin/main}' "$root/sortie/launch.sh"; then
-  printf 'not ok - WORKFLOW.md installs from trusted snapshot of origin/main\n' >&2
+  printf 'not ok - LAB_WORKFLOW.md installs from trusted snapshot of origin/main\n' >&2
   failures=$((failures + 1))
 else
-  printf 'ok - WORKFLOW.md installs from trusted snapshot of origin/main\n'
+  printf 'ok - LAB_WORKFLOW.md installs from trusted snapshot of origin/main\n'
 fi
 
 if [ "$failures" -ne 0 ]; then
