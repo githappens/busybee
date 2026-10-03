@@ -765,6 +765,7 @@ class Workers(template.Lab):
         has its own lease) or the host lacks the allocation's storage, else
         None. Every owned Linux worker counts until it is destroyed, whatever
         its state."""
+        workers = None
         if name == "linux":
             cap = contracts.linux_workers(self.config)
             workers, notes = self._reconcile()
@@ -774,6 +775,15 @@ class Workers(template.Lab):
                     contracts.finding("worker_limit", f"{cap} Linux worker(s) may be active at once: "
                                       f"{', '.join(active)}"), *notes])
         allotted, free = self.config["worker"]["storage_gib"], self.free_gib(self.state)
+        if workers is not None:
+            # Each active Linux worker's linked clone can grow to its full
+            # storage_gib before it is destroyed; reserve that before checking
+            # whether one more fits.  Using the full allocation rather than
+            # what the clone has grown to so far is simpler and errs safe.
+            reserved = sum(
+                w["allocation"]["storage_gib"] if w["allocation"] else allotted
+                for w in workers if w["role"] == "worker")
+            free -= reserved
         if free < allotted:
             return contracts.result(op, "environment_failure", "not enough storage", [
                 contracts.finding("storage_exhausted", f"a worker is allotted {allotted} GiB; {free} GiB is free")])
