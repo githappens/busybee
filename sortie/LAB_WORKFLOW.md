@@ -24,9 +24,13 @@ polling:
   interval_ms: 60000
 
 hooks:
+  # Sortie runs hooks with only a system allowlist and SORTIE_* variables, so
+  # each hook first sources the trusted sortie/hook-env.sh, which restores the
+  # launcher's settings from their SORTIE_BUSYBEE_* copies or stops loudly.
   # HTTPS clones with the dispatcher's gh identity; an SSH URL (an operator's
   # deploy-key host alias) uses its own key, never prompting.
   after_create: |
+    . "${SORTIE_BUSYBEE_TRUSTED:?is not set. Start the lab with sortie/run-lab.sh, which exports it for hooks.}/sortie/hook-env.sh"
     case "$BUSYBEE_SORTIE_CLONE_URL" in
       http://* | https://*)
         git -c credential.helper= -c credential.helper='!gh auth git-credential' clone "$BUSYBEE_SORTIE_CLONE_URL" . ;;
@@ -38,11 +42,14 @@ hooks:
   # the launcher's `session agent` command.
   before_run: |
     set -e
+    . "${SORTIE_BUSYBEE_TRUSTED:?is not set. Start the lab with sortie/run-lab.sh, which exports it for hooks.}/sortie/hook-env.sh"
     bash "$BUSYBEE_SORTIE_TRUSTED/sortie/prepare-workspace.sh"
     profile=$(python3 "$BUSYBEE_SORTIE_TRUSTED/sortie/lab.py" profile --issue "$SORTIE_ISSUE_IDENTIFIER")
     python3 "$BUSYBEE_SORTIE_TRUSTED/scripts/vm/vmctl.py" --root "$BUSYBEE_LAB_ROOT" session start \
       --issue "$SORTIE_ISSUE_IDENTIFIER" --workspace "$SORTIE_WORKSPACE" --profile "$profile"
   after_run: |
+    set -e
+    . "${SORTIE_BUSYBEE_TRUSTED:?is not set. Start the lab with sortie/run-lab.sh, which exports it for hooks.}/sortie/hook-env.sh"
     python3 "$BUSYBEE_SORTIE_TRUSTED/scripts/vm/vmctl.py" --root "$BUSYBEE_LAB_ROOT" session end \
       --workspace "$SORTIE_WORKSPACE"
   timeout_ms: 900000
@@ -90,6 +97,8 @@ reactions:
     escalation_label: needs-human
     triage:
       script: |
+        set -e
+        . "${SORTIE_BUSYBEE_TRUSTED:?is not set. Start the lab with sortie/run-lab.sh, which exports it for hooks.}/sortie/hook-env.sh"
         python3 "$BUSYBEE_SORTIE_TRUSTED/sortie/review-triage.py"
       timeout_ms: 180000
   review_comments:

@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import subprocess
 import sys
 
@@ -167,6 +168,43 @@ def release(dry_run=False):
             print(f"#{number}: released")
 
 
+# Sortie's per-issue state (schema of the pinned runtime): its run history is
+# the session budget, retry entries the attempt counter.
+SORTIE_ISSUE_TABLES = ("run_history", "retry_entries", "session_metadata", "parked_issues",
+                       "budget_hold_notices", "handoff_absence_resets", "reaction_fingerprints")
+
+
+def reset(numbers, state):
+    """Forget Sortie's attempts and sessions for issues a harness failure burned
+    and label them `sortie:ready` again. Only with the launcher stopped."""
+    state = Path(state)
+    if (state / "launcher.lock").exists():
+        raise RuntimeError(f"{state / 'launcher.lock'} exists: stop the launcher first")
+    db = state / "sortie.db"
+    if not db.is_file():
+        raise RuntimeError(f"no Sortie state at {db}")
+    con = sqlite3.connect(db)
+    try:
+        present = {name for (name,) in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        missing = set(SORTIE_ISSUE_TABLES) - present
+        if missing:
+            raise RuntimeError(f"{db} lacks {sorted(missing)}: not the schema this reset knows")
+        with con:
+            for number in numbers:
+                removed = {table: con.execute(f"DELETE FROM {table} WHERE issue_id = ?", (str(number),)).rowcount
+                           for table in SORTIE_ISSUE_TABLES}
+                print(f"#{number}: removed " + ", ".join(f"{n} {t}" for t, n in removed.items() if n))
+    finally:
+        con.close()
+    for number in numbers:
+        labels = {label["name"] for label in api(f"repos/{REPO}/issues/{number}")["labels"]}
+        if "sortie:working" in labels:
+            api(f"repos/{REPO}/issues/{number}/labels/sortie:working", "DELETE")
+        if "sortie:ready" not in labels:
+            api(f"repos/{REPO}/issues/{number}/labels", "POST", {"labels": ["sortie:ready"]})
+        print(f"#{number}: sortie:ready")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="operation", required=True)
@@ -176,11 +214,17 @@ def main():
                                            help="print each ready issue's decision; change nothing")
     sub.add_parser("profile", help="print the issue's execution profile").add_argument("--issue", type=int,
                                                                                         required=True)
+    forget = sub.add_parser("reset", help="clear Sortie's attempts for issues and mark them sortie:ready")
+    forget.add_argument("--issue", type=int, action="append", required=True)
+    forget.add_argument("--state", required=True, help="the launcher's state directory (build/sortie-lab)")
     args = parser.parse_args()
-    if getattr(args, "issue", 1) < 1:
+    issues = getattr(args, "issue", [])
+    if any(n < 1 for n in (issues if isinstance(issues, list) else [issues])):
         parser.error("issue must be positive")
     if args.operation == "check":
         check(args.issue)
+    elif args.operation == "reset":
+        reset(args.issue, args.state)
     elif args.operation == "profile":
         print(profile(api(f"repos/{REPO}/issues/{args.issue}"), guard_policy()))
     else:

@@ -185,5 +185,75 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(lab.guard_policy()["profiles"]["infrastructure"]["forbidden_paths"], [])
 
 
+class ResetTests(unittest.TestCase):
+    """`lab.py reset` clears what Sortie recorded for an issue whose retries a
+    harness failure burned, and hands the issue back as ready."""
+
+    def setUp(self):
+        import sqlite3
+        import tempfile
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = Path(tmp.name)
+        self.db = self.state / "sortie.db"
+        con = sqlite3.connect(self.db)
+        con.executescript("""
+            CREATE TABLE run_history (id INTEGER PRIMARY KEY, issue_id TEXT, identifier TEXT, attempt INTEGER);
+            CREATE TABLE retry_entries (issue_id TEXT PRIMARY KEY, identifier TEXT, attempt INTEGER);
+            CREATE TABLE session_metadata (issue_id TEXT PRIMARY KEY, session_id TEXT);
+            CREATE TABLE parked_issues (issue_id TEXT PRIMARY KEY, identifier TEXT);
+            CREATE TABLE budget_hold_notices (issue_id TEXT PRIMARY KEY);
+            CREATE TABLE handoff_absence_resets (issue_id TEXT PRIMARY KEY);
+            CREATE TABLE reaction_fingerprints (issue_id TEXT, kind TEXT, PRIMARY KEY (issue_id, kind));
+            CREATE TABLE aggregate_metrics (key TEXT PRIMARY KEY);
+        """)
+        for issue in ("7", "8"):
+            con.execute("INSERT INTO run_history (issue_id, identifier, attempt) VALUES (?, ?, 1)", (issue, issue))
+            con.execute("INSERT INTO run_history (issue_id, identifier, attempt) VALUES (?, ?, 2)", (issue, issue))
+            con.execute("INSERT INTO retry_entries VALUES (?, ?, 3)", (issue, issue))
+            for table in ("session_metadata", "budget_hold_notices", "handoff_absence_resets"):
+                con.execute(f"INSERT INTO {table} (issue_id) VALUES (?)", (issue,))
+            con.execute("INSERT INTO parked_issues VALUES (?, ?)", (issue, issue))
+            con.execute("INSERT INTO reaction_fingerprints VALUES (?, 'ci')", (issue,))
+        con.execute("INSERT INTO aggregate_metrics VALUES ('totals')")
+        con.commit()
+        con.close()
+        self.tracker = Tracker([lab_issue(7, labels=("sortie:working", "sortie")),
+                                lab_issue(8, labels=("sortie:working",))], {}, set())
+        self.original = lab.api
+        lab.api = self.tracker
+        self.addCleanup(setattr, lab, "api", self.original)
+
+    def rows(self, issue):
+        import sqlite3
+        con = sqlite3.connect(self.db)
+        tables = [t for (t,) in con.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                  if t != "aggregate_metrics"]
+        found = {t: con.execute(f"SELECT count(*) FROM {t} WHERE issue_id = ?", (issue,)).fetchone()[0]
+                 for t in tables}
+        con.close()
+        return found
+
+    def test_reset_clears_one_issue_and_makes_it_ready(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            lab.reset([7], self.state)
+        self.assertEqual(set(self.rows("7").values()), {0})
+        self.assertEqual(set(self.rows("8").values()), {1, 2})
+        self.assertEqual(self.tracker.writes, [
+            ("DELETE", f"repos/{lab.REPO}/issues/7/labels/sortie:working", None),
+            ("POST", f"repos/{lab.REPO}/issues/7/labels", {"labels": ["sortie:ready"]})])
+
+    def test_reset_refuses_while_a_launcher_holds_the_lock(self):
+        (self.state / "launcher.lock").mkdir()
+        with self.assertRaisesRegex(RuntimeError, "launcher.lock"):
+            lab.reset([7], self.state)
+        self.assertEqual(self.rows("7")["run_history"], 2)
+        self.assertEqual(self.tracker.writes, [])
+
+    def test_reset_needs_sortie_state(self):
+        with self.assertRaisesRegex(RuntimeError, "sortie.db"):
+            lab.reset([7], self.state / "missing")
+
+
 if __name__ == "__main__":
     unittest.main()

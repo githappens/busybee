@@ -70,6 +70,22 @@ that would prompt fails the fetch or push instead of stalling a run. The
 session fetches `origin/main` and pushes from the workspace, so the same
 transport serves the whole session.
 
+### What hooks see
+
+Sortie runs every hook (and the review triage script) as `sh -c` with a
+restricted environment: a small system allowlist (`PATH`, `HOME`, `USER`,
+`TMPDIR`, `SSH_AUTH_SOCK`, ...) plus every `SORTIE_*` variable of its own
+process. Anything else the launcher exports, including the variables above and
+`GITHUB_TOKEN`, is stripped. The launcher therefore also exports its settings
+as `SORTIE_BUSYBEE_*`, and each hook first sources the trusted
+`sortie/hook-env.sh`, which maps them back to the names the lab scripts read
+and stops the hook with a message naming the missing setting when one is
+absent. The agent command is not filtered: `vmctl session agent` inherits the
+launcher's whole environment, including the model credential.
+`--validate` and `--dry-run` never run hooks; `sortie/tests/test_hook_env.py`
+runs the real hook bodies with Sortie's filtering, and, inside
+`nix develop .#agent`, one real dispatch through the pinned binary.
+
 ## Dispatch, ordering and concurrency
 
 Issue states are `sortie:ready`, `sortie:working`, `sortie:review`, and
@@ -166,6 +182,28 @@ existing launcher lock requires checking the previous process before removing
 it. Preserve workspaces and reports when escalating; remove `needs-human` and
 re-enable an issue only after its blocker is resolved. Restart a stopped
 controller to adopt a newly merged policy snapshot.
+
+### Resetting an issue whose retries a harness failure burned
+
+A hook or launcher failure fails every attempt before a turn runs, yet each
+attempt still counts against `agent.max_sessions` and leaves the issue in
+`sortie:working` with a growing retry backoff. Once the harness is fixed, stop
+the launcher (no `build/sortie-lab/launcher.lock` may remain), then:
+
+```sh
+nix develop .#agent -c python3 sortie/lab.py reset \
+  --state build/sortie-lab --issue N [--issue M ...]
+```
+
+It deletes the issues' rows from Sortie's per-issue tables in
+`build/sortie-lab/sortie.db` (`run_history`, which is the session budget,
+`retry_entries`, `session_metadata`, `parked_issues`, `budget_hold_notices`,
+`handoff_absence_resets`, `reaction_fingerprints`), and moves the issue from
+`sortie:working` back to `sortie:ready`. Lab session records under
+`build/vm/sessions/` are evidence and stay. If a failed attempt left a
+checkout without a `.git` directory under the workspace root, remove it so
+`after_create` clones afresh. Reset only issues whose runs never reached
+the agent: a reset discards real attempt history too.
 
 ```sh
 nix develop .#agent -c python3 -m unittest discover -s sortie/tests
