@@ -47,7 +47,9 @@ agent:
   max_sessions: 20
   turn_timeout_ms: 7200000
   read_timeout_ms: 30000
-  stall_timeout_ms: 900000
+  # A turn that asks for a handoff ends with the evidence gate verifying its
+  # head and base on Linux and macOS, silently, before the turn returns.
+  stall_timeout_ms: 3600000
   max_retry_backoff_ms: 300000
 
 claude-code:
@@ -150,7 +152,8 @@ scenario`, `lab exec`, `lab inspect`, `lab console`, `lab collect`, `lab
 checkpoint`, and `lab reset`, which applies when your turn ends (end the turn
 after asking for it). The worker holds no GitHub credentials: `lab fetch`
 updates origin/main, `lab push [--force-with-lease]` pushes your branch, and
-`lab pr status|create|ready|comment|view` and `lab handoff` act on its PR.
+`lab pr status|create|ready|comment|view`, `lab handoff` and `lab verification`
+act on its PR.
 
 Host configuration and global installations are outside scope. All project Nix,
 provisioning, and tests belong in the repo. Product tests use private
@@ -166,12 +169,20 @@ When implementation and required checks are ready:
    review skills in separate Claude Opus 5.5 high sessions after Linux/macOS
    checks pass. Local skill reviews are optional early feedback; do not publish
    author review receipts or claim they can satisfy the gate.
-3. `lab handoff` runs the trusted `$BUSYBEE_SORTIE_TRUSTED/sortie/reviews.py handoff`
-   on the dispatcher's checkout, writing `.sortie/scm.json` (including the
-   pushed SHA and time) and `.sortie/status`. Hand off immediately; do not wait
-   in an agent session for CI review. `needs-human-review` is Sortie's
-   protocol name: CI supplies the formal review and Sortie handles the
-   resulting continuation or merge.
+3. `lab handoff` asks for review of the pushed head; end the turn right after
+   it. Your report of success is not evidence: when the turn ends, the
+   controller releases your worker and verifies the head and its merge base
+   with main in fresh Linux and macOS workers (required checks, the issue's
+   regression scenarios red on the base and green on the head, terminal
+   evidence, cleanup). If you added a regression test, name its files with
+   `lab handoff --overlay PATH...` so the base's red run includes them. Only
+   an accepted head is handed to review, with the evidence posted on the PR;
+   then the trusted `$BUSYBEE_SORTIE_TRUSTED/sortie/reviews.py handoff`
+   writes `.sortie/scm.json` and `.sortie/status`. Otherwise your next turn starts in a fresh worker: read
+   `lab verification`, fix what it names, push, and hand off again. Do not
+   post evidence yourself; the controller refuses text carrying its marker.
+   `needs-human-review` is Sortie's protocol name: CI supplies the formal
+   review and Sortie handles the resulting continuation or merge.
 4. On a findings continuation, fix valid scoped findings, rerun affected
    checks, and `lab push` to the same PR. Explain declined findings with
    `lab pr comment` and concrete evidence; CI re-reviews that new disposition

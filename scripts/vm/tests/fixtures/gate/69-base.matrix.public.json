@@ -1,0 +1,157 @@
+{
+  "schema": "busybee.vm.verification/v1",
+  "id": "<run-id>",
+  "role": "base",
+  "source": {
+    "revision": "cf61aa557dfc0f16e43c7bb42db9f72b02a9e19e",
+    "patch_sha256": null,
+    "overlay_sha256": null
+  },
+  "controller": {
+    "head": "cf61aa557dfc0f16e43c7bb42db9f72b02a9e19e",
+    "scenarios_dirty": false
+  },
+  "required_platforms": [
+    "linux",
+    "macos"
+  ],
+  "platforms": {
+    "linux": {
+      "status": "ran",
+      "run_id": "<run-id>",
+      "baseline": "<baseline-linux>",
+      "head": "cf61aa557dfc0f16e43c7bb42db9f72b02a9e19e",
+      "version": "bzb 0.1.97",
+      "binaries": {
+        "build/debug/busybee": "a4bbe092b7f7fecde0d87746bab889564b6794a8947f312cf583e8664f42a31f",
+        "build/debug/bzb": "92ef5c9d06bba750ccf059cc3777f58d80cc95c4a83ebe87f1a0a91bec0df086",
+        "build/debug/bzbd": "d2df009574d48a2d800516b77c3d5ca9f425b1dc10583286caea83772a28bc89"
+      },
+      "checks": {
+        "build": {
+          "status": "success",
+          "exec": "0001",
+          "exit_code": 0,
+          "elapsed_s": 19.444
+        },
+        "fmt": {
+          "status": "success",
+          "exec": "0002",
+          "exit_code": 0,
+          "elapsed_s": 1.809
+        },
+        "clippy": {
+          "status": "success",
+          "exec": "0003",
+          "exit_code": 0,
+          "elapsed_s": 8.86
+        },
+        "test": {
+          "status": "product_failure",
+          "exec": "0004",
+          "exit_code": 101,
+          "elapsed_s": 84.654
+        }
+      },
+      "scenarios": {
+        "live-monitor": {
+          "issue": 77,
+          "ui": true,
+          "modes": {
+            "prepared": {
+              "status": "success",
+              "exec": "0006",
+              "failed": [],
+              "binaries_match": true,
+              "terminals": [
+                "0006-monitor-wide",
+                "0006-monitor-narrow"
+              ]
+            }
+          }
+        },
+        "umask-startup": {
+          "issue": 69,
+          "ui": false,
+          "modes": {
+            "cold": {
+              "status": "product_failure",
+              "exec": "0007",
+              "failed": [
+                "task_runs",
+                "lease_released"
+              ],
+              "binaries_match": true,
+              "terminals": []
+            }
+          }
+        }
+      },
+      "not_applicable": [],
+      "collected": "success",
+      "evidence": "runs/<run-id>/public"
+    },
+    "macos": {
+      "status": "ran",
+      "run_id": "<run-id>",
+      "baseline": "<baseline-macos>",
+      "head": "cf61aa557dfc0f16e43c7bb42db9f72b02a9e19e",
+      "version": "bzb 0.1.97",
+      "binaries": {
+        "build/debug/busybee": "9be43167fc5be15e60b955bf07253ff7ec84caed5dfedcb91246f9f546960d7a",
+        "build/debug/bzb": "0f84dd7f6c4798363e4bf0596dc73d5ea547cf8ca39dbfcb56a5f34099da8761",
+        "build/debug/bzbd": "bd11eaeb47ca7eed493318e88c6995f1c9cc9fbbf834ef7559713cc43ee9c59f"
+      },
+      "checks": {
+        "build": {
+          "status": "success",
+          "exec": "0001",
+          "exit_code": 0,
+          "elapsed_s": 27.717
+        },
+        "fmt": {
+          "status": "success",
+          "exec": "0002",
+          "exit_code": 0,
+          "elapsed_s": 4.643
+        },
+        "clippy": {
+          "status": "success",
+          "exec": "0003",
+          "exit_code": 0,
+          "elapsed_s": 12.033
+        },
+        "test": {
+          "status": "success",
+          "exec": "0004",
+          "exit_code": 0,
+          "elapsed_s": 121.082
+        }
+      },
+      "scenarios": {
+        "umask-startup": {
+          "issue": 69,
+          "ui": false,
+          "modes": {
+            "cold": {
+              "status": "product_failure",
+              "exec": "0006",
+              "failed": [
+                "task_runs"
+              ],
+              "binaries_match": true,
+              "terminals": []
+            }
+          }
+        }
+      },
+      "not_applicable": [
+        "live-monitor"
+      ],
+      "collected": "success",
+      "evidence": "runs/<run-id>/public"
+    }
+  },
+  "verdict": "failed",
+  "findings": []
+}

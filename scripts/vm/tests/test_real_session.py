@@ -279,9 +279,55 @@ class RealSessionTests(unittest.TestCase):
                 self.assertTrue(turn["finished"], turn)
                 end = self.end()
                 self.assertEqual((end["outcome"], end["run_id"]), (outcome, run_id), end)
+                if outcome == "success":
+                    # Handed off only once the gate accepted the head on both platforms.
+                    self.assertIn(self.attempt()["verification"]["verdict"], ("verified", "preexisting_failures"))
+                    self.assertEqual((self.workspace / ".sortie" / "status").read_text(), "needs-human-review\n")
                 self.assertEqual(code, {"timeout": 124, "cancelled": 143, "adapter_failure": 127}.get(outcome, 0))
                 public = json.loads((STATE / end["exported"] / "manifest.json").read_text())
                 self.assertEqual(public["missing"], [])
+
+    def test_a_claim_of_success_is_handed_off_only_on_evidence(self):
+        self.start()
+        # The agent claims success for a head that breaks formatting.
+        code = self.agent("""
+            sed -i 's/^fn main() {/fn  main() {/' crates/bzbd/src/main.rs
+            git -c user.name=Fixture -c user.email=fixture@example.test commit -qam 'misformatted'
+            lab push > /dev/null
+            printf 'Closes #990079\\n' > /var/tmp/body.md
+            lab pr create --title fix --body-file /var/tmp/body.md > /dev/null
+            lab pr ready > /dev/null
+            lab handoff
+        """)
+        self.assertEqual(code, 0, self.last_log)
+        status = self.workspace / ".sortie" / "status"
+        self.assertFalse(status.exists(), status.read_text() if status.exists() else None)
+        verification = self.attempt()["verification"]
+        self.assertEqual(verification["verdict"], "failed")
+        record = json.loads((STATE / verification["record"]).read_text())
+        refused = [f["message"] for f in record["findings"] if f["code"] == "new_failure"]
+        self.assertTrue(any("linux fmt" in m for m in refused) and any("macos fmt" in m for m in refused), refused)
+        gh = json.loads((self.tmp / "gh.json").read_text())
+        self.assertEqual(gh["prs"][0].get("comments", []), [])
+        # The next turn is a fresh worker: the agent reads why, fixes it and asks again.
+        code = self.agent("""
+            lab verification > $OUT/verification.json
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print("verdict", r["data"]["verdict"])' \\
+                $OUT/verification.json
+            git -c user.name=Fixture -c user.email=fixture@example.test revert --no-edit HEAD > /dev/null
+            lab push > /dev/null
+            lab handoff
+        """)
+        self.assertEqual(code, 0, self.last_log)
+        self.assertIn("verdict failed", self.last_log)
+        self.assertEqual(self.attempt("0001")["end"]["outcome"], "unverified")
+        self.assertEqual(status.read_text(), "needs-human-review\n")
+        comments = json.loads((self.tmp / "gh.json").read_text())["prs"][0]["comments"]
+        self.assertEqual(len(comments), 1)
+        header = json.loads(comments[0].splitlines()[0].split(" ", 2)[2].rsplit(" -->", 1)[0])
+        self.assertEqual(header["head"], git("-C", str(self.workspace), "rev-parse", "HEAD"))
+        self.assertIn(header["verdict"], ("verified", "preexisting_failures"))
+        self.assertEqual(self.end()["outcome"], "success")
 
 
 if __name__ == "__main__":

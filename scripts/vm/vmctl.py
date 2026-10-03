@@ -17,6 +17,7 @@ import sys
 import tomllib
 
 import contracts
+import gate
 import guest
 import macos
 import parallels
@@ -186,7 +187,7 @@ def check_template(repo, name, entry, config, adapter, vms, findings):
 # Controller operations an issue session may rely on; lab dispatch requires
 # `controller:<name>` for the ones an issue declares (sortie/lab.py).
 CAPABILITIES = ("session", "exec", "terminal", "scenario", "inspect", "signal", "console", "collect", "reset",
-                "verify")
+                "verify", "gate")
 
 
 def doctor(repo, config_path, host, runner=parallels.run):
@@ -278,6 +279,15 @@ def worker_operation(repo, args, host, operation):
             revision = workers._source(args.revision, args.patch)["revision"]
             return verify.run(verify.WorkerOps(workers), args.platform or list(contracts.GUEST_OS), revision,
                               args.patch, state)
+        if operation == "gate":
+            revision = workers._source(args.revision, None)["revision"]
+            base = args.base or subprocess.run(["git", "merge-base", "refs/remotes/origin/main", revision], cwd=repo,
+                                               capture_output=True, text=True).stdout.strip()
+            if not base:
+                raise worker.Refused("source_invalid", f"no merge base of {revision} with origin/main; name --base")
+            return gate.evaluate(gate.WorkerOps(workers), args.issue, revision,
+                                 workers._source(base, args.overlay)["revision"], args.overlay,
+                                 args.platform or list(contracts.GUEST_OS))
         if operation in ("exec", "terminal open"):
             malformed = [item for item in args.env if "=" not in item]
             if malformed:
@@ -344,6 +354,7 @@ def summary(result):
                      f"{a['memory_mib']} MiB, {a['storage_gib']} GiB free")
     for name, template in data.get("templates", {}).items():
         lines.append(f"  template {name}: {template['state']}")
+    lines += [f"  {line}" for line in data.get("view", [])]
     return "\n".join(lines)
 
 
@@ -403,6 +414,15 @@ def parser():
     check.add_argument("--platform", action="append", choices=contracts.GUEST_OS,
                        help="a required platform; repeatable; default all")
     check.add_argument("--config", type=Path, help="default: build/vm/local.toml under --root")
+    evidence_gate = ops.add_parser("gate", help="verify (or reuse) a candidate and its base on every platform, "
+                                   "and judge them as a fix of an issue")
+    evidence_gate.add_argument("--issue", type=int, required=True, help="the issue the candidate fixes")
+    evidence_gate.add_argument("--revision", required=True, help="the candidate commit")
+    evidence_gate.add_argument("--base", help="the base commit; default: its merge base with origin/main")
+    evidence_gate.add_argument("--overlay", type=Path, help="test patch the base's red run applies")
+    evidence_gate.add_argument("--platform", action="append", choices=contracts.GUEST_OS,
+                               help="a required platform; repeatable; default all")
+    evidence_gate.add_argument("--config", type=Path, help="default: build/vm/local.toml under --root")
     run_scenario = ops.add_parser("scenario", parents=[target], help="run a tests/scenarios scenario in a worker")
     run_scenario.add_argument("scenario", help="scenario id: tests/scenarios/<id>.toml")
     run_scenario.add_argument("--mode", required=True, choices=("cold", "prepared"))

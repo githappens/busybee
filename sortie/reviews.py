@@ -15,6 +15,13 @@ MODEL = "claude-opus-5-5"
 EFFORT = "high"
 GATE_MARKER = "busybee-agent-review-gate:v2 "
 REQUIRED_CHECKS = ("ubuntu-latest", "macos-latest")
+# The lab controller's verification evidence (scripts/vm/gate.py): the first
+# line of a comment by the PR's author, which is the dispatcher identity the
+# controller acts as. Lab sessions' PRs need it for their head.
+LAB_MARKER = "busybee-lab-evidence:v1"
+LAB_LINE = re.compile(r"<!-- " + re.escape(LAB_MARKER) + r" (\{.*\}) -->")
+LAB_BRANCH = "sortie-lab/"
+LAB_PASSING = ("verified", "preexisting_failures")
 
 
 def command(argv, stdin=None):
@@ -66,9 +73,40 @@ def human_comments(comments, author=None):
                  c.get("author_association") in ("OWNER", "MEMBER", "COLLABORATOR"))]
 
 
+def lab_evidence(packet):
+    """The newest lab evidence header the PR's author posted for its current
+    head, or None."""
+    author, found = packet["metadata"]["user"]["login"], None
+    for c in sorted(packet["prior_comments"], key=lambda c: c["id"]):
+        if c.get("user", {}).get("login") != author or c.get("user", {}).get("type") == "Bot":
+            continue
+        match = LAB_LINE.fullmatch((c.get("body") or "").split("\n", 1)[0].strip())
+        try:
+            header = json.loads(match[1]) if match else None
+        except ValueError:
+            header = None
+        if isinstance(header, dict) and header.get("head") == packet["head"]:
+            found = {"comment": c["id"], **header}
+    return found
+
+
+def lab_errors(packet):
+    """Why a lab session's PR is not yet reviewable: no accepted controller
+    evidence for its current head. Other PRs need none."""
+    if not packet["metadata"]["head"]["ref"].startswith(LAB_BRANCH):
+        return []
+    found = lab_evidence(packet)
+    if found is None:
+        return [f"No lab evidence for head {packet['head']}; the lab controller posts it when it accepts a handoff"]
+    if found.get("verdict") not in LAB_PASSING:
+        return [f"The lab evidence for head {packet['head']} is {found.get('verdict')}, not accepted"]
+    return []
+
+
 def input_id(packet):
     pr = packet["metadata"]
     data = {k: packet[k] for k in ("repo", "pr", "issue", "head", "base", "skill_sha256", "policy_sha256")}
+    data["lab_evidence"] = lab_evidence(packet)
     data.update(title=pr["title"], body=pr.get("body"),
                 dispositions=human_comments(packet["prior_comments"], pr["user"]["login"]),
                 contracts=[{"issue": {k: c["issue"].get(k) for k in ("number", "title", "body")},
@@ -146,7 +184,7 @@ def evaluate(packet, record, checks):
     for verdict in ("UNSURE", "BLOCKED"):
         if any(r["verdict"] == verdict for r in record["reviews"].values()):
             return verdict, [f"{s}: {r['report']}" for s, r in record["reviews"].items() if r["verdict"] == verdict]
-    errors = ci_errors(packet["head"], checks)
+    errors = ci_errors(packet["head"], checks) + lab_errors(packet)
     if not reviewable(pr):
         errors.append("PR must be open, ready, and from the same repository")
     return ("WAITING", errors) if errors else ("READY", [])
@@ -185,10 +223,13 @@ def collect_packet(repo, number, issue=None):
     live = read_pr(repo, number)
     if (live["head"]["sha"], live["base"]["sha"]) != (pr["head"]["sha"], pr["base"]["sha"]):
         raise ValueError("PR changed while collecting the packet; collect it again")
-    return {"repo": repo, "pr": number, "issue": issue, "head": pr["head"]["sha"], "base": base,
-            "metadata": pr, "contracts": issues, "contract_source": "issues" if issues else "PR description only",
-            "diff": diff, "prior_comments": comments, "prior_reviews": prior,
-            "skill_sha256": skill_hashes(), "policy_sha256": policy_hash()}
+    packet = {"repo": repo, "pr": number, "issue": issue, "head": pr["head"]["sha"], "base": base,
+              "metadata": pr, "contracts": issues, "contract_source": "issues" if issues else "PR description only",
+              "diff": diff, "prior_comments": comments, "prior_reviews": prior,
+              "skill_sha256": skill_hashes(), "policy_sha256": policy_hash()}
+    # For the reviewers: the comment holding the lab controller's evidence.
+    packet["lab_evidence"] = lab_evidence(packet)
+    return packet
 
 
 def checks_for(repo, head):
@@ -240,10 +281,14 @@ def publish_decision(packet, record, checks):
     api(f"repos/{repo}/pulls/{number}/reviews", "POST", {"event": event, "commit_id": head, "body": body})
 
 
-def write_handoff(pr, sha, branch, target):
+def handoff_errors(pr, sha, branch):
     if (not reviewable(pr)
             or pr["head"]["sha"] != sha or pr["head"]["ref"] != branch):
         raise ValueError("Handoff requires the local branch/head to match an open, ready, pushed same-repository PR")
+
+
+def write_handoff(pr, sha, branch, target):
+    handoff_errors(pr, sha, branch)
     owner, repo = pr["base"]["repo"]["full_name"].split("/")
     scm = {"branch": branch, "sha": sha, "pr_number": pr["number"], "owner": owner, "repo": repo,
            "pushed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")}
@@ -262,13 +307,20 @@ def main():
         if name == "packet":
             p.add_argument("--issue", type=int)
             p.add_argument("--output", required=True)
+        else:
+            p.add_argument("--check", action="store_true",
+                           help="only check that the local head is the pushed, ready PR's; write nothing")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo) or args.pr < 1:
         parser.error("Expected OWNER/REPO and a positive PR number")
     if args.operation == "handoff":
         pr = read_pr(args.repo, args.pr)
-        write_handoff(pr, command(["git", "rev-parse", "HEAD"]).strip(),
-                      command(["git", "branch", "--show-current"]).strip(), Path(".sortie"))
+        sha, branch = command(["git", "rev-parse", "HEAD"]).strip(), command(["git", "branch", "--show-current"]).strip()
+        if args.check:
+            handoff_errors(pr, sha, branch)
+            print(f"PR #{args.pr} at {sha} can be handed off")
+            return
+        write_handoff(pr, sha, branch, Path(".sortie"))
         print(f"Handed PR #{args.pr} at {pr['head']['sha']} to Sortie and CI review")
         return
     if args.operation == "packet":

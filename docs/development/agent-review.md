@@ -44,6 +44,10 @@ early feedback; they do not grant approval or replace either CI session.
    writes `.sortie/scm.json` with `branch`, `sha`, `pushed_at`, `pr_number`,
    `owner`, and `repo`, followed by `needs-human-review` in `.sortie/status`.
    That status is Sortie's protocol name; the CI gate supplies the review.
+   A lab session's agent asks with `lab handoff` instead: the controller
+   runs the helper only after its evidence gate accepted the head on Linux
+   and macOS, and posts that evidence on the PR first
+   ([agent sessions](../design/agent-lab.md#agent-sessions)).
 4. After the current Linux and macOS CI jobs pass, the base-controlled Actions
    workflow starts two fresh Claude sessions, one per skill. They inspect the
    full live PR packet and exact candidate tree with only read/search tools.
@@ -86,6 +90,15 @@ Trust model:
 - The publisher rechecks live inputs, head, and both platform jobs. Stale,
   missing, malformed, or `UNSURE` results never approve, and an earlier
   approval is revoked when its evidence is invalidated or CI fails on that head.
+- A lab session's PR (`sortie-lab/` branch) also needs the lab controller's
+  evidence for its current head: a comment by the PR's author (the dispatcher
+  identity the controller acts as) whose first line is the
+  `busybee-lab-evidence:v1` marker with a `verified` or
+  `preexisting_failures` verdict. Without it no review session starts and
+  the gate waits; an approval whose evidence is gone is revoked. The
+  controller refuses agent text carrying the marker. The packet names the
+  comment as `lab_evidence`, and it is part of the input fingerprint, so new
+  evidence is reviewed and unchanged evidence is not.
 
 Each model session returns only:
 

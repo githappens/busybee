@@ -16,8 +16,9 @@ REPO = "githappens/busybee"
 MILESTONE = "agent lab: autonomous VM development"
 # The trusted snapshot this file runs from: its controller and guard policy.
 ROOT = Path(__file__).resolve().parents[1]
-# Every dispatched agent runs in a Linux worker through a controller session.
-DEFAULT_CAPABILITIES = ("controller:session", "worker:linux")
+# Every dispatched agent runs in a Linux worker through a controller session,
+# and its handoff is verified on Linux and macOS by the evidence gate.
+DEFAULT_CAPABILITIES = ("controller:gate", "controller:session", "worker:linux", "worker:macos")
 REQUIRES = re.compile(r"^[\s*_]*lab requires:[\s*_]*(.+)$", re.IGNORECASE | re.MULTILINE)
 
 

@@ -44,12 +44,19 @@ class FakeOps:
 
     def create(self, platform, revision, patch):
         self.calls.append(("create", platform))
+        self.patches = getattr(self, "patches", []) + [patch]
         run_id = f"r-20261003T00000{len(self.runs)}Z-abcdef"
         self.runs[run_id] = platform
         return {"status": "success", "findings": [], "data": {"run_id": run_id}}
 
     def checkout(self, run_id):
         return "/checkout"
+
+    def baseline_of(self, run_id):
+        return f"baseline-{self.runs[run_id]}"
+
+    def controller(self):
+        return {"head": "c" * 40, "scenarios_dirty": False}
 
     def exec(self, run_id, argv, cwd):
         platform = self.runs[run_id]
@@ -72,7 +79,8 @@ class FakeOps:
         status = self.scenario_status.get((platform, scenario_id, mode), "success")
         return {"status": status, "exec": f"{len(self.calls):04d}",
                 "failed": ["task_runs"] if status == "product_failure" else [],
-                "busybee_sha256": self.scenario_digest.get(platform, self.on_disk(platform, "scenario"))}
+                "busybee_sha256": self.scenario_digest.get(platform, self.on_disk(platform, "scenario")),
+                "terminals": ["monitor"] if scenario_id == "live-monitor" else []}
 
     def destroy(self, run_id):
         self.calls.append(("destroy", self.runs[run_id]))
@@ -105,7 +113,7 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(result["status"], "success", result["findings"])
         matrix = self.matrix(result)
         self.assertEqual((matrix["schema"], matrix["verdict"]), (verify.SCHEMA, "verified"))
-        self.assertEqual(matrix["source"], {"revision": REVISION, "patch_sha256": None})
+        self.assertEqual(matrix["source"], {"revision": REVISION, "patch_sha256": None, "overlay_sha256": None})
         for platform in ("linux", "macos"):
             entry = matrix["platforms"][platform]
             self.assertEqual(entry["head"], REVISION)
@@ -128,6 +136,29 @@ class VerifyTests(unittest.TestCase):
         lifecycle = [c[:2] for c in self.ops.calls if c[0] in ("create", "destroy")]
         self.assertEqual(lifecycle, [("create", "linux"), ("destroy", "linux"), ("create", "macos"),
                                      ("destroy", "macos")])
+
+    def test_the_matrix_binds_its_role_overlay_controller_baselines_and_ui(self):
+        # The evidence gate (gate.py) reuses a matrix only for exactly this source,
+        # this controller and scenario revision, and these template baselines.
+        overlay = self.out / "overlay.patch"
+        overlay.write_bytes(b"a regression test, applied to the base\n")
+        result = verify.run(self.ops, ["linux", "macos"], REVISION, None, self.out, overlay=overlay, role="base")
+        matrix = self.matrix(result)
+        self.assertEqual(matrix["role"], "base")
+        self.assertEqual(matrix["source"]["patch_sha256"], None)
+        self.assertEqual(matrix["source"]["overlay_sha256"], verify.worker._sha256(overlay.read_bytes()))
+        self.assertEqual(self.ops.patches, [overlay, overlay])
+        self.assertEqual(matrix["controller"], {"head": "c" * 40, "scenarios_dirty": False})
+        self.assertEqual({p: e["baseline"] for p, e in matrix["platforms"].items()},
+                         {"linux": "baseline-linux", "macos": "baseline-macos"})
+        monitor = matrix["platforms"]["linux"]["scenarios"]["live-monitor"]
+        self.assertTrue(monitor["ui"])
+        self.assertEqual(monitor["modes"]["prepared"]["terminals"], ["monitor"])
+        self.assertFalse(matrix["platforms"]["linux"]["scenarios"]["umask-startup"]["ui"])
+        # A matrix is a candidate's unless it says otherwise.
+        self.assertEqual(self.matrix(self.verify())["role"], "candidate")
+        # Template identities are placeholders in the public copy.
+        self.assertNotIn("baseline-linux", (self.out / result["data"]["public"]).read_text())
 
     def test_a_different_head_or_binary_is_not_the_same_revision(self):
         self.ops.heads["macos"] = "b" * 40
