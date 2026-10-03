@@ -332,6 +332,37 @@ class RealSessionTests(unittest.TestCase):
         self.assertIn(header["verdict"], ("verified", "preexisting_failures"))
         self.assertEqual(self.end()["outcome"], "success")
 
+    @unittest.skipUnless(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"), "needs a Claude credential in the environment")
+    def test_a_model_agent_hands_off_through_the_gate(self):
+        # A real model-backed Claude turn in the worker: it changes the branch,
+        # opens and readies the PR and asks for review; the gate decides.
+        self.start()
+        prompt = ("You work in a disposable VM on branch sortie-lab/990079 of busybee; `lab` is on your PATH. "
+                  "Do exactly this with the Bash tool, then stop: create PILOT.md containing the line "
+                  "'model-backed lab turn'; commit it with `git -c user.name=Lab -c user.email=lab@example.test "
+                  "commit`; run `lab push`; write 'Closes #990079' to /var/tmp/body.md; run `lab pr create "
+                  "--title 'lab: model pilot' --body-file /var/tmp/body.md`; run `lab pr ready`; run "
+                  "`lab handoff`. Report the final output of `lab handoff`.")
+        code = self.agent("", argv=["claude", "-p", prompt, "--permission-mode", "bypassPermissions",
+                                      "--allowedTools", "Bash", "--max-turns", "30", "--output-format", "json"])
+        self.assertEqual(code, 0, self.last_log)
+        turn = self.attempt()["turns"][-1]
+        self.assertEqual((turn["runner"], turn["kind"]), ("claude", "exited"), turn)
+        self.assertIn('"type":"result"', self.last_log.replace(" ", ""))
+        self.assertEqual(git("-C", str(self.workspace), "show", "HEAD:PILOT.md").strip(), "model-backed lab turn")
+        verification = self.attempt()["verification"]
+        self.assertIn(verification["verdict"], ("verified", "preexisting_failures"), verification)
+        self.assertEqual((self.workspace / ".sortie" / "status").read_text(), "needs-human-review\n")
+        comments = json.loads((self.tmp / "gh.json").read_text())["prs"][0]["comments"]
+        self.assertEqual(len(comments), 1)
+        # The credential reached the turn only: never the session's or the runs' records.
+        secret = os.environ["CLAUDE_CODE_OAUTH_TOKEN"].encode()
+        for root in (STATE / "sessions" / str(ISSUE), STATE / "runs" / self.attempt()["run_id"]):
+            for path in root.rglob("*"):
+                if path.is_file():
+                    self.assertNotIn(secret, path.read_bytes(), path.name)
+        self.assertEqual(self.end()["outcome"], "success")
+
 
 if __name__ == "__main__":
     unittest.main()
