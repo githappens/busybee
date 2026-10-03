@@ -23,12 +23,15 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tarfile
 import time
 
 import contracts
 import evidence
 import guest
+import lease
+import macos
 import parallels
 import screen
 import template
@@ -170,11 +173,11 @@ def kill_command(pid_path):
     return f"p=$(cat {pid_path} 2>/dev/null) && kill -s KILL -- -$p; true"
 
 
-def _after_exec(status_path, pid_path):
+def _after_exec(status_path, pid_path, checkout=CHECKOUT):
     """Read and remove the recorded status, then report source and binary provenance."""
     binaries = " ".join(f"build/*/{b}" for b in BINARIES)
     return (f'printf "status: %s\\n" "$(cat {status_path} 2>/dev/null)"; rm -f {status_path} {pid_path}; '
-            f'cd {CHECKOUT} || exit 0; printf "head: %s\\n" "$(git rev-parse HEAD)"; '
+            f'cd {checkout} || exit 0; printf "head: %s\\n" "$(git rev-parse HEAD)"; '
             f'printf "dirty: %s\\n" "$(git status --porcelain | wc -l)"; '
             f'for f in {binaries}; do [ -f "$f" ] && sha256sum "$f" | sed "s/^/binary: /"; done; true')
 
@@ -207,6 +210,19 @@ def parse_after_exec(text):
     return facts
 
 
+# Every process, in BSD syntax that procps and macOS both take; etime is
+# [[dd-]hh:]mm:ss on both (procps's etimes, in seconds, is not on macOS).
+PS = "ps axo pid=,ppid=,user=,stat=,etime=,args="
+
+
+def _seconds(elapsed):
+    days, _, clock = elapsed.rpartition("-")
+    seconds = 0
+    for part in clock.split(":"):
+        seconds = seconds * 60 + int(part)
+    return seconds + int(days or 0) * 86400
+
+
 def parse_processes(text):
     processes = []
     for line in text.splitlines():
@@ -214,7 +230,7 @@ def parse_processes(text):
         if len(fields) == 6 and fields[0].isdigit():
             pid, ppid, user, stat, elapsed, args = fields
             processes.append({"pid": int(pid), "ppid": int(ppid), "user": user, "stat": stat,
-                              "elapsed_s": int(elapsed), "args": args})
+                              "elapsed_s": _seconds(elapsed), "args": args})
     return processes
 
 
@@ -225,22 +241,36 @@ class Workers(template.Lab):
     substitute them, and the clock and sleep that waits use."""
 
     def __init__(self, repo, config, prl, reg, free_gib, connect=None, supervise=None, clock=time.time,
-                 sleep=time.sleep):
+                 sleep=time.sleep, slot_wait_s=None):
         super().__init__(repo, config, prl, reg)
         self.connect = connect or self._ssh
         self.free_gib = free_gib
         self.supervise = supervise
         self.clock, self.sleep = clock, sleep
+        # How long `worker create macos` waits in line for the slot.
+        self.slot_wait_s = config["deadlines"]["run"] if slot_wait_s is None else slot_wait_s
+        self.slot = lease.Slot(self.state, clock=clock, sleep=sleep)
 
     # Ownership and records
 
+    def vm_for(self, run_id):
+        """The VM a run works in: its own clone, or the macOS slot while it holds the lease."""
+        return next((n for n, e in self.reg.entries().items() if e["role"] == "slot" and e.get("holder") == run_id),
+                    contracts.worker_name(run_id))
+
+    def claimed(self, run_id):
+        entry = self.reg.get(self.vm_for(run_id))
+        return entry is not None and (entry["role"] == "worker" and entry["run_id"] == run_id
+                                      or entry["role"] == "slot" and entry.get("holder") == run_id)
+
     def _owned(self, run_id, need_record=True):
-        """The registry entry and record of a worker this controller created."""
+        """The registry entry and record of a worker this controller created
+        or, on macOS, of the slot this run holds."""
         if not contracts.valid_run_id(run_id):
             raise Refused("target_invalid", f"{run_id!r} is not a run id")
-        vm = contracts.worker_name(run_id)
+        vm = self.vm_for(run_id)
         entry = self.reg.get(vm)
-        if entry is None or entry["role"] != "worker" or entry["run_id"] != run_id:
+        if not self.claimed(run_id):
             raise Refused("target_not_owned", f"no registered worker for run {run_id}")
         record = _load(run_dir(self.state, run_id) / "worker.json")
         if record is None and need_record:
@@ -315,13 +345,28 @@ class Workers(template.Lab):
 
     # Guest access
 
+    def _guest_user(self, record):
+        """The account the baseline's key logs into: root on NixOS, the macOS
+        baseline's lab account as its candidate recorded it."""
+        if record["template"] != "macos":
+            return "root"
+        cdir = template.candidate_dir(self.state, record["template"], record["candidate"])
+        return json.loads((cdir / "candidate.json").read_text())["guest_user"]
+
+    def checkout(self, record):
+        return macos.checkout(self._guest_user(record)) if record["template"] == "macos" else CHECKOUT
+
     def _ssh(self, record, info, deadline):
         cdir = template.candidate_dir(self.state, record["template"], record["candidate"])
         ip = guest.wait_for_lease(info["mac"], deadline)
         known = run_dir(self.state, record["run_id"]) / "known_hosts"
         known.write_text(f"{ip} {' '.join((cdir / 'host.pub').read_text().split()[:2])}\n")
-        g = guest.Guest(ip, cdir / "access", known)
+        g = guest.Guest(ip, cdir / "access", known, user=self._guest_user(record),
+                        posix=record["template"] == "macos")
         g.wait(deadline)
+        if record["template"] == "macos" and not macos.wait_for_nix(g, deadline, lambda: self._bound("command"),
+                                                                     self.sleep):
+            raise guest.GuestError("the macOS guest answers, but its Nix store did not mount")
         return g
 
     def _guest(self, record, boot=False):
@@ -330,34 +375,41 @@ class Workers(template.Lab):
         if info["state"] != "running":
             if not boot:
                 raise Refused("worker_stopped", f"worker {record['run_id']} is {info['state']}")
-            self.prl.start(vm)
+            self.prl.start_reporting(vm)
         return self.connect(record, info, self._until(self.config["deadlines"]["command"]))
 
     def _transfer(self, g, record):
         """The recorded revision with its history and tags, as a guest-local checkout."""
         revision = record["source"]["revision"]
+        co = self.checkout(record)
         bundle = subprocess.run(["git", "bundle", "create", "-", revision, "--tags"], cwd=self.repo,
                                 capture_output=True, check=True).stdout
         # A bare revision is no ref in the bundle, so unbundle and recreate the tags.
-        g.run(f"rm -rf {CHECKOUT} /var/tmp/source.bundle && cat > /var/tmp/source.bundle && "
-              f"git init -q {CHECKOUT} && cd {CHECKOUT} && git bundle unbundle /var/tmp/source.bundle | "
+        g.run(f"rm -rf {co} /var/tmp/source.bundle && cat > /var/tmp/source.bundle && "
+              f"git init -q {co} && cd {co} && git bundle unbundle /var/tmp/source.bundle | "
               f"while read -r id ref; do git update-ref \"$ref\" \"$id\"; done && "
               f"git checkout -q --detach {revision} && rm /var/tmp/source.bundle",
               self._bound("command"), stdin=bundle)
         patch = run_dir(self.state, record["run_id"]) / "source.patch"
         if record["source"]["patch_sha256"]:
-            g.run(f"cd {CHECKOUT} && git apply", self._bound("command"), stdin=patch.read_bytes())
-        head = g.run(f"git -C {CHECKOUT} rev-parse HEAD", self._bound("command"))[1].strip()
+            g.run(f"cd {co} && git apply", self._bound("command"), stdin=patch.read_bytes())
+        head = g.run(f"git -C {co} rev-parse HEAD", self._bound("command"))[1].strip()
         if head != revision:
             raise RuntimeError(f"guest checkout is at {head}, not {revision}")
 
-    def halt(self, vm):
+    def halt(self, record):
+        vm = record["worker"]
         if self.prl.info(vm)["state"] == "stopped":
             return
         try:
             self._remaining()  # with no time left, straight to the kill
-            self._shutdown(vm)
-        except (template.DeadlineExceeded, parallels.ParallelsError):
+            if record["template"] == "macos":
+                # A macOS guest answers an ACPI request with a dialog: shut it down from inside.
+                self._guest(record).run("sudo -n shutdown -h now", self._bound("command"), check=False)
+                self._wait_state(vm, "stopped", self.config["deadlines"]["command"])
+            else:
+                self._shutdown(vm)
+        except (template.DeadlineExceeded, parallels.ParallelsError, guest.GuestError, Refused):
             self.prl.stop(vm, kill=True)
 
     # Admission and reconciliation
@@ -368,9 +420,12 @@ class Workers(template.Lab):
         looked at; no other VM is touched."""
         workers, findings = [], []
         for vm, entry in sorted(self.reg.entries().items()):
-            if entry["role"] != "worker":
+            if entry["role"] == "slot" and entry.get("holder"):
+                run_id = entry["holder"]
+            elif entry["role"] == "worker":
+                run_id = entry["run_id"]
+            else:
                 continue
-            run_id = entry["run_id"]
             record = _load(run_dir(self.state, run_id) / "worker.json")
             if record and (record["status"] in ("ready", "provisioning") or self.unfinished(run_id) or
                            record["status"] in contracts.FROZEN_STATES and self._running(vm)):
@@ -420,57 +475,54 @@ class Workers(template.Lab):
 
     # Operations
 
-    def create(self, name, revision, patch=None):
-        op = "worker create"
-        if name != "linux":
-            return contracts.result(op, "unsupported", f"{name} workers are not provided here", [
-                contracts.finding("template_unsupported", "only linux workers are cloned by this controller")])
+    def usable_baseline(self, name):
+        """The promoted baseline workers of `name` come from and its registered
+        VM, or the findings that make it unusable."""
         path = template.manifest_path(self.state, name)
         if not path.is_file():
-            return contracts.result(op, "environment_failure", "no baseline", [
-                contracts.finding("baseline_missing", f"no promoted {name} baseline")])
+            return None, None, [contracts.finding("baseline_missing", f"no promoted {name} baseline")]
         manifest = json.loads(path.read_text())
         errors = contracts.manifest_errors(manifest)
-        strategy = self.config["clone_strategy"]
+        strategy = contracts.clone_strategy(self.config, name)
+        if not errors and manifest["os"] != name:
+            errors.append(f"the {name} manifest describes a {manifest['os']} baseline")
         if not errors and strategy not in manifest["clone_modes"]:
             errors.append(f"clone_strategy {strategy} was not validated for this baseline")
         baseline_vm = self.reg.name_for(manifest["vm_id"])
         if baseline_vm is None:
             errors.append("the baseline VM is not registered to this controller")
         if errors:
-            return contracts.result(op, "environment_failure", "baseline is not usable",
-                                    [contracts.finding("baseline_invalid", "; ".join(errors))])
+            return None, None, [contracts.finding("baseline_invalid", "; ".join(errors))]
+        return manifest, baseline_vm, []
+
+    def create(self, name, revision, patch=None):
+        op = "worker create"
+        if name not in contracts.GUEST_OS:
+            return contracts.result(op, "unsupported", f"{name} workers are not provided here", [
+                contracts.finding("template_unsupported", f"workers are {', '.join(contracts.GUEST_OS)}")])
+        manifest, baseline_vm, problems = self.usable_baseline(name)
+        if problems:
+            return contracts.result(op, "environment_failure", "baseline is not usable", problems)
+        if name == "macos":
+            return self._lease(manifest, baseline_vm, revision, patch)
+        strategy = contracts.clone_strategy(self.config, name)
         # Admission and the claim are one step: no other controller process
         # can admit a worker between this one's check and its claim.
         with locked(self.state / "controller.lock"):
-            workers, notes = self._reconcile()
-            active = [w["run_id"] for w in workers]
-            if len(active) >= MAX_ACTIVE:
-                return contracts.result(op, "environment_failure", "worker limit reached", [
-                    contracts.finding("worker_limit", f"{MAX_ACTIVE} worker(s) may be active; "
-                                      f"destroy {', '.join(active)} first"), *notes])
             allocation = dict(self.config["worker"])
+            refused = self._admit(op)
+            if refused:
+                return refused
             # A clone can grow to the baseline's disk size, so that must fit the allocation.
             disk_mib = self.prl.info(baseline_vm)["disk_mib"]
             if disk_mib is None or disk_mib > allocation["storage_gib"] * 1024:
                 return contracts.result(op, "environment_failure", "baseline disk exceeds the allocation", [
                     contracts.finding("storage_exhausted", f"the baseline disk is {disk_mib} MiB; a worker is "
                                       f"allotted {allocation['storage_gib']} GiB")])
-            free = self.free_gib(self.state)
-            if free < allocation["storage_gib"]:
-                return contracts.result(op, "environment_failure", "not enough storage", [
-                    contracts.finding("storage_exhausted", f"a worker is allotted {allocation['storage_gib']} GiB; "
-                                      f"{free} GiB is free")])
             source = self._source(revision, patch)
-
             run_id = contracts.new_run_id()
             vm = contracts.worker_name(run_id)
-            rdir = run_dir(self.state, run_id)
-            rdir.mkdir(parents=True)
-            if patch:
-                evidence.durable(rdir / "source.patch", Path(patch).read_bytes())
-            created = _now()
-            expires = self._start()
+            rdir, created, expires = self._open_run(run_id, patch)
             self.reg.claim(vm, "worker", name, run_id, expires, parent=manifest["vm_id"])
         record = None
         with locked(self._lock(run_id)):
@@ -505,6 +557,179 @@ class Workers(template.Lab):
                     *(contracts.finding("cleanup_incomplete", n) for n in notes)], {"run_id": run_id})
         return contracts.result(op, "success", f"worker {run_id} is ready", data={
             "run_id": run_id, "worker": vm, "deadline": expires, "source": source, "allocation": allocation})
+
+    # The macOS slot: one guest, leased (lease.py, §macOS workers)
+
+    def _slot_blocked(self):
+        """Why a free slot lock still cannot be granted, or None. A holder
+        halted with its evidence (retained, stopped, expired) keeps the slot
+        until it is destroyed; one whose lease process died has lost it."""
+        for vm, entry in self.reg.entries().items():
+            if entry["role"] != "slot" or not entry.get("holder"):
+                continue
+            holder = entry["holder"]
+            record = _load(run_dir(self.state, holder) / "worker.json")
+            if record is None or record["status"] in ("destroyed", "failed"):
+                self.reg.hold(vm, None, None)
+            elif record["status"] in contracts.FROZEN_STATES:
+                return f"run {holder} is {record['status']} with uncollected evidence; destroy it to free the slot"
+            else:
+                # Its supervisor held the lease; the lock being free means it is gone.
+                self._lose_lease(record, "its supervisor ended while it held the macOS slot")
+                self.reg.hold(vm, None, None)
+        return None
+
+    def _slot_vm(self, manifest, baseline_vm, allocation):
+        """The slot guest for the current baseline: kept while the baseline
+        stays, replaced when another is promoted. Its reset snapshot is taken
+        before it first starts."""
+        known = _load(self.slot.record_path)
+        if known and known["candidate"] == manifest["candidate"] and self.reg.owns(known["vm"]):
+            return known
+        if known and self.reg.owns(known["vm"]):
+            if self._running(known["vm"]):
+                self.prl.stop(known["vm"], kill=True)
+            self.prl.delete(known["vm"])
+            self.reg.release(known["vm"])
+        vm = f"{contracts.SLOT_PREFIX}{contracts.new_run_id()}"
+        self.reg.claim(vm, "slot", "macos", vm[len(contracts.SLOT_PREFIX):], None, parent=manifest["vm_id"])
+        try:
+            self._clone(baseline_vm, vm, manifest["snapshot_id"], "full")
+            info = self.prl.info(vm)
+            self.reg.bind(vm, info["vm_id"])
+            present = sorted(set(info["devices"]) & set(template.HOST_DEVICES))
+            if present:
+                raise RuntimeError(f"the slot guest has host devices: {', '.join(present)}")
+            self.prl.allocate(vm, allocation["cpus"], allocation["memory_mib"])
+            known = {"vm": vm, "vm_id": info["vm_id"], "candidate": manifest["candidate"],
+                     "reset_snapshot_id": self.prl.snapshot(vm, "slot baseline")}
+        except Exception as err:  # a half-made slot guest is removed, or stays registered and reported
+            notes = self._dispose(vm, self.slot.dir / "failure-console.png")
+            raise RuntimeError(f"{_reason(err)}{'; ' + '; '.join(notes) if notes else ''}") from err
+        template._write_json(self.slot.record_path, known)
+        return known
+
+    def _lease(self, manifest, baseline_vm, revision, patch):
+        op = "worker create"
+        source = self._source(revision, patch)
+        run_id = contracts.new_run_id()
+
+        def report(ahead, why):
+            print(f"busybee-lab: {run_id} queued for the macOS slot ({ahead} ahead"
+                  f"{': ' + why if why else ''})", file=sys.stderr, flush=True)
+        try:
+            held = self.slot.acquire(run_id, self.slot_wait_s, report, self._slot_blocked)
+        except lease.Waited as err:
+            return contracts.result(op, "environment_failure", "the macOS slot is busy",
+                                    [contracts.finding("lease_wait_timeout", str(err))])
+        try:
+            with locked(self.state / "controller.lock"):
+                refused = self._admit(op)
+                if refused:
+                    return refused
+                allocation = dict(self.config["worker"])
+                _, created, expires = self._open_run(run_id, patch)
+                try:
+                    slot = self._slot_vm(manifest, baseline_vm, allocation)
+                except Exception as err:  # the slot could not be prepared; nothing was leased
+                    return contracts.result(op, "environment_failure", "the macOS slot could not be prepared", [
+                        contracts.finding(getattr(err, "code", "slot_unavailable"), _reason(err))])
+                self.reg.hold(slot["vm"], run_id, expires)
+            record = None
+            with locked(self._lock(run_id)):
+                try:
+                    record = {"schema": contracts.WORKER_SCHEMA, "run_id": run_id, "worker": slot["vm"],
+                              "vm_id": slot["vm_id"], "template": "macos", "candidate": manifest["candidate"],
+                              "baseline_vm_id": manifest["vm_id"], "snapshot_id": manifest["snapshot_id"],
+                              "reset_snapshot_id": slot["reset_snapshot_id"], "clone_strategy": "full",
+                              "allocation": allocation, "source": source, "status": "provisioning",
+                              "created_at": _stamp(created), "deadline": expires}
+                    self._save(record)
+                    self.event(run_id, "leased", worker=slot["vm"])
+                    # The supervisor takes over the lease, and with it the run deadline.
+                    self.supervise(run_id, lease=held)
+                    # Whatever the last holder did, the guest starts from the slot's snapshot.
+                    if self._running(slot["vm"]):
+                        self.prl.stop(slot["vm"], kill=True)
+                    self.prl.snapshot_switch(slot["vm"], slot["reset_snapshot_id"])
+                    self.event(run_id, "reset", snapshot=slot["reset_snapshot_id"])
+                    self._transfer(self._guest(record, boot=True), record)
+                    record["status"] = "ready"
+                    self._save(record)
+                except Exception as err:  # the lease ends; the slot guest stays for the next holder
+                    if record:
+                        record["status"] = "failed"
+                        self._save(record)
+                    self.reg.hold(slot["vm"], None, None)
+                    status = "timeout" if isinstance(err, template.DeadlineExceeded) else "environment_failure"
+                    return contracts.result(op, status, f"worker {run_id} was not created", [
+                        contracts.finding(getattr(err, "code", "worker_create_failed"), _reason(err))],
+                        {"run_id": run_id})
+        finally:
+            held.close()  # the supervisor holds its own copy
+        return contracts.result(op, "success", f"worker {run_id} is ready on the macOS slot", data={
+            "run_id": run_id, "worker": slot["vm"], "deadline": expires, "source": source, "allocation": allocation})
+
+    def _lose_lease(self, record, reason):
+        record["status"] = "failed"
+        self._save(record)
+        self.event(record["run_id"], "lease_lost", reason=reason)
+
+    def rehold(self, run_id):
+        """A restarted supervisor's lease: the slot's lock while this run still
+        holds the slot, else None, and a run that was working has lost it. A
+        run whose creation still holds its operation lock is left alone: that
+        creation holds the slot and starts the supervisor that keeps it."""
+        if held(self._lock(run_id)):
+            return None
+        lock = self.slot.try_hold()
+        if lock is not None and self.claimed(run_id):
+            return lock
+        if lock is not None:
+            lock.close()
+        record = _load(run_dir(self.state, run_id) / "worker.json")
+        if record and record["status"] in ("ready", "provisioning"):
+            self._lose_lease(record, "its supervisor ended and the macOS slot passed on")
+        return None
+
+    def _release(self, record):
+        """End a macOS lease: the guest is stopped and kept for the next holder,
+        whose grant restores it."""
+        notes = []
+        try:
+            if self._running(record["worker"]):
+                self.prl.stop(record["worker"], kill=True)
+        except parallels.ParallelsError as err:
+            notes.append(f"stopping the slot guest failed: {err}")
+        record["status"] = "destroyed"
+        self._save(record)
+        if self.reg.get(record["worker"]) and self.reg.get(record["worker"]).get("holder") == record["run_id"]:
+            self.reg.hold(record["worker"], None, None)
+        self.event(record["run_id"], "released", notes=notes)
+        return notes
+
+    def _admit(self, op):
+        """Under controller.lock: the refusal when another worker is active or
+        the host lacks the allocation's storage, else None."""
+        workers, notes = self._reconcile()
+        active = [w["run_id"] for w in workers]
+        if len(active) >= MAX_ACTIVE:
+            return contracts.result(op, "environment_failure", "worker limit reached", [
+                contracts.finding("worker_limit", f"{MAX_ACTIVE} worker(s) may be active; "
+                                  f"destroy {', '.join(active)} first"), *notes])
+        allotted, free = self.config["worker"]["storage_gib"], self.free_gib(self.state)
+        if free < allotted:
+            return contracts.result(op, "environment_failure", "not enough storage", [
+                contracts.finding("storage_exhausted", f"a worker is allotted {allotted} GiB; {free} GiB is free")])
+        return None
+
+    def _open_run(self, run_id, patch):
+        """The run directory with its patch; returns it, the creation time and the run deadline."""
+        rdir = run_dir(self.state, run_id)
+        rdir.mkdir(parents=True)
+        if patch:
+            evidence.durable(rdir / "source.patch", Path(patch).read_bytes())
+        return rdir, _now(), self._start()
 
     def _source(self, revision, patch):
         found = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"], cwd=self.repo,
@@ -652,24 +877,25 @@ class Workers(template.Lab):
         """What the guest's checkout holds beyond the recorded revision, as
         (artifact name, producer) pairs."""
         base = record["source"]["revision"]
-        head = g.run(f"git -C {CHECKOUT} rev-parse HEAD", self._bound("command"))[1].strip()
-        status = g.run(f"git -C {CHECKOUT} status --porcelain --untracked-files=all", self._bound("command"))[1]
+        co = self.checkout(record)
+        head = g.run(f"git -C {co} rev-parse HEAD", self._bound("command"))[1].strip()
+        status = g.run(f"git -C {co} status --porcelain --untracked-files=all", self._bound("command"))[1]
         outputs = [("source.json", lambda: json.dumps({"base": base, "head": head, "status": status,
                                                        "patch_sha256": record["source"]["patch_sha256"]},
                                                       indent=2).encode())]
         if head != base:
             outputs.append(("commits.bundle", lambda: g.run(
-                f"git -C {CHECKOUT} bundle create - HEAD ^{base}", self._bound("command"), raw=True)[1]))
+                f"git -C {co} bundle create - HEAD ^{base}", self._bound("command"), raw=True)[1]))
         # Uncommitted and untracked changes, without touching the agent's index.
         outputs.append(("worktree.diff", lambda: g.run(
-            f"cd {CHECKOUT} && i=$(mktemp) && cp .git/index $i && GIT_INDEX_FILE=$i git add -A && "
+            f"cd {co} && i=$(mktemp) && cp .git/index $i && GIT_INDEX_FILE=$i git add -A && "
             f"GIT_INDEX_FILE=$i git diff --cached --binary HEAD; s=$?; rm -f $i; exit $s",
             self._bound("command"), raw=True)[1]))
         return outputs
 
-    def _observe(self, g):
-        processes = parse_processes(g.run("ps -eo pid=,ppid=,user=,stat=,etimes=,args=", self._bound("command"))[1])
-        facts = self._facts(g)
+    def _observe(self, g, record):
+        processes = parse_processes(g.run(PS, self._bound("command"))[1])
+        facts = self._facts(g, record["template"])
         return {"processes": processes, "daemons": {k: facts[k] for k in ("processes", "sockets", "paths")}}
 
     def _baseline(self, record):
@@ -745,7 +971,7 @@ class Workers(template.Lab):
             try:
                 g = self._guest(record, boot=True)
                 outputs = [(n, p) for n, p in self._source_outputs(g, record) if n not in kept]
-                observations = self._observe(g)
+                observations = self._observe(g, record)
                 missing += self._fetch_terminals(g, rdir)
             except Exception as err:  # unreachable guest: every source artifact is missing
                 missing.append(f"source: {_reason(err)}")
@@ -830,7 +1056,7 @@ class Workers(template.Lab):
         shutil.rmtree(old, ignore_errors=True)
 
     def retain(self, op, record, missing):
-        self.halt(record["worker"])
+        self.halt(record)
         record["status"] = "retained"
         self._save(record)
         self.event(record["run_id"], "retained", missing=missing)
@@ -844,7 +1070,7 @@ class Workers(template.Lab):
             self._window("cleanup")
             manifest, path, missing = self.collect_run(record)
             if record["status"] in contracts.FROZEN_STATES:
-                self.halt(vm)  # it was started only to finish collecting
+                self.halt(record)  # it was started only to finish collecting
         data = {"run_id": run_id, "missing": missing}
         findings = [contracts.finding("artifact_missing", m) for m in missing]
         if manifest:
@@ -916,6 +1142,11 @@ class Workers(template.Lab):
                     manifest, _, missing = self.collect_run(record)
                     if missing:
                         return self.retain(op, record, missing)
+                if record is not None and record["template"] == "macos":
+                    notes = self._release(record)
+                    return contracts.result(op, "success", f"worker {run_id} released the macOS slot", [
+                        contracts.finding("cleanup_incomplete", n, "warning") for n in notes],
+                        data={"run_id": run_id, "collected": manifest})
                 notes = self._dispose(vm, rdir / "final-console.png")
                 if notes:
                     return contracts.result(op, "environment_failure", f"worker {run_id} was not removed",
@@ -930,7 +1161,9 @@ class Workers(template.Lab):
     def _destroyed_before(self, run_id):
         """A repeated destroy: the claim is gone, and so is the VM it named."""
         record = _load(run_dir(self.state, run_id) / "worker.json") if contracts.valid_run_id(run_id) else None
-        if record is None or record["vm_id"] in self._host_vms():
+        # A macOS run's lease is gone (released, or lost with its supervisor); the slot guest stays.
+        leased = record is not None and record["template"] == "macos"
+        if record is None or (record["vm_id"] in self._host_vms() and not leased):
             self._owned(run_id, need_record=False)  # raises the refusal
         if record["status"] != "destroyed":
             record["status"] = "destroyed"
@@ -945,7 +1178,7 @@ class Workers(template.Lab):
         data = {"run_id": run_id, "status": record["status"], "vm_state": info["state"],
                 "deadline": record["deadline"], "allocation": record["allocation"], "source": record["source"]}
         if info["state"] == "running":
-            data.update(self._observe(self._guest(record)))
+            data.update(self._observe(self._guest(record), record))
         return contracts.result("inspect", "success", f"worker {run_id} is {info['state']}", data=data)
 
     def signal(self, run_id, name, pid):

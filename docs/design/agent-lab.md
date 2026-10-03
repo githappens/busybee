@@ -138,6 +138,9 @@ macOS baseline, leased to one run at a time. macOS workers are not cloned per ru
 - **Started on demand.** The guest may be stopped while idle, by an operator or
   after a host restart. Granting a lease starts it when it is not running.
   Holders do not shut it down; releasing the lease is enough.
+- **Evidence first.** A holder halted with uncollected evidence (`retained`,
+  `stopped`, `expired`) keeps the slot until it is destroyed, so no grant
+  resets its guest under it.
 - **Independent of busybee.** The lease, its queue, and its deadlines are
   controller functions. Busybee is not installed in the baseline and does not
   schedule the lab's own work.
@@ -217,7 +220,7 @@ template and worker schemas and exit codes are documented in
 `scripts/vm/vmctl.py` and `scripts/vm/contracts.py`.
 
 `doctor` and `template build`, `validate` and `promote` have shipped for the
-Linux template. `template build linux --arch aarch64` installs NixOS from the
+Linux and macOS templates. `template build linux --arch aarch64` installs NixOS from the
 installer pinned in `infra/vm/linux/installer.json` into a dedicated candidate
 VM with a 16 GiB expanding disk: a typed console command authorizes a run-scoped key on the installer, whose
 live environment then evaluates and builds `infra/vm/flake.nix`. The candidate
@@ -227,6 +230,37 @@ with the configured strategy and checks each capability on the clone;
 replaces. Every VM the controller creates is claimed in
 `build/vm/registry.json` before it exists, and no Parallels call changes a VM
 that is not claimed there.
+
+macOS has no unattended installer, so its one-time setup is an operator's
+prepared VM, named with the lab account and a bootstrap key in `[templates.macos]`:
+the OS, an account with passwordless sudo, Determinate Nix with an
+unencrypted store, and SSH. `template build macos --arch arm64` requires that
+source to be stopped, full-clones it into an owned candidate (the source is
+only read), removes the clone's host devices and sharing, and provisions it
+over SSH from `infra/vm/macos`: the Command Line Tools pinned in
+`baseline.json` through `softwareupdate`, a neutral host name, and the run's
+own SSH host key and access key in place of the source's, after which the
+bootstrap key no longer opens the candidate. Warming adds `nix develop -c
+cargo fetch` and installs the development shell's coreutils into the
+account's profile for GNU `timeout`, which bounds every exec. A macOS guest
+answers an ACPI stop with a confirmation dialog, so it is shut down from
+inside. Its `validate` adds `nix_store`, which waits for determinate-nixd to
+mount `/nix` after SSH answers, and `dev_tools`, which names each missing
+tool; a PTY there is `/dev/ttys*`. A start refused at Apple's limit is the
+named finding `macos_guest_limit`, read from the VM's `parallels.log`.
+`[templates.macos] clone_strategy` must be `full`; a configuration that would
+clone macOS linked is invalid rather than switched.
+
+`worker create macos` takes the slot (§macOS workers): a FIFO ticket under
+`slots/macos/`, then an flock on its `slot.lock`, whose descriptor the run's
+supervisor inherits and holds; a restarted supervisor takes it back only while
+its run still holds the slot, and otherwise records `lease_lost`. The slot
+guest is a full clone of the promoted baseline, registered with the role
+`slot` and its holder, snapshotted before its first start and replaced when
+another baseline is promoted. Each grant restores that snapshot, starts the
+guest and transfers the source; `destroy` collects, stops the guest and
+releases the lease. The guest's disk is the baseline's own and is reverted at
+every grant, so only the host's free storage is checked against `storage_gib`.
 
 `worker create linux --revision REV [--patch FILE]` claims the worker in the
 registry, naming the baseline it depends on, then clones the promoted
@@ -318,14 +352,33 @@ images are rendered from text, so the export redacts each terminal's recording
 and screens with placeholders of the same length, which keeps the timing log
 and the layout valid, and renders its cells and images again from that copy.
 
-`template prune linux` deletes each retained baseline that no registered worker
-was cloned from, and keeps and reports the rest.
+`template prune linux|macos` deletes each retained baseline that no registered
+worker or slot was cloned from, and keeps and reports the rest.
+
+`verify --revision REV [--patch FILE] [--platform linux|macos ...]` is step 5
+of §Run an issue: it checks that every required platform (default all) has a
+usable baseline before creating anything, then on each platform in turn
+creates a worker, runs `cargo build`, `fmt --check`, `clippy -D warnings` and
+`test --workspace` in the checkout's development shell, records `busybee
+--version`, runs each applicable scenario that names an issue in its required
+modes, and destroys the worker, exporting its public evidence. The platform
+matrix (`busybee.vm.verification/v1`, `verifications/<id>/matrix.json`) holds
+per platform the head, version, binary digests and every outcome, and whether
+each scenario ran the busybee that platform built. The digests are taken after
+the checks, since `cargo test` can relink the binaries with test-time features. It is `verified` only when
+all passed on the same source; `failed` keeps a product failure; a missing
+platform, a check that could not run (exit 127 is `tool_missing`), a head,
+version or binary that does not match, a worker that stopped serving mid-run
+(`interrupted`; it is still destroyed), or evidence that was not collected or
+exported makes it `incomplete`. The matrix is always written, with a
+`matrix.public.json` beside it whose run identities, user, host, addresses
+and home paths are placeholders.
 
 The unit tests under `scripts/vm/tests` need no Parallels. The acceptance tests
 that build, validate and compare real candidates, and drive real workers, run
 against the local config when opted in: `BUSYBEE_VM_LAB=1 python3 -m unittest
 test_real_template test_real_worker test_real_supervision test_real_scenarios
-test_real_terminal` in that directory. The scenario runner's own tests need neither:
+test_real_terminal test_real_macos` in that directory. The scenario runner's own tests need neither:
 `python3 -m unittest discover -s tests/scenarios/tests`.
 
 Long commands return a run handle with status, elapsed time, last-output time,
@@ -436,7 +489,11 @@ a scenario refused before its exec was queued ran nothing and leaves no record.
 Coverage takes the latest run in each mode: a scenario is verified only when
 every required mode's latest run passed, and a prepared pass is reported
 alongside a missing or failing cold run, never in its place. The runner covers
-Linux; on another platform it reports `platform_unsupported`.
+Linux and macOS; on another platform it reports `platform_unsupported`. On
+macOS, where the exec runs as the lab account, it starts through `sudo`, drops
+privileges without `setpriv` (its interpreter clears the groups, then sets the
+group and the user), and finds the fixture's processes by their marker in `ps`
+output, since there is no `/proc`; BSD reports no process umask.
 
 ## Make UI behavior observable
 
@@ -447,8 +504,13 @@ state changes. Preserve the raw terminal recording as well as decoded screen
 text and rendered images. Label images rendered from terminal cells separately
 from VM console screenshots.
 
-The guest template carries zellij, pinned through the lab flake; the terminal
-host is `tests/scenarios/terminal.py`, staged like the scenarios:
+The Linux guest template carries zellij, pinned through the lab flake; the
+terminal host is `tests/scenarios/terminal.py`, staged like the scenarios. It
+needs util-linux `script`'s advanced timing and `/proc`, so terminals run on
+Linux workers only and a macOS worker refuses `terminal open`
+(`platform_unsupported`); scenarios that drive one declare `platforms =
+["linux"]`. macOS terminal access is validated as SSH PTY transport. On
+Linux:
 
 - **Session.** Each terminal is one zellij session with a unique name and one
   borderless pane, no bars and no session serialization; opening it checks the
@@ -463,7 +525,8 @@ host is `tests/scenarios/terminal.py`, staged like the scenarios:
 - **Input.** Bytes, text and named keys reach the pane through zellij's
   pane-addressed actions; named keys are encoded for the pane's current
   terminal modes, as a terminal would.
-- **Recording.** The pane runs the command under util-linux `script`, whose
+- **Recording.** The pane waits, briefly and bounded, until zellij has given
+  its PTY a size, then runs the command under util-linux `script`, whose
   advanced timing log records every output and input chunk, each window-size
   change and the exit code. zellij's own screen and its report of the pane
   (`dump-screen`, `list-panes`) form a second, independent view.

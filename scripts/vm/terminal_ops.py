@@ -81,6 +81,11 @@ def open_terminal(workers, run_id, argv, cols, rows, cwd, env, timeout):
     if bad:
         raise worker.Refused("env_invalid", f"not environment variable names: {', '.join(map(repr, bad))}")
     record = _ready(workers, run_id)
+    if record["template"] != "linux":
+        # terminal.py needs util-linux script's advanced timing and /proc; a
+        # macOS guest's terminal access is checked as SSH PTY transport only.
+        raise worker.Refused("platform_unsupported", f"the terminal driver runs on linux workers, not "
+                             f"{record['template']}")
     stage, digest = scenario.stage_runner(workers, run_id, record)
     hdir = worker._next_dir(worker.run_dir(workers.state, run_id) / "terminal")
     handle = hdir.name

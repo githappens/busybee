@@ -139,11 +139,24 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("revision_version_unknown", codes)
 
     def test_platform_and_privilege_are_checked(self):
-        self.probe.os, self.probe.uid = "macos", 1000
-        del self.probe.tools["setpriv"]
+        self.probe.os, self.probe.uid = "freebsd", 1000
         facts, findings = runner.preflight(meta(), self.bin, "/checkout", self.probe)
         self.assertEqual(sorted(f["code"] for f in findings),
-                         ["platform_not_applicable", "platform_unsupported", "runner_not_root", "tool_missing"])
+                         ["platform_not_applicable", "platform_unsupported", "runner_not_root"])
+        # Linux drops privileges with setpriv, so it must be there.
+        self.probe.os, self.probe.uid = "linux", 0
+        del self.probe.tools["setpriv"]
+        _, findings = runner.preflight(meta(), self.bin, "/checkout", self.probe)
+        self.assertEqual([f["code"] for f in findings], ["tool_missing"])
+
+    def test_macos_runs_scenarios_without_setpriv(self):
+        # macOS has no setpriv; the runner drops privileges itself there.
+        self.probe.os = "macos"
+        del self.probe.tools["setpriv"]
+        _, findings = runner.preflight(meta(platforms=["linux", "macos"]), self.bin, "/checkout", self.probe)
+        self.assertEqual(findings, [])
+        _, findings = runner.preflight(meta(), self.bin, "/checkout", self.probe)
+        self.assertEqual([f["code"] for f in findings], ["platform_not_applicable"])
 
     def test_expected_version_follows_the_build_script(self):
         self.assertEqual(runner.version_from_describe("0.1.0-5-gabcdef1"), "0.1.5")
@@ -151,6 +164,34 @@ class PreflightTests(unittest.TestCase):
         self.assertIsNone(runner.version_from_describe("release-5-gabcdef1"))
         self.assertTrue(runner.terminal.at_least("4.0.4", "4.0"))
         self.assertFalse(runner.terminal.at_least("3.9.9", "4.0"))
+
+
+class UserTests(unittest.TestCase):
+    def test_the_scenario_user_is_dropped_to_without_setpriv_on_macos(self):
+        linux, mac = runner.scenario_user("linux"), runner.scenario_user("macos")
+        self.assertEqual(linux.prefix[0], "setpriv")
+        self.assertEqual(mac.prefix[:2], [sys.executable, "-c"])
+        self.assertEqual(mac.prefix[3:], [str(mac.uid), str(mac.gid)])
+        # The shim clears supplementary groups, then the group, then the user, and execs.
+        code = mac.prefix[2]
+        self.assertLess(code.index("setgroups"), code.index("setgid"))
+        self.assertLess(code.index("setgid"), code.index("setuid"))
+        self.assertIn("execvp", code)
+
+
+class ProcessScanTests(unittest.TestCase):
+    def test_macos_processes_are_found_by_marker_and_owner(self):
+        root = "/private/tmp/bzs-abc"
+        names = ("  101   -2 bzbd\n  102   -2 pueued\n  103  501 bzbd\n  104    0 sleep\n  105    0 sh\n"
+                 "  106   -2 python3.13\n")
+        environ = (f"  101 /tmp/bzs-abc/bin/bzbd HOME=/x {runner.MARKER}={root}\n"
+                   "  102 pueued -d -c x PATH=/bin\n"
+                   f"  104 sleep 86400 A=1 {runner.MARKER}={root} B=2\n"
+                   f"  105 sh -c x {runner.MARKER}={root}-other\n"
+                   "  106 python3.13 x\n")
+        found = runner.parse_ps(names, environ, root, 4294967294)
+        self.assertEqual([(p["pid"], p["comm"]) for p in found], [(101, "bzbd"), (102, "pueued"), (104, "sleep")])
+        self.assertTrue(all(p["umask"] is None for p in found))
 
 
 class FakeProcesses:

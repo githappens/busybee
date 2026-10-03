@@ -113,6 +113,11 @@ def literals(repo, state, record):
               record["worker"]: "vm-name", record["run_id"]: "run-id", record["candidate"]: "baseline"}
     for key in ("vm_id", "baseline_vm_id", "snapshot_id", "reset_snapshot_id"):
         values[record[key]] = "vm-id"
+    # The account a macOS baseline's key logs into (NixOS guests use root).
+    candidate = Path(state) / "templates" / record["template"] / "candidates" / record["candidate"] / "candidate.json"
+    user = json.loads(candidate.read_text()).get("guest_user") if candidate.is_file() else None
+    if user:
+        values[user] = "guest-user"
     return values
 
 

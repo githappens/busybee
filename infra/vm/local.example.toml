@@ -41,9 +41,18 @@ storage_gib = 16
 artifact_mib = 2048
 
 # Baselines, by guest OS. Each manifest path is relative to state_dir and is
-# written by template validation (busybee.vm.template/v1).
+# written by template promotion (busybee.vm.template/v2).
 [templates.linux]
 manifest = "templates/linux/manifest.json"
 
+# macOS guests boot only from full clones (APFS makes them copy-on-write), and
+# the lab leases one long-lived macOS guest instead of cloning per run.
+# `template build macos` clones `source`, an operator-prepared macOS VM (Nix,
+# SSH, passwordless sudo for `user`), which the controller first reaches with
+# `bootstrap_key` (relative to state_dir) and then never again.
 [templates.macos]
 manifest = "templates/macos/manifest.json"
+clone_strategy = "full"
+# source = "<your prepared macOS VM>"
+# user = "<its lab account>"
+# bootstrap_key = "keys/<private key authorized for that account>"

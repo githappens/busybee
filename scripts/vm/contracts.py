@@ -21,6 +21,11 @@ RESULT_STATES = ("success", "product_failure", "environment_failure", "timeout",
 
 CLONE_STRATEGIES = ("linked", "full")
 GUEST_OS = ("linux", "macos")
+# Parallels accepts a linked macOS clone, but its macOS engine attaches only
+# the clone's empty overlay disk and the guest never boots.
+UNSUPPORTED_CLONE_MODES = {"macos": ("linked",)}
+# The leased macOS guest's VM name prefix; it is one VM for many runs.
+SLOT_PREFIX = "busybee-lab-macos-"
 STATE_ROOT = Path("build/vm")
 
 # Inclusive bounds. Deadlines are seconds; every one is finite and nested:
@@ -121,13 +126,32 @@ def config_errors(config, repo):
         errors.append(("config_invalid", "[templates] must be a table"))
         templates = {}
     for name, entry in templates.items():
-        if name not in GUEST_OS or not isinstance(entry, dict) or set(entry) != {"manifest"} \
-                or not isinstance(entry["manifest"], str):
-            errors.append(("config_invalid", f"[templates.{name}] needs exactly a manifest path, "
-                                             f"and the name must be one of {', '.join(GUEST_OS)}"))
-        elif state and not (state / entry["manifest"]).resolve().is_relative_to(state):
-            errors.append(("config_invalid", f"[templates.{name}] manifest must stay inside state_dir"))
+        # macOS baselines are prepared from an operator's VM (`source`), which
+        # the lab account `user` reaches with `bootstrap_key` until the
+        # candidate has its own keys.
+        allowed = {"manifest", "clone_strategy"} | ({"source", "user", "bootstrap_key"} if name == "macos" else set())
+        if name not in GUEST_OS or not isinstance(entry, dict) or "manifest" not in entry or set(entry) - allowed \
+                or not all(isinstance(v, str) for v in entry.values()):
+            errors.append(("config_invalid", f"[templates.{name}] takes a manifest path and optionally "
+                                             f"{', '.join(sorted(allowed - {'manifest'}))} as strings, and the name "
+                                             f"must be one of {', '.join(GUEST_OS)}"))
+            continue
+        for key in ("manifest", "bootstrap_key"):
+            if key in entry and state and (Path(entry[key]).is_absolute()
+                                           or not (state / entry[key]).resolve().is_relative_to(state)):
+                errors.append(("config_invalid", f"[templates.{name}] {key} must stay inside state_dir"))
+        if strategy in CLONE_STRATEGIES and clone_strategy(config, name) in UNSUPPORTED_CLONE_MODES.get(name, ()):
+            errors.append(("clone_mode_unsupported", f"{name} guests do not boot from {clone_strategy(config, name)} "
+                                                     f"clones; set [templates.{name}] clone_strategy = \"full\""))
+        elif entry.get("clone_strategy", strategy) not in CLONE_STRATEGIES:
+            errors.append(("clone_mode_unsupported", f"[templates.{name}] clone_strategy is not one of "
+                                                     f"{', '.join(CLONE_STRATEGIES)}"))
     return errors
+
+
+def clone_strategy(config, name):
+    """How `name` workers are cloned: the template's own setting, else the global one."""
+    return config.get("templates", {}).get(name, {}).get("clone_strategy", config.get("clone_strategy"))
 
 
 def manifest_errors(manifest):
@@ -152,6 +176,9 @@ def manifest_errors(manifest):
     modes = manifest["clone_modes"]
     if not isinstance(modes, list) or not modes or not set(modes) <= set(CLONE_STRATEGIES):
         errors.append(f"clone_modes must be a non-empty subset of {', '.join(CLONE_STRATEGIES)}")
+    elif set(modes) & set(UNSUPPORTED_CLONE_MODES.get(manifest["os"], ())):
+        errors.append(f"clone_modes must not list {', '.join(UNSUPPORTED_CLONE_MODES[manifest['os']])} "
+                      f"for a {manifest['os']} baseline")
     for key in ("lock_hashes", "tools"):
         if not isinstance(manifest[key], dict):
             errors.append(f"{key} must be an object")
@@ -185,6 +212,9 @@ def worker_errors(record):
         errors.append(f"schema must be {WORKER_SCHEMA}")
     if not valid_run_id(record["run_id"]):
         errors.append("run_id is malformed")
+    elif record["template"] == "macos":
+        if not str(record["worker"]).startswith(SLOT_PREFIX):
+            errors.append("a macOS worker must be the leased slot guest")
     elif record["worker"] != worker_name(record["run_id"]):
         errors.append("worker name does not belong to this run")
     for key in ("vm_id", "baseline_vm_id", "snapshot_id", "reset_snapshot_id"):

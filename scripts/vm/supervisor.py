@@ -28,6 +28,7 @@ import time
 
 import contracts
 import guest
+import lease
 import parallels
 import template
 import worker
@@ -35,24 +36,28 @@ import worker
 KILL_WAIT_S = 5
 
 
-def alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
-
-
-def ensure(state, run_id, argv, wait_s=10):
-    """Start the run's supervisor unless one holds its lock. `argv` runs it."""
+def ensure(state, run_id, argv, wait_s=10, lease=None):
+    """Start the run's supervisor unless one holds its lock. `argv` runs it.
+    `lease`, the macOS slot's held lock file, is inherited by the supervisor,
+    which holds the lease from then on."""
     rdir = worker.run_dir(state, run_id)
     lock = rdir / "supervisor.lock"
+    until = time.monotonic() + wait_s
+    # A supervisor started meanwhile by reconciliation, without the lease, gives
+    # way at once (worker.rehold); the one holding the lease must still start.
+    while lease and worker.held(lock) and time.monotonic() < until:
+        time.sleep(0.1)
     if worker.held(lock):
+        if lease:
+            raise worker.Refused("supervisor_unavailable", f"run {run_id} has a supervisor that does not hold "
+                                 "its lease")
         return
+    fds = (lease.fileno(),) if lease else ()
+    if lease:
+        argv = [*argv, "--lease-fd", str(lease.fileno())]
     with open(rdir / "supervisor.log", "ab") as log:
-        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        child = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+                                 pass_fds=fds)
     until = time.monotonic() + wait_s
     while time.monotonic() < until:
         # Watching, or already done because nothing was left to watch.
@@ -64,12 +69,21 @@ def ensure(state, run_id, argv, wait_s=10):
     raise worker.Refused("supervisor_unavailable", f"run {run_id}'s supervisor did not start; see its supervisor.log")
 
 
-def serve(workers, run_id):
-    """The supervisor process: tick until there is nothing left to watch."""
+def serve(workers, run_id, lease_fd=None):
+    """The supervisor process: tick until there is nothing left to watch. A
+    macOS run's supervisor holds the slot's lease: inherited from `worker
+    create` as `lease_fd`, or taken back on a restart while the run still
+    holds it."""
     lock = worker.run_dir(workers.state, run_id) / "supervisor.lock"
     with worker.locked(lock, wait=False) as got:
         if not got:
             return  # another supervisor already watches this run
+        record = worker._load(worker.run_dir(workers.state, run_id) / "worker.json")
+        held = None
+        if record and record["template"] == "macos" and lease_fd is None:
+            held = workers.rehold(run_id)
+            if held is None:
+                return  # the lease is gone; rehold recorded why
         workers.event(run_id, "supervisor_started", pid=os.getpid())
         watch = Supervisor(workers, run_id)
         while True:
@@ -84,7 +98,7 @@ def serve(workers, run_id):
 
 
 class Supervisor:
-    def __init__(self, workers, run_id, alive=alive):
+    def __init__(self, workers, run_id, alive=lease.alive):
         self.w, self.run_id = workers, run_id
         self.clock = workers.clock
         self.alive = alive
@@ -98,7 +112,7 @@ class Supervisor:
     def tick(self):
         """One pass over the run. Returns whether there is anything left to watch."""
         record = self._record()
-        if self.w.reg.get(contracts.worker_name(self.run_id)) is None or record is None \
+        if not self.w.claimed(self.run_id) or record is None \
                 or record["status"] == "destroyed":
             return False
         if record["status"] in ("ready", "provisioning") and self.clock() >= worker.run_deadline(record):
@@ -179,7 +193,8 @@ class Supervisor:
         g = self._connect("cleanup")
         files = (worker.guest_file(self.run_id, name, "status"), worker.guest_file(self.run_id, name, "pid"))
         # The query ends in `true`: any other status means ssh never reached the guest.
-        return worker.parse_after_exec(g.run(worker._after_exec(*files), self.w._bound("command"))[1])
+        return worker.parse_after_exec(g.run(worker._after_exec(*files, self.w.checkout(self._record())),
+                                             self.w._bound("command"))[1])
 
     def _outcome(self, name, state, after, status, summary, findings, enforced_by=None):
         command = worker._load(self._edir(name) / "command.json")
@@ -314,7 +329,7 @@ class Supervisor:
                 _, _, missing = self.w.collect_run(record)
             if record["status"] in ("ready", "provisioning"):
                 try:
-                    self.w.halt(record["worker"])
+                    self.w.halt(record)
                 except parallels.ParallelsError as err:
                     missing.append(f"halting the worker failed: {err}")
                 record["status"] = "expired"
@@ -325,7 +340,7 @@ class Supervisor:
         with worker.locked(self.w._lock(self.run_id), wait=False) as got:
             if got:
                 self.w._window("cleanup")
-                self.w.halt(self._record()["worker"])
+                self.w.halt(self._record())
                 self.w.event(self.run_id, "halted", reason="an operation that started the halted worker ended")
 
     def _interrupted(self):
