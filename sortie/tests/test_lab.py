@@ -84,13 +84,14 @@ class Tracker:
 
 class DispatchTests(unittest.TestCase):
     def setUp(self):
-        self.capabilities = {"worker:linux": "", "worker:macos": "no promoted macos baseline",
-                             "controller:session": "", "controller:verify": ""}
+        self.capabilities = {"worker:linux": "", "worker:macos": "", "controller:session": "",
+                             "controller:gate": "", "controller:verify": "",
+                             "controller:terminal": "no terminal support in this controller"}
         self.tracker = Tracker(
-            [lab_issue(10), lab_issue(11), lab_issue(12, body="**Lab requires:** worker:macos"),
+            [lab_issue(10), lab_issue(11), lab_issue(12, body="**Lab requires:** controller:terminal"),
              lab_issue(13, body="Lab requires: worker:windows"),
              lab_issue(14, milestone="another milestone"), lab_issue(15, labels=("sortie:ready", "epic")),
-             lab_issue(16, labels=("sortie:ready", "sortie"), body="Lab requires: worker:macos, controller:verify")],
+             lab_issue(16, labels=("sortie:ready", "sortie"), body="Lab requires: controller:terminal, controller:verify")],
             blocked_by={11: [9], 10: [8]}, merged={8})
         self.original = lab.api, lab.available_capabilities
         lab.api = self.tracker
@@ -109,9 +110,9 @@ class DispatchTests(unittest.TestCase):
         self.assertEqual(self.release(dry_run=True), [
             "#10: eligible",
             "#11: waiting for merged prerequisites [9]",
-            "#12: capability worker:macos is unavailable: no promoted macos baseline",
+            "#12: capability controller:terminal is unavailable: no terminal support in this controller",
             "#13: unsupported capability worker:windows",
-            "#16: capability worker:macos is unavailable: no promoted macos baseline",
+            "#16: capability controller:terminal is unavailable: no terminal support in this controller",
         ])
         # A dry run changes nothing, and unrelated issues are never touched.
         self.assertEqual(self.tracker.writes, [])
@@ -132,9 +133,18 @@ class DispatchTests(unittest.TestCase):
                          "the linux baseline VM or snapshot no longer exists")
 
     def test_every_dispatch_needs_a_linux_worker_and_sessions(self):
-        self.assertEqual(lab.required_capabilities(lab_issue(1)), ["controller:session", "worker:linux"])
+        # A session works in a Linux worker; its handoff is verified on Linux and macOS by the gate.
+        defaults = ["controller:gate", "controller:session", "worker:linux", "worker:macos"]
+        self.assertEqual(lab.required_capabilities(lab_issue(1)), defaults)
         self.assertEqual(lab.required_capabilities(lab_issue(1, body="**Lab requires:** worker:macos,terminal")),
-                         ["controller:session", "terminal", "worker:linux", "worker:macos"])
+                         sorted(defaults + ["terminal"]))
+
+    def test_no_dispatch_when_the_handoff_could_not_be_verified(self):
+        self.capabilities["worker:macos"] = "no promoted macos baseline"
+        with self.assertRaises(ValueError) as raised:
+            lab.check(10)
+        self.assertEqual(str(raised.exception),
+                         "#10: capability worker:macos is unavailable: no promoted macos baseline")
 
     def test_capabilities_come_from_the_controller_doctor(self):
         doctor = {"data": {"templates": {"linux": {"state": "ready"}, "macos": {"state": "missing"}},

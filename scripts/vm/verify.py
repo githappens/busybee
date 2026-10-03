@@ -17,6 +17,14 @@ source, or evidence that was not collected makes it `incomplete`; nothing
 substitutes for the missing platform. A product failure, such as a known
 regression's red scenario, keeps it `failed`. Scenarios that cover no issue
 check the harness itself and are not part of the matrix.
+
+A matrix is bound to what produced it, so the evidence gate (gate.py) can
+tell current evidence from stale: its role (`candidate`, or `base` for the
+red run), the source revision with the candidate's patch or, for a base, the
+test overlay recorded apart from the product revision, the controller and
+scenario revision, and per platform the template baseline the worker came
+from. A scenario that drives a terminal is marked `ui`, with the terminals
+each run captured.
 """
 import getpass
 import json
@@ -33,6 +41,7 @@ import template
 import worker
 
 SCHEMA = "busybee.vm.verification/v1"
+ROLES = ("candidate", "base")
 # The repository's required checks (CI's), in the checkout's development shell.
 CHECKS = (("build", ["cargo", "build", "--workspace", "--bins"]),
           ("fmt", ["cargo", "fmt", "--all", "--check"]),
@@ -67,7 +76,7 @@ def _platform(ops, platform, revision, patch, findings):
                                           + "; ".join(f["message"] for f in created["findings"])))
         return {"status": "unavailable", "reason": created["findings"]}
     run_id = created["data"]["run_id"]
-    entry = {"status": "ran", "run_id": run_id, "head": None, "version": None, "binaries": {}, "checks": {},
+    entry = {"status": "ran", "run_id": run_id, "baseline": ops.baseline_of(run_id), "head": None, "version": None, "binaries": {}, "checks": {},
              "scenarios": {}, "not_applicable": [], "collected": None, "evidence": None}
     try:
         _checks(ops, platform, run_id, entry, findings)
@@ -105,8 +114,14 @@ def _checks(ops, platform, run_id, entry, findings):
         for mode in meta["required_modes"]:
             done = ops.scenario(run_id, scenario_id, mode)
             modes[mode] = {"status": done["status"], "exec": done["exec"], "failed": done["failed"],
-                           "binaries_match": done["busybee_sha256"] == entry["binaries"].get(BUSYBEE)}
-        entry["scenarios"][scenario_id] = {"issue": meta["issue"], "modes": modes}
+                           "binaries_match": done["busybee_sha256"] == entry["binaries"].get(BUSYBEE),
+                           "terminals": done["terminals"]}
+        entry["scenarios"][scenario_id] = {"issue": meta["issue"], "ui": ui(meta), "modes": modes}
+
+
+def ui(meta):
+    """Whether a scenario observes the interface through a real terminal."""
+    return "zellij" in meta.get("tools", {})
 
 
 def _dispose(ops, platform, run_id, entry, findings):
@@ -162,14 +177,18 @@ def verdict(matrix, findings):
     return "failed" if "product_failure" in statuses else "verified"
 
 
-def run(ops, platforms, revision, patch, out_dir):
-    """Verify `revision` (and `patch`) on `platforms`; `ops` reaches the workers."""
+def run(ops, platforms, revision, patch, out_dir, overlay=None, role="candidate"):
+    """Verify `revision` (and `patch`) on `platforms`; `ops` reaches the workers.
+    A `base` run takes a test `overlay` instead of a patch, recorded apart."""
+    if role not in ROLES or (overlay and (patch or role != "base")):
+        raise ValueError("an overlay belongs to a base run without a patch")
     vid = contracts.new_run_id()
     path = Path(out_dir) / "verifications" / vid / "matrix.json"
     findings = []
-    source = {"revision": revision, "patch_sha256": worker._sha256(Path(patch).read_bytes()) if patch else None}
-    matrix = {"schema": SCHEMA, "id": vid, "source": source, "required_platforms": platforms,
-              "platforms": {}, "verdict": None}
+    digest = lambda f: worker._sha256(Path(f).read_bytes()) if f else None  # noqa: E731
+    source = {"revision": revision, "patch_sha256": digest(patch), "overlay_sha256": digest(overlay)}
+    matrix = {"schema": SCHEMA, "id": vid, "role": role, "source": source, "controller": ops.controller(),
+              "required_platforms": platforms, "platforms": {}, "verdict": None}
     unusable = {p: ops.baseline(p) for p in platforms}
     for platform, problems in unusable.items():
         if problems:
@@ -178,12 +197,13 @@ def run(ops, platforms, revision, patch, out_dir):
                                               + "; ".join(p["message"] for p in problems)))
     if not findings:
         for platform in platforms:
-            matrix["platforms"][platform] = _platform(ops, platform, revision, patch, findings)
+            matrix["platforms"][platform] = _platform(ops, platform, revision, patch or overlay, findings)
     matrix["verdict"] = verdict(matrix, findings)
     matrix["findings"] = findings
     evidence.durable(path, (json.dumps(matrix, indent=2) + "\n").encode())
     # For publishing: run identities and machine values become placeholders.
     runs = {e["run_id"]: "run-id" for e in matrix["platforms"].values() if e.get("run_id")}
+    runs.update({e["baseline"]: "baseline" for e in matrix["platforms"].values() if e.get("baseline")})
     runs.update({getpass.getuser(): "user", socket.gethostname().split(".")[0]: "host"})
     public = path.with_name("matrix.public.json")
     evidence.durable(public, evidence.Redactor(runs).json(path.read_bytes()))
@@ -212,6 +232,12 @@ class WorkerOps:
     def checkout(self, run_id):
         return self.w.checkout(self.w._owned(run_id)[1])
 
+    def baseline_of(self, run_id):
+        return self.w._owned(run_id)[1]["candidate"]
+
+    def controller(self):
+        return scenario._controller(self.repo)
+
     def exec(self, run_id, argv, cwd):
         # As long as a scenario may take: a workspace build or test run is not one command's worth.
         done = self.w.exec(run_id, argv, cwd, {}, self.w.config["deadlines"]["scenario"])
@@ -224,7 +250,8 @@ class WorkerOps:
         tools = ((record.get("result") or {}).get("preflight") or {}).get("tools", {})
         return {"status": done["status"], "exec": done["data"]["exec"],
                 "failed": [a["name"] for a in done["data"]["assertions"] if a["status"] == "failed"],
-                "busybee_sha256": tools.get("busybee", {}).get("sha256")}
+                "busybee_sha256": tools.get("busybee", {}).get("sha256"),
+                "terminals": sorted((record.get("terminals") or {}).keys())}
 
     def destroy(self, run_id):
         return self.w.destroy(run_id)

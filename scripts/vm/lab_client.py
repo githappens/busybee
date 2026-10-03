@@ -7,7 +7,8 @@ through the socket in $BUSYBEE_LAB_SOCKET; the broker serves it for this
 worker only. Prints the JSON result; exits 0 on success, 1 otherwise, 2 on
 usage errors. Standard library only.
 
-  lab inspect | console | collect | checkpoint | reset | fetch | handoff
+  lab inspect | console | collect | checkpoint | reset | fetch | verification
+  lab handoff [--overlay PATH...]   (verified when the turn ends; review only if accepted)
   lab signal SIGNAL PID
   lab exec [--cwd D] [--env N=V] [--timeout S] [--detach] -- ARGV...
   lab status EXEC | wait EXEC [--timeout S] | read EXEC stdout|stderr [--offset N]
@@ -56,8 +57,10 @@ def parser():
     root.add_argument("--run", help="address a run explicitly (only this worker's is served)")
     root.add_argument("--target", help="address a target explicitly (only 'worker' is served)")
     ops = root.add_subparsers(dest="op", required=True)
-    for name in ("inspect", "collect", "checkpoint", "reset", "fetch", "handoff"):
+    for name in ("inspect", "collect", "checkpoint", "reset", "fetch", "verification"):
         ops.add_parser(name)
+    ops.add_parser("handoff").add_argument("--overlay", nargs="+", default=[], metavar="PATH",
+                                           help="test files the base's red run takes from this branch")
     ops.add_parser("console")
     sig = ops.add_parser("signal")
     sig.add_argument("signal")
@@ -146,6 +149,8 @@ def build(args, command):
         a = {"scenario": args.scenario, "mode": args.mode, "bin_dir": args.bin_dir}
     elif op == "push":
         a = {"force_with_lease": args.force_with_lease}
+    elif op == "handoff":
+        a = {"overlay": args.overlay}
     elif op == "pr":
         op = f"pr-{args.action}"
         if args.action == "create":

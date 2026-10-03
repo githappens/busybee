@@ -90,6 +90,41 @@ class CIReviewTests(unittest.TestCase):
         self.assertEqual(result["model"], "claude-opus-5-5")
         self.assertEqual(result["effort"], "high")
 
+    def test_unchanged_review_evidence_stays_settled(self):
+        head = "a" * 40
+        repo = {"full_name": "example/tool"}
+        pr = {"number": 7, "state": "open", "draft": False, "user": {"login": "author"}, "title": "Fix", "body": "",
+              "head": {"sha": head, "ref": "sortie-lab/72", "repo": repo}, "base": {"sha": "b" * 40, "repo": repo}}
+
+        def comment(cid, body, login="author", kind="User"):
+            return {"id": cid, "user": {"login": login, "type": kind}, "author_association": "OWNER", "body": body}
+
+        def evidence(cid, verdict, evidence_id="e"):
+            header = {"head": head, "base": "f" * 40, "issue": 72, "verdict": verdict,
+                      "evidence_id": evidence_id * 64}
+            return comment(cid, f"<!-- {reviews.LAB_MARKER} {json.dumps(header, sort_keys=True)} -->\nbody")
+        packet = {"repo": "example/tool", "pr": 7, "issue": 72, "head": head, "base": "b" * 40, "metadata": pr,
+                  "contracts": [], "prior_comments": [evidence(1, "verified"), comment(2, "Declined: out of scope")],
+                  "skill_sha256": {s: "c" * 64 for s in reviews.SKILLS}, "policy_sha256": "d" * 64}
+        checks = [{"id": i, "name": n, "head_sha": head, "status": "completed", "conclusion": "success",
+                   "app": {"slug": "github-actions"}} for i, n in enumerate(reviews.REQUIRED_CHECKS, 1)]
+        settled = reviews.input_id(packet)
+        # The same head, replies and gate verdict: the cached judgement stands; no session runs.
+        self.assertFalse(ci.review_needed(packet, {"input_id": settled}, checks))
+        packet["prior_comments"].append(comment(3, "Review ready", login="github-actions[bot]", kind="Bot"))
+        self.assertEqual(reviews.input_id(packet), settled)
+        # Changed relevant evidence is judged again: new lab evidence, a new reply, a new head.
+        for change in (lambda p: p["prior_comments"].append(evidence(4, "preexisting_failures", "f")),
+                       lambda p: p["prior_comments"].append(comment(5, "Declined: the spec says otherwise")),
+                       lambda p: p.update(head="e" * 40)):
+            changed = json.loads(json.dumps(packet))
+            change(changed)
+            self.assertNotEqual(reviews.input_id(changed), settled)
+        self.assertTrue(ci.review_needed(packet, None, checks))
+        # A lab head without accepted evidence is not judged at all.
+        packet["prior_comments"] = [evidence(1, "failed")]
+        self.assertFalse(ci.review_needed(packet, None, checks))
+
     def test_stale_or_missing_structured_result_cannot_pass(self):
         for output in ('{}', 'not-json', json.dumps({"head": "b" * 40, "verdict": "READY", "findings": [], "report": "Ready"})):
             result = ci.normalize("success", output, "session", "a" * 40, "hash")

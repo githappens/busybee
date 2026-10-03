@@ -73,6 +73,9 @@ class RealSessionTests(unittest.TestCase):
         git("init", "-q", "--bare", str(origin))
         # main is this revision, so the guard sees only what the agent changes.
         git("-C", str(REPO), "push", "-q", str(origin), f"{self.head}:refs/heads/main", f"{self.head}:refs/heads/seed")
+        # A task checkout clones the repository with its tags, which `git describe`
+        # versions the build from; the scenarios' preflight checks that version.
+        git("-C", str(REPO), "push", "-q", str(origin), "--tags")
         self.workspace = self.tmp / "ws"
         git("clone", "-q", "--branch", "main", str(origin), str(self.workspace))
         git("-C", str(self.workspace), "checkout", "-q", "-b", BRANCH, "origin/seed")
@@ -267,7 +270,9 @@ class RealSessionTests(unittest.TestCase):
         ]
         for outcome, script, how in cases:
             with self.subTest(outcome=outcome):
-                run_id = self.start()["run_id"]
+                # No scenario names the synthetic issue: only an infrastructure
+                # session hands off a head on passing checks alone.
+                run_id = self.start("infrastructure" if outcome == "success" else "product")["run_id"]
                 if "cancel_after" in how:
                     runner = self.agent(script, background=True)
                     time.sleep(how["cancel_after"])
@@ -279,9 +284,86 @@ class RealSessionTests(unittest.TestCase):
                 self.assertTrue(turn["finished"], turn)
                 end = self.end()
                 self.assertEqual((end["outcome"], end["run_id"]), (outcome, run_id), end)
+                if outcome == "success":
+                    # Handed off only once the gate accepted the head on both platforms.
+                    self.assertEqual(self.attempt()["verification"]["verdict"], "checks_only")
+                    self.assertEqual((self.workspace / ".sortie" / "status").read_text(), "needs-human-review\n")
                 self.assertEqual(code, {"timeout": 124, "cancelled": 143, "adapter_failure": 127}.get(outcome, 0))
                 public = json.loads((STATE / end["exported"] / "manifest.json").read_text())
                 self.assertEqual(public["missing"], [])
+
+    def test_a_claim_of_success_is_handed_off_only_on_evidence(self):
+        self.start("infrastructure")
+        # The agent claims success for a head that breaks formatting.
+        code = self.agent("""
+            sed -i 's/^fn main() {/fn  main() {/' crates/bzbd/src/main.rs
+            git -c user.name=Fixture -c user.email=fixture@example.test commit -qam 'misformatted'
+            lab push > /dev/null
+            printf 'Closes #990079\\n' > /var/tmp/body.md
+            lab pr create --title fix --body-file /var/tmp/body.md > /dev/null
+            lab pr ready > /dev/null
+            lab handoff
+        """)
+        self.assertEqual(code, 0, self.last_log)
+        status = self.workspace / ".sortie" / "status"
+        self.assertFalse(status.exists(), status.read_text() if status.exists() else None)
+        verification = self.attempt()["verification"]
+        self.assertEqual(verification["verdict"], "failed")
+        record = json.loads((STATE / verification["record"]).read_text())
+        refused = [f["message"] for f in record["findings"] if f["code"] == "new_failure"]
+        self.assertTrue(any("linux fmt" in m for m in refused) and any("macos fmt" in m for m in refused), refused)
+        gh = json.loads((self.tmp / "gh.json").read_text())
+        self.assertEqual(gh["prs"][0].get("comments", []), [])
+        # The next turn is a fresh worker: the agent reads why, fixes it and asks again.
+        code = self.agent("""
+            lab verification > $OUT/verification.json
+            python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print("verdict", r["data"]["verdict"])' \\
+                $OUT/verification.json
+            git -c user.name=Fixture -c user.email=fixture@example.test revert --no-edit HEAD > /dev/null
+            lab push > /dev/null
+            lab handoff
+        """)
+        self.assertEqual(code, 0, self.last_log)
+        self.assertIn("verdict failed", self.last_log)
+        self.assertEqual(self.attempt("0001")["end"]["outcome"], "unverified")
+        self.assertEqual(status.read_text(), "needs-human-review\n")
+        comments = json.loads((self.tmp / "gh.json").read_text())["prs"][0]["comments"]
+        self.assertEqual(len(comments), 1)
+        header = json.loads(comments[0].splitlines()[0].split(" ", 2)[2].rsplit(" -->", 1)[0])
+        self.assertEqual(header["head"], git("-C", str(self.workspace), "rev-parse", "HEAD"))
+        self.assertEqual((header["verdict"], header["profile"]), ("checks_only", "infrastructure"))
+        self.assertEqual(self.end()["outcome"], "success")
+
+    @unittest.skipUnless(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"), "needs a Claude credential in the environment")
+    def test_a_model_agent_hands_off_through_the_gate(self):
+        # A real model-backed Claude turn in the worker: it changes the branch,
+        # opens and readies the PR and asks for review; the gate decides.
+        self.start("infrastructure")
+        prompt = ("You work in a disposable VM on branch sortie-lab/990079 of busybee; `lab` is on your PATH. "
+                  "Do exactly this with the Bash tool, then stop: create PILOT.md containing the line "
+                  "'model-backed lab turn'; commit it with `git -c user.name=Lab -c user.email=lab@example.test "
+                  "commit`; run `lab push`; write 'Closes #990079' to /var/tmp/body.md; run `lab pr create "
+                  "--title 'lab: model pilot' --body-file /var/tmp/body.md`; run `lab pr ready`; run "
+                  "`lab handoff`. Report the final output of `lab handoff`.")
+        code = self.agent("", argv=["claude", "-p", prompt, "--permission-mode", "bypassPermissions",
+                                      "--allowedTools", "Bash", "--max-turns", "30", "--output-format", "json"])
+        self.assertEqual(code, 0, self.last_log)
+        turn = self.attempt()["turns"][-1]
+        self.assertEqual((turn["runner"], turn["kind"]), ("claude", "exited"), turn)
+        self.assertIn('"type":"result"', self.last_log.replace(" ", ""))
+        self.assertEqual(git("-C", str(self.workspace), "show", "HEAD:PILOT.md").strip(), "model-backed lab turn")
+        verification = self.attempt()["verification"]
+        self.assertEqual(verification["verdict"], "checks_only", verification)
+        self.assertEqual((self.workspace / ".sortie" / "status").read_text(), "needs-human-review\n")
+        comments = json.loads((self.tmp / "gh.json").read_text())["prs"][0]["comments"]
+        self.assertEqual(len(comments), 1)
+        # The credential reached the turn only: never the session's or the runs' records.
+        secret = os.environ["CLAUDE_CODE_OAUTH_TOKEN"].encode()
+        for root in (STATE / "sessions" / str(ISSUE), STATE / "runs" / self.attempt()["run_id"]):
+            for path in root.rglob("*"):
+                if path.is_file():
+                    self.assertNotIn(secret, path.read_bytes(), path.name)
+        self.assertEqual(self.end()["outcome"], "success")
 
 
 if __name__ == "__main__":

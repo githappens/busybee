@@ -392,6 +392,16 @@ class CliTests(unittest.TestCase):
             self.assertEqual((result["operation"], result["status"]), ("verify", "environment_failure"))
             self.assertEqual({f["code"] for f in result["findings"]}, {"config_missing"})
 
+    def test_gate_is_implemented(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.run_cli("--json", "gate", "--issue", "69", "--revision", "HEAD",
+                               "--config", str(Path(tmp) / "absent.toml"))
+            self.assertEqual(out.returncode, vmctl.EXIT_FAILED, out.stderr)
+            result = json.loads(out.stdout)
+            self.assertEqual((result["operation"], result["status"]), ("gate", "environment_failure"))
+            self.assertEqual({f["code"] for f in result["findings"]}, {"config_missing"})
+        self.assertIn("gate", vmctl.CAPABILITIES)
+
     def test_template_operations_need_a_valid_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = self.run_cli("--json", "template", "build", "linux", "--arch", "aarch64",

@@ -23,6 +23,13 @@ loaded from.
   the host from the workspace, so the guest never holds GitHub credentials.
   The agent's model credentials reach it per turn in a tmpfs file it removes
   before starting.
+- **Handoff.** An agent's request for review is a claim, not evidence. When
+  its turn ends, the attempt's worker is released and the evidence gate
+  (gate.py) verifies the pushed head and its merge base with main on Linux and
+  macOS in the lab's own workers. Only a head the gate accepts is handed to
+  review, with its public evidence posted on the PR; otherwise the result is
+  recorded for the agent's next turn, in a fresh worker. Verification that
+  cannot complete for the same head twice blocks the attempt with its cause.
 - **Exits.** Every attempt ends with an outcome, its worker destroyed (or
   retained with what it could not collect) and its public evidence exported.
   An attempt nobody closed is closed as `interrupted` by the next `start`.
@@ -46,6 +53,7 @@ import time
 
 import contracts
 import evidence
+import gate
 import guest
 import parallels
 import scenario
@@ -55,8 +63,13 @@ import worker
 
 SCHEMA = "busybee.lab.session/v1"
 BRANCH_PREFIX = "sortie-lab/"
-# How an attempt ended. Only `success` handed a pushed head to review.
-OUTCOMES = ("success", "blocked", "no_handoff", "timeout", "cancelled", "adapter_failure", "interrupted")
+# How an attempt ended. Only `success` handed a pushed head to review;
+# `unverified` asked for review of a head the evidence gate did not accept.
+OUTCOMES = ("success", "blocked", "unverified", "no_handoff", "timeout", "cancelled", "adapter_failure",
+            "interrupted")
+# How often verification of one head may end incomplete before the attempt is
+# blocked on its environment rather than asked to try again.
+VERIFY_LIMIT = 2
 # The agent's own conversation state, kept across worker replacement so a
 # resumed turn finds its session (relative to the guest account's home).
 AGENT_STATE = (".claude/projects", ".codex/sessions")
@@ -65,11 +78,17 @@ CREDENTIALS = {"claude": ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHR
                "codex": ("OPENAI_API_KEY", "CODEX_API_KEY")}
 # The development shell each runner's command runs in; others use the default one.
 AGENT_SHELL = {"claude": ".#worker-agent", "codex": ".#worker-agent"}
+# What a runner needs to be told about the guest it runs in. The agent is root
+# there, and Claude Code skips its permission prompts as root only when told
+# it runs in a sandbox, which a disposable worker is.
+RUNNER_ENV = {"claude": {"IS_SANDBOX": "1"}}
 PROTOCOL_LIMIT = 64 * 1024 * 1024
 MARGIN_S = worker.KILL_GRACE_S + 30
 LAB_CLIENT = Path(__file__).resolve().parent / "lab_client.py"
 TURN_RELAY = Path(__file__).resolve().parent / "turn_relay.py"
 SORTIE_FILES = ("status", "blocker.md")
+# A path a test overlay may name: relative, inside the checkout.
+OVERLAY_PATH = re.compile(r"^(?!/)(?!.*(?:^|/)\.\.(?:/|$)).+$")
 
 
 class SessionError(Exception):
@@ -216,6 +235,12 @@ class Controller:
     def export(self, run_id):
         return self.w.export(run_id)
 
+    def gate(self, issue, revision, base, overlay, source_repo, branch, profile):
+        """The evidence gate on the lab's own workers; the revisions come from
+        the session's workspace."""
+        self.w.source_repo, self.w.transfer_refs = Path(source_repo), (f"refs/heads/{branch}",)
+        return gate.evaluate(gate.WorkerOps(self.w), issue, revision, base, overlay, profile=profile)
+
     def collected(self, run_id):
         latest = worker._latest_dir(worker.run_dir(self.state, run_id) / "collect")
         return latest / "collected.json" if latest and (latest / "collected.json").is_file() else None
@@ -348,6 +373,7 @@ class Sessions:
         name = f"{session['attempts']:04d}"
         attempt = {"attempt": name, "run_id": None, "started_at": _now(), "profile": session["profile"],
                    "source": None, "synced": None, "turns": [], "resets": [], "reset_requested": False,
+                   "handoff_requested": None, "released": None, "verification": None,
                    "handoff": None, "blocked": None, "violation": None, "conflict": None, "end": None}
         session["attempt"] = name
         self._save(session, attempt)
@@ -525,7 +551,16 @@ class Sessions:
                 raise worker.Refused("attempt_missing", f"#{issue} has no open attempt; the before_run hook "
                                      "starts one")
             record = self.c.record(attempt["run_id"])
-            if record is None or record["status"] != "ready":
+            if attempt.get("released"):
+                # Released for verification: the attempt ends as the gate decided.
+                self._end(session)
+                attempt = self._open(session)
+                try:
+                    self._allocate(session, attempt)
+                except SessionError as err:
+                    self.note(err.result["summary"])
+                    return 1
+            elif record is None or record["status"] != "ready":
                 state = record["status"] if record else "missing"
                 self.note(f"worker {attempt['run_id']} is {state}; replacing it with a fresh one from the workspace")
                 self._end(session, "timeout" if state == "expired" else "adapter_failure", f"the worker was {state}")
@@ -578,7 +613,7 @@ class Sessions:
             self._forget(gdir, attempt)
             return finish("adapter_failure", 1, f"the worker did not take the turn: {err}")
         exports = {"BUSYBEE_SORTIE_WORKER": "1", "BUSYBEE_LAB_SOCKET": f"{gdir}/broker.sock",
-                   "BUSYBEE_LAB_ISSUE": str(issue), "BUSYBEE_LAB_RUN": run_id}
+                   "BUSYBEE_LAB_ISSUE": str(issue), "BUSYBEE_LAB_RUN": run_id, **RUNNER_ENV.get(runner, {})}
         if session["pr"]:
             exports["BUSYBEE_LAB_PR"] = str(session["pr"])
         command = (f"d={q(gdir)}; set -a; . \"$d/env\"; set +a; rm -f \"$d/env\"; "
@@ -638,6 +673,11 @@ class Sessions:
             for sig, handler in previous.items():
                 signal.signal(sig, handler)
         turn["sync"] = self._after_turn(session, attempt, gdir)
+        if attempt["handoff_requested"]:
+            if attempt["reset_requested"]:  # the worker is released instead
+                attempt["reset_requested"] = False
+                turn["reset"] = {"at": _now(), "status": "skipped", "summary": "the turn asked for a handoff"}
+            turn["handoff"] = self._gated_handoff(session, attempt, turn["sync"])
         if attempt["reset_requested"]:
             if turn["sync"]["status"] in ("synced", "unchanged"):
                 turn["reset"] = self._reset(session, attempt)
@@ -723,6 +763,136 @@ class Sessions:
             self.note(f"reset of worker {attempt['run_id']}: {entry['summary']}")
         return entry
 
+    # Handing a head to review, on evidence
+
+    def _gated_handoff(self, session, attempt, sync):
+        """The handoff an agent asked for, once its turn ended: release the
+        worker, verify the head against its base, and hand it to review only
+        when the evidence gate accepts it. Returns what happened."""
+        request, attempt["handoff_requested"] = attempt["handoff_requested"], None
+        workspace, issue = Path(session["workspace"]), session["issue"]
+        head = _git(workspace, "rev-parse", "HEAD").stdout.decode().strip()
+        entry = {"at": _now(), "requested": request["sha"], "status": None, "summary": None}
+
+        def done(status, summary):
+            entry.update(status=status, summary=summary)
+            self._save(session, attempt)
+            self.note(f"handoff {status}: {summary}")
+            return entry
+        if sync["status"] not in ("synced", "unchanged") or head != request["sha"] or workspace_diff(workspace):
+            return done("skipped", f"the branch is not the requested {request['sha'][:12]} any more (checkpoint "
+                        f"{sync['status']}); push and ask again")
+        attempt["released"] = self._release(attempt)
+        try:
+            _git(workspace, "fetch", "-q", "origin", "main")
+            base = _git(workspace, "merge-base", "refs/remotes/origin/main", head).stdout.decode().strip()
+            overlay = self._overlay(session, base, head, request["overlay"])
+        except (RuntimeError, ValueError) as err:
+            return done("environment_failure", f"no base to verify against: {err}")
+        try:
+            result = self.c.gate(issue, head, base, overlay, workspace, session["branch"], session["profile"])
+        except (worker.Refused, guest.GuestError, parallels.ParallelsError, template.DeadlineExceeded, OSError,
+                ValueError, RuntimeError) as err:  # recorded as verification that could not complete
+            result = contracts.result("gate", "environment_failure", "verification did not run", [
+                contracts.finding("gate_failed", f"{type(err).__name__}: {err}")], {"verdict": "incomplete"})
+        record = self._record_verification(session, head, base, request, result)
+        verdict = result["data"].get("verdict")
+        attempt["verification"] = {"head": head, "base": base, "verdict": verdict, "record": record,
+                                   "gate": result["data"].get("gate")}
+        self._save(session, attempt)
+        if not gate.accepted(verdict, session["profile"]):
+            failed = [f for f in result["findings"] if f["severity"] == "error"]
+            summary = f"verification of {head[:12]} is {verdict}: " + "; ".join(
+                f"{f['code']}: {f['message']}" for f in failed[:5])
+            tries = [v for v in self._verifications(issue) if v["head"] == head and v["verdict"] in
+                     ("incomplete", "stale")]
+            if verdict in ("incomplete", "stale") and len(tries) >= VERIFY_LIMIT:
+                self._block(session, attempt, f"Verification of {head} could not complete {len(tries)} times; the "
+                            f"cause is the lab environment, not the change.\n\n" + "\n".join(
+                                f"- {f['code']}: {f['message']}" for f in failed) +
+                            f"\n\nRetained evidence: {record} and {result['data'].get('gate')} under the lab "
+                            "state directory.\n")
+                return done("blocked", summary)
+            return done("refused", summary)
+        try:
+            self._post_evidence(session, request, result)
+            self._handoff(session, request["pr"])
+        except RuntimeError as err:
+            return done("environment_failure", f"{head[:12]} is {verdict} but the handoff failed: {err}")
+        attempt["handoff"] = {"sha": head, "pr": request["pr"], "at": _now(), "verdict": verdict}
+        return done("success", f"{head[:12]} is {verdict}; handed PR #{request['pr']} to review")
+
+    def _release(self, attempt):
+        """Destroy the attempt's worker so verification can use the lab's."""
+        try:
+            destroyed = self.c.destroy(attempt["run_id"])
+            return {"at": _now(), "status": destroyed["status"], "summary": destroyed["summary"]}
+        except (worker.Refused, guest.GuestError, parallels.ParallelsError, template.DeadlineExceeded) as err:
+            return {"at": _now(), "status": "environment_failure", "summary": str(err)}
+
+    def _overlay(self, session, base, head, paths):
+        """The candidate's changes to `paths` since `base`, as a patch file the
+        base run applies: a new regression test on old code."""
+        if not paths:
+            return None
+        diff = _git(Path(session["workspace"]), "diff", "--binary", base, head, "--", *paths).stdout
+        if not diff:
+            raise ValueError(f"the overlay paths {', '.join(paths)} have no changes since {base[:12]}")
+        path = self._sdir(session["issue"]) / "overlays" / f"{_sha256(diff)}.patch"
+        _write(path, diff)
+        return path
+
+    def _verifications(self, issue):
+        vdir = self._sdir(issue) / "verifications"
+        return [json.loads(p.read_text()) for p in sorted(vdir.glob("*.json"))] if vdir.is_dir() else []
+
+    def _record_verification(self, session, head, base, request, result):
+        vdir = self._sdir(session["issue"]) / "verifications"
+        path = vdir / f"{len(self._verifications(session['issue'])) + 1:04d}.json"
+        _write(path, {"at": _now(), "head": head, "base": base, "pr": request["pr"], "overlay": request["overlay"],
+                      "verdict": result["data"].get("verdict"), "status": result["status"],
+                      "summary": result["summary"], "findings": result["findings"], "gate": result["data"]})
+        return str(path.relative_to(self.state))
+
+    def _block(self, session, attempt, reason):
+        sortie = Path(session["workspace"]) / ".sortie"
+        sortie.mkdir(exist_ok=True)
+        _write(sortie / "blocker.md", reason.encode())
+        _write(sortie / "status", b"blocked\n")
+        attempt["blocked"] = reason.splitlines()[0][:300]
+
+    def _gh(self, session, *args, stdin=None):
+        done = subprocess.run([self.gh, *args], cwd=session["workspace"], input=stdin, capture_output=True, text=True,
+                              timeout=120)
+        if done.returncode != 0:
+            raise RuntimeError(f"gh {' '.join(args[:2])} failed: {done.stderr.strip()[-300:]}")
+        return done.stdout
+
+    def _post_evidence(self, session, request, result):
+        """The gate's public record on the PR, once per piece of evidence."""
+        body = gate.comment(json.loads((self.state / result["data"]["public"]).read_text()))
+        marker = body.splitlines()[0]
+        view = json.loads(self._gh(session, "pr", "view", str(request["pr"]), "--json", "author,comments"))
+        author = (view.get("author") or {}).get("login")
+        if any((c.get("body") or "").splitlines()[:1] == [marker] and (c.get("author") or {}).get("login") == author
+               for c in view.get("comments", [])):
+            return  # already there: unchanged evidence is not posted again
+        self._gh(session, "pr", "comment", str(request["pr"]), "--body-file", "-", stdin=body)
+
+    def _reviews(self, session, *args):
+        env = dict(os.environ)
+        if os.sep in self.gh:  # an explicit gh, which the trusted helper must use too
+            env["PATH"] = f"{Path(self.gh).parent}{os.pathsep}{env.get('PATH', '')}"
+        done = subprocess.run([sys.executable, str(self.code / "sortie" / "reviews.py"), "handoff", *args],
+                              cwd=session["workspace"], capture_output=True, text=True, timeout=120, env=env)
+        if done.returncode != 0:
+            raise RuntimeError(done.stderr.strip()[-500:] or done.stdout.strip())
+        return done.stdout.strip()
+
+    def _handoff(self, session, pr):
+        repo = self._gh(session, "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").strip()
+        return self._reviews(session, "--repo", repo, "--pr", str(pr))
+
     # Ending an attempt
 
     def end(self, workspace, outcome=None, reason=None):
@@ -748,6 +918,9 @@ class Sessions:
         head = _git(Path(session["workspace"]), "rev-parse", "HEAD").stdout.decode().strip()
         if attempt["handoff"] and attempt["handoff"]["sha"] == head:
             return "success", f"handed {head} to review"
+        if attempt.get("verification"):
+            v = attempt["verification"]
+            return "unverified", f"verification of {v['head']} was {v['verdict']} ({v['record']})"
         if record and record["status"] == "expired":
             return "timeout", "the worker reached its run deadline"
         if not attempt["turns"]:
@@ -810,17 +983,31 @@ class Sessions:
         return end
 
     def status(self, issue):
+        """The run-result view: every attempt's worker and outcome, and the
+        latest verification with what it rests on."""
         session = self.load(issue)
         if session is None:
             raise worker.Refused("session_missing", f"#{issue} has no session")
-        attempts = []
+        attempts, lines = [], []
         for path in sorted((self._sdir(issue) / "attempts").glob("*/attempt.json")):
             a = json.loads(path.read_text())
             attempts.append({"attempt": a["attempt"], "run_id": a["run_id"], "turns": len(a["turns"]),
-                             "end": a["end"]})
-        return contracts.result("session status", "success", f"#{issue}: {len(attempts)} attempt(s), "
-                                f"{'one open' if session['attempt'] else 'none open'}",
-                                data={**session, "attempt_records": attempts})
+                             "verification": a.get("verification"), "end": a["end"]})
+            end = a["end"] or {}
+            lines.append(f"attempt {a['attempt']}: {len(a['turns'])} turn(s), worker "
+                         f"{end.get('worker_status') or 'held'}, {end.get('outcome') or 'open'}"
+                         + (f" ({end['reason']})" if end.get("reason") else ""))
+        verifications = self._verifications(issue)
+        if verifications:
+            v = verifications[-1]
+            lines.append(f"verification {v['head'][:12]} against {v['base'][:12]}: {v['verdict']} "
+                         f"(gate {v['gate'].get('gate')})")
+            lines += [f"  {f['code']}: {f['message']}" for f in v["findings"] if f["severity"] == "error"][:10]
+        summary = f"#{issue}, PR {session['pr'] or 'none'}: {len(attempts)} attempt(s), " \
+                  f"{'one open' if session['attempt'] else 'none open'}"
+        return contracts.result("session status", "success", summary, data={
+            **session, "attempt_records": attempts, "view": lines,
+            "latest_verification": verifications[-1] if verifications else None})
 
 
 class Broker:
@@ -829,7 +1016,7 @@ class Broker:
     WORKER_OPS = ("inspect", "signal", "exec", "status", "wait", "read", "terminal-open", "terminal-send",
                   "terminal-resize", "terminal-capture", "console-capture", "scenario", "collect")
     SESSION_OPS = ("checkpoint", "reset", "fetch", "push", "pr-status", "pr-create", "pr-ready", "pr-comment",
-                   "pr-view", "handoff")
+                   "pr-view", "handoff", "verification")
 
     def __init__(self, sessions, session, attempt):
         self.s, self.session, self.attempt = sessions, session, attempt
@@ -951,8 +1138,15 @@ class Broker:
         return self._ok("pr-status", f"{len(found)} open pull request(s) for {self.session['branch']}",
                         {"recorded": self.session["pr"], "open": found})
 
+    def _reserved(self, body):
+        # Only the controller posts evidence; an agent's text cannot pose as it.
+        if gate.MARKER in body:
+            raise worker.Refused("evidence_marker_reserved", f"{gate.MARKER} marks the controller's own "
+                                 "verification evidence; an agent's text may not carry it")
+
     def op_pr_create(self, title, body):
         """Reuse the branch's pull request; open a draft only when there is none."""
+        self._reserved(title + body)
         found = self._open_prs()
         if found:
             self._record_pr(found[0]["number"])
@@ -970,6 +1164,7 @@ class Broker:
         return self._ok("pr-ready", f"#{number} is ready for review", {"pr": number})
 
     def op_pr_comment(self, body):
+        self._reserved(body)
         number = self._pr()
         self._gh("pr", "comment", str(number), "--body-file", "-", stdin=body)
         return self._ok("pr-comment", f"commented on #{number}", {"pr": number})
@@ -980,24 +1175,45 @@ class Broker:
                                    "number,url,state,isDraft,headRefOid,reviews,comments,statusCheckRollup"))
         return self._ok("pr-view", f"#{number}", view)
 
-    def op_handoff(self):
-        """The trusted handoff, on the host workspace, once it holds the pushed head."""
+    def op_handoff(self, overlay=()):
+        """Ask for review of the pushed head. Checked now, done when the turn
+        ends: the worker is released and the head verified (gate.py) first.
+        `overlay` names test files whose candidate version the base run uses."""
+        if not isinstance(overlay, (list, tuple)) or not all(
+                isinstance(p, str) and OVERLAY_PATH.match(p) for p in overlay):
+            raise worker.Refused("request_invalid", "overlay names paths relative to the checkout")
         outcome = self.s.sync(self.session, self.attempt)
         if outcome["status"] not in ("synced", "unchanged"):
             return self._failed("handoff", f"checkpoint_{outcome['status']}", outcome["message"], outcome)
+        if workspace_diff(self._workspace()):
+            return self._failed("handoff", "handoff_refused", "the branch has uncommitted changes; commit and push "
+                                "them, since only a pushed head is verified and reviewed")
         number = self._pr()
         repo = self._gh("repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner").strip()
-        env = dict(os.environ)
-        if os.sep in self.s.gh:  # an explicit gh, which the trusted helper must use too
-            env["PATH"] = f"{Path(self.s.gh).parent}{os.pathsep}{env.get('PATH', '')}"
-        done = subprocess.run([sys.executable, str(self.s.code / "sortie" / "reviews.py"), "handoff", "--repo", repo,
-                               "--pr", str(number)], cwd=self._workspace(), capture_output=True, text=True,
-                              timeout=120, env=env)
-        if done.returncode != 0:
-            return self._failed("handoff", "handoff_refused", done.stderr.strip()[-500:] or done.stdout.strip())
-        self.attempt["handoff"] = {"sha": outcome["head"], "pr": number, "at": _now()}
+        try:
+            self.s._reviews(self.session, "--check", "--repo", repo, "--pr", str(number))
+        except RuntimeError as err:
+            return self._failed("handoff", "handoff_refused", str(err))
+        # An earlier head's handoff no longer stands for this branch.
+        for name in ("status", "scm.json"):
+            stale = self._workspace() / ".sortie" / name
+            if name == "scm.json" or (stale.is_file() and stale.read_text().strip() == "needs-human-review"):
+                stale.unlink(missing_ok=True)
+        self.attempt["handoff_requested"] = {"sha": outcome["head"], "pr": number, "overlay": list(overlay),
+                                             "at": _now()}
         self.s._save(self.session, self.attempt)
-        return self._ok("handoff", done.stdout.strip(), {"pr": number, "sha": outcome["head"]})
+        return self._ok("handoff", f"scheduled: when this turn ends the worker is released and {outcome['head'][:12]} "
+                        "is verified on Linux and macOS against its merge base with main; it goes to review only if "
+                        "the evidence gate accepts it. End the turn now; the next turn's `lab verification` shows a "
+                        "refusal and why.", {"scheduled": True, "pr": number, "sha": outcome["head"]})
+
+    def op_verification(self):
+        """The session's latest verification: verdict, findings and records."""
+        found = self.s._verifications(self.session["issue"])
+        if not found:
+            return self._failed("verification", "verification_missing", "no head of this session was verified yet")
+        latest = found[-1]
+        return self._ok("verification", f"{latest['head'][:12]}: {latest['verdict']}", latest)
 
     # Transport: one JSON request and one JSON reply per connection
 

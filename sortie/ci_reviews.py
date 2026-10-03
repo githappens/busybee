@@ -11,7 +11,7 @@ import sys
 import zipfile
 
 from reviews import (EFFORT, MODEL, SKILLS, api, checks_for, ci_errors,
-                     collect_packet, input_id, paged_objects, publish_decision,
+                     collect_packet, input_id, lab_errors, paged_objects, publish_decision,
                      read_pr, result_errors, reviewable)
 
 WORKFLOW = ".github/workflows/agent-review-gate.yml"
@@ -110,6 +110,15 @@ def select(args):
     output("prs", json.dumps([pr["number"] for pr in candidates if reviewable(pr)]))
 
 
+def review_needed(packet, record, checks):
+    """Whether to start the model sessions: only for inputs with no settled
+    record, current-head CI that passed, and, for a lab PR, accepted lab
+    evidence. Unchanged inputs keep their judgement."""
+    settled = isinstance(record, dict) and record.get("input_id") == input_id(packet)
+    return (not settled and not ci_errors(packet["head"], checks) and not lab_errors(packet)
+            and reviewable(packet["metadata"]))
+
+
 def prepare(args):
     pr = read_pr(args.repo, args.pr)
     if not reviewable(pr):
@@ -123,7 +132,7 @@ def prepare(args):
     args.directory.mkdir(parents=True, exist_ok=True)
     (args.directory / "packet.json").write_text(json.dumps(packet, indent=2) + "\n")
     (args.directory / "record.json").write_text(json.dumps(record, indent=2) + "\n")
-    needed = record is None and not ci_errors(packet["head"], checks) and reviewable(packet["metadata"])
+    needed = record is None and review_needed(packet, record, checks)
     flags = ["--model", MODEL, "--effort", EFFORT, "--max-turns", "100", "--restricted",
              "--tools", "Read,Glob,Grep", "--allowedTools", "Read,Glob,Grep", "--permission-mode", "dontAsk",
              "--setting-sources", "user", "--disable-slash-commands", "--strict-mcp-config",

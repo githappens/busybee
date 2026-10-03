@@ -10,8 +10,9 @@ operations, and Linux workers with `exec`, `inspect`, `signal`, `console
 capture`, `collect`, run supervision, exec handles (`status`, `wait`, `read`),
 the public `export`, Linux regression `scenario` runs and the `terminal`
 operations (`scripts/vm/vmctl.py`, `tests/scenarios/`), macOS workers and
-`verify`, and issue sessions that run the lab dispatcher's agents in their own
-workers (§Agent sessions) have shipped.
+`verify`, issue sessions that run the lab dispatcher's agents in their own
+workers (§Agent sessions), and the evidence `gate` every lab handoff passes
+(§Evidence required for a verified fix) have shipped.
 Until the rest lands, [CLAUDE.md](../../CLAUDE.md) and the
 [Sortie workflow](../../sortie/README.md) remain the operational instructions.
 
@@ -374,14 +375,26 @@ platform, a check that could not run (exit 127 is `tool_missing`), a head,
 version or binary that does not match, a worker that stopped serving mid-run
 (`interrupted`; it is still destroyed), or evidence that was not collected or
 exported makes it `incomplete`. The matrix is always written, with a
-`matrix.public.json` beside it whose run identities, user, host, addresses
-and home paths are placeholders.
+`matrix.public.json` beside it whose run identities, template baselines, user,
+host, addresses and home paths are placeholders. A matrix records what it is
+evidence for: its `role` (`candidate`, or `base` for a red run), the source
+revision with the candidate's patch or, for a base, a test overlay (`verify
+--overlay` is `--patch` recorded apart from the base revision), the
+controller and scenario revision, per platform the template baseline its
+worker came from, and per scenario whether it drives a terminal (`ui`) and
+the terminals each run captured.
+
+`gate --issue N --revision REV [--base REV] [--overlay FILE]` judges REV as
+a fix of issue N (§Evidence required for a verified fix): it verifies the
+candidate and its base (default: the merge base with origin/main), or reuses
+complete matrices already bound to exactly that evidence, and writes
+`gates/<id>/gate.json` with a `gate.public.json` beside it.
 
 The unit tests under `scripts/vm/tests` need no Parallels. The acceptance tests
 that build, validate and compare real candidates, and drive real workers, run
 against the local config when opted in: `BUSYBEE_VM_LAB=1 python3 -m unittest
 test_real_template test_real_worker test_real_supervision test_real_scenarios
-test_real_terminal test_real_macos test_real_session` in that directory;
+test_real_terminal test_real_macos test_real_session test_real_gate` in that directory;
 `BUSYBEE_VM_LAB_ROOT` names another worktree of the repository that holds the
 lab state. The scenario runner's own tests need neither:
 `python3 -m unittest discover -s tests/scenarios/tests`.
@@ -406,7 +419,9 @@ the controller; `scripts/vm/session.py` connects the two through `vmctl session`
 when every native blocker was completed by a merged PR into `main` and every
 capability it needs is available now. Every issue needs `worker:linux` and
 `controller:session`; an issue body adds more on a `Lab requires:` line (for
-example `**Lab requires:** worker:macos`). Availability comes from the trusted
+example `**Lab requires:** controller:terminal`). Every issue also needs
+`worker:macos` and `controller:gate`, since its handoff is verified on both
+platforms (§Evidence required for a verified fix). Availability comes from the trusted
 controller's read-only `doctor`: `worker:<os>` is the promoted baseline being
 `ready`, and `controller:<name>` is an operation that controller provides. An
 unknown capability is `unsupported`; a missing one names its cause. `release
@@ -437,7 +452,7 @@ agent's saved conversation state (`.claude/projects`, `.codex/sessions` in the
 guest home) is restored, so a resumed turn finds its session in a new worker.
 `after_run` runs `session end`. Concurrency stays one active worker; a
 session holds its worker only during an attempt, never while its PR waits for
-review.
+review, and releases it before its handoff is verified.
 
 **Turns.** Sortie's agent command is `vmctl session agent -- <runner argv>`,
 run in the workspace. It runs the runner in the worker over SSH, in the
@@ -451,7 +466,9 @@ Model credentials named for the runner (`CLAUDE_CODE_OAUTH_TOKEN`,
 `CODEX_API_KEY`) reach the turn through a mode-0600 file under `/run` (tmpfs)
 that the turn deletes before the runner starts; a runner without one fails the
 turn (`credentials_missing`) rather than running unauthenticated. Nothing
-else from the dispatcher's environment enters the guest. No
+else from the dispatcher's environment enters the guest. The agent is root in
+its guest, so a Claude turn runs with `IS_SANDBOX=1`, without which Claude
+Code refuses to skip its permission prompts as root. No
 credential is written to the worker's disk, its snapshots, the run's evidence
 or the session's records. Sortie's generated `--mcp-config` names a host-side
 tool server and is dropped, with a notice. A turn is bounded by `timeout(1)`
@@ -480,12 +497,13 @@ and stages the `lab` client (`scripts/vm/lab_client.py`) on its PATH. Every
 request is served for the attempt's own run: `exec`, `status`, `wait`, `read`,
 `terminal open|send|resize|capture`, `inspect`, `signal`, `console`,
 `scenario` and `collect` call the worker operations above; `checkpoint`,
-`reset`, `fetch`, `push`, `pr status|create|ready|comment|view` and `handoff`
-act for the session. A request naming another run (`target_not_assigned`),
+`reset`, `fetch`, `push`, `pr status|create|ready|comment|view`, `handoff` and
+`verification` act for the session. A request naming another run (`target_not_assigned`),
 any target but the worker (`host_target_refused`) or another operation
 (`operation_not_permitted`) is refused. Pushes go only to the session's branch
 and pull-request calls only to its PR, from the host workspace with the
-dispatcher's GitHub identity; `pr create` reuses the branch's open PR. Inside
+dispatcher's GitHub identity; `pr create` reuses the branch's open PR, and
+neither it nor `pr comment` accepts text carrying the evidence marker. Inside
 its guest the agent is root and needs no permission to install tools, restart
 daemons or break things. `reset` is applied when the turn ends, since it
 restarts the guest the agent runs in: the work is checkpointed, the worker
@@ -495,12 +513,31 @@ failure), the reset is skipped and recorded as such. A reset also marks the
 run's terminals collected before it as final, since the restore removes them
 from the guest.
 
+**Handoff.** `handoff [--overlay PATH...]` is a request, checked at once
+(the workspace holds the pushed head of a ready PR, with nothing uncommitted)
+and carried out when the turn ends, after the checkpoint: the attempt's
+worker is collected and destroyed, origin/main is fetched, and the evidence
+gate judges the head against its merge base with main (`gate`, with the
+candidate's changes to the overlay paths as the base's test overlay). The
+session's records keep each result (`sessions/<issue>/verifications/`). A
+head the gate accepts gets its public record posted on the PR, once per
+piece of evidence, and then the trusted `reviews.py handoff` writes
+`.sortie/status`. Otherwise nothing is handed off; the next turn finds the
+attempt released, closes it `unverified` and continues in a fresh worker,
+where `verification` returns the verdict and its findings. A head whose
+verification ends `incomplete` or `stale` twice blocks the attempt with the
+cause and the retained records in `.sortie/blocker.md` rather than asking
+again. A new handoff request removes an older head's `needs-human-review`.
+
 **Exits.** `session end` checkpoints a ready worker, derives the outcome
 unless one is given, destroys the worker (collecting first; a collection that
 fails retains it, stopped) and exports its public evidence. Outcomes:
-`success` (handoff of the current head), `blocked`, `no_handoff`, `timeout`,
+`success` (handoff of the current head, accepted by the gate), `blocked`,
+`unverified` (a handoff the gate did not accept), `no_handoff`, `timeout`,
 `cancelled`, `adapter_failure` (including a worker that could not be created)
-and `interrupted`. `sessions/<issue>/attempts/<n>/attempt.json` records the
+and `interrupted`. `session status --issue N` is the run-result view: each
+attempt's turns, worker and outcome, and the latest verification's verdict
+and findings. `sessions/<issue>/attempts/<n>/attempt.json` records the
 run, every turn, every reset and checkpoint, and the end: outcome, reason,
 the worker's final state, and the collected manifest and public export.
 
@@ -723,6 +760,47 @@ A verified fix has a regression that fails on the relevant base and passes on
 the candidate, required platform checks on the candidate revision, appropriate
 UI inspection, and confirmed cleanup. Skipped prerequisites, screenshots of a
 fixture alone, or a success message from the agent are insufficient evidence.
+
+The evidence gate (`scripts/vm/gate.py`, `busybee.vm.gate/v1`) applies this
+to two platform matrices, the candidate's and its base's:
+
+- **Bound.** The candidate matrix is for the committed head with no patch, the
+  base matrix for its merge base with main and the declared test overlay, both
+  from the current controller and scenario revision and the promoted template
+  baselines. A new commit, a rebase, a moved main, another controller or a new
+  baseline makes earlier evidence `stale`.
+- **Complete.** Both platforms ran; every required check and every scenario
+  that names an issue has an outcome in each required mode, and a scenario
+  that does not apply on a platform is declared not applicable there, never
+  inferred from a missing result. A skip, timeout or environment failure, a
+  scenario that ran another binary, a terminal scenario without captured
+  terminals, public evidence missing from disk, or a worker not collected and
+  destroyed makes it `incomplete`.
+- **A fix.** The regressions are the scenarios that name the issue and, with
+  an overlay, `cargo test`: each must fail on the base and pass on the
+  candidate. Any other candidate failure the base does not share is `failed`.
+  A failure the base shares, such as a known product bug in another issue, is
+  listed under `preexisting` and the verdict is `preexisting_failures`, which
+  may go to review with that list in its evidence; it is never dropped.
+- **No regression declared.** When no scenario names the issue and no overlay
+  is given, nothing shows a red base: passing checks are `checks_only`, which
+  is not a verified fix. Its evidence says so in its first lines.
+
+`verified` and `preexisting_failures` pass for every session. `checks_only`
+passes only for an `infrastructure` session (`sortie/guard-policy.json`),
+whose lab or harness work owes no product regression; a product session must
+name its regression, through a scenario or `handoff --overlay`. The gate reads its evidence and
+changes none of it, so a refusal keeps every matrix and run for diagnosis.
+Complete matrices bound to the same evidence are reused, so unchanged
+evidence is not verified twice: a candidate that was verified or that a gate
+accepted, and a base whether it passed or failed. A refused candidate is verified again when its handoff is
+asked for again, so a flaky check does not stick to an unchanged head;
+incomplete matrices are never reused. The pull-request
+comment that carries the public record starts with `<!-- busybee-lab-evidence:v1
+{head, base, issue, verdict, evidence_id, profile} -->`; the CI review gate
+requires one by the PR's author, for the current head, with a verdict that
+passes for its profile, before it reviews or approves a `sortie-lab/` PR
+([review workflow](../development/agent-review.md)).
 
 ## Implementation sequence
 

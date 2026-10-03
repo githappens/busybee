@@ -12,6 +12,13 @@ reviews = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reviews)
 
 
+def lab_comment(comment_id, head, verdict, login="author", evidence="e", profile="product"):
+    header = {"head": head, "base": "f" * 40, "issue": 72, "verdict": verdict, "evidence_id": evidence * 64,
+              "profile": profile}
+    return {"id": comment_id, "user": {"login": login, "type": "User"}, "author_association": "OWNER",
+            "body": f"<!-- {reviews.LAB_MARKER} {json.dumps(header, sort_keys=True)} -->\n**Lab evidence**\n"}
+
+
 class ReviewGateTests(unittest.TestCase):
     def setUp(self):
         self.head, self.base = "a" * 40, "b" * 40
@@ -21,10 +28,12 @@ class ReviewGateTests(unittest.TestCase):
             "head": {"sha": self.head, "ref": "sortie-lab/72", "repo": {"full_name": "example/tool"}},
             "base": {"sha": self.base, "ref": "main", "repo": {"full_name": "example/tool"}},
         }
+        # A lab PR (sortie-lab/) carries the lab controller's evidence for its head.
+        self.evidence = lab_comment(1, self.head, "verified")
         self.packet = {
             "repo": "example/tool", "pr": 123, "issue": 72, "head": self.head, "base": self.base,
             "metadata": self.pr, "contracts": [{"issue": {"title": "Task", "body": "Contract"}, "comments": []}],
-            "prior_comments": [], "skill_sha256": {s: "c" * 64 for s in reviews.SKILLS},
+            "prior_comments": [self.evidence], "skill_sha256": {s: "c" * 64 for s in reviews.SKILLS},
             "policy_sha256": "d" * 64,
         }
         self.record = {
@@ -114,6 +123,44 @@ class ReviewGateTests(unittest.TestCase):
         self.assertEqual(reviews.input_id(self.packet), before)
         self.packet["prior_comments"].append({"id": 2, "user": {"login": "author", "type": "User"}, "body": "Declined: the issue requires this"})
         self.assertNotEqual(reviews.input_id(self.packet), before)
+
+    def test_lab_prs_are_approved_only_on_controller_evidence_for_their_head(self):
+        self.assertEqual(reviews.lab_evidence(self.packet)["verdict"], "verified")
+        for name, comments in (
+                ("none", []),
+                ("an earlier head", [lab_comment(1, "e" * 40, "verified")]),
+                ("refused by the gate", [lab_comment(1, self.head, "failed")]),
+                ("incomplete", [lab_comment(1, self.head, "incomplete")]),
+                ("not by the PR's author", [lab_comment(1, self.head, "verified", login="someone")]),
+                ("superseded by a refusal", [self.evidence, lab_comment(2, self.head, "stale")])):
+            with self.subTest(name):
+                self.packet["prior_comments"] = comments
+                self.record["input_id"] = reviews.input_id(self.packet)
+                verdict, reasons = reviews.evaluate(self.packet, self.record, self.checks)
+                self.assertEqual(verdict, "WAITING", reasons)
+                self.assertIn("lab evidence", " ".join(reasons))
+        # Pre-existing failures the base shares are listed in the evidence, and pass.
+        self.packet["prior_comments"] = [lab_comment(1, self.head, "preexisting_failures")]
+        self.record["input_id"] = reviews.input_id(self.packet)
+        self.assertEqual(self.decision(), "READY")
+        # Passing checks with no regression shown pass only for an infrastructure issue.
+        for profile, expected in (("product", "WAITING"), ("infrastructure", "READY")):
+            self.packet["prior_comments"] = [lab_comment(1, self.head, "checks_only", profile=profile)]
+            self.record["input_id"] = reviews.input_id(self.packet)
+            self.assertEqual(self.decision(), expected, profile)
+        # A PR that is not a lab session's needs none.
+        self.pr["head"]["ref"] = "feature/fix"
+        self.packet["prior_comments"] = []
+        self.record["input_id"] = reviews.input_id(self.packet)
+        self.assertEqual(self.decision(), "READY")
+
+    def test_missing_lab_evidence_revokes_an_earlier_approval(self):
+        post = self.publish()[0]
+        self.assertEqual(post["event"], "APPROVE")
+        self.packet["prior_comments"] = []
+        self.record["input_id"] = reviews.input_id(self.packet)
+        prior = [dict(post, id=10, state="APPROVED", user={"login": "github-actions[bot]"})]
+        self.assertEqual(self.publish(prior=prior)[0]["event"], "REQUEST_CHANGES")
 
     def test_unrelated_base_advance_does_not_invalidate_same_delta(self):
         before = reviews.input_id(self.packet)

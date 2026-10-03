@@ -15,9 +15,12 @@ The lab profile dispatches and reviews issues for the
 owned Linux worker: the `before_run` and `after_run` hooks open and close the
 attempt, and every agent turn runs in the worker through `vmctl session
 agent` (see [Agent sessions](../docs/design/agent-lab.md#agent-sessions)).
-It needs the lab's local configuration and a promoted Linux baseline in this
-checkout, and the runner's model credential in the launcher's environment
-(`CLAUDE_CODE_OAUTH_TOKEN` or an API key; Codex: `OPENAI_API_KEY`).
+It needs the lab's local configuration and promoted Linux and macOS baselines
+in this checkout, and the runner's model credential in the launcher's
+environment (`CLAUDE_CODE_OAUTH_TOKEN` or an API key; Codex: `OPENAI_API_KEY`).
+An agent's `lab handoff` reaches review only after the controller's evidence
+gate has verified the pushed head against its base on both platforms
+([evidence](../docs/design/agent-lab.md#evidence-required-for-a-verified-fix)).
 
 ## Start and validate
 
@@ -55,8 +58,9 @@ Issue states are `sortie:ready`, `sortie:working`, `sortie:review`, and
 `sortie:done`; the `sortie` marker enables dispatch. Sortie owns state changes.
 The lab controller rejects tracking/parked issues and requires prerequisites
 to be completed by a merged PR into `main`, not merely closed, and the worker
-capabilities the issue needs (a `Lab requires:` line adds to the default
-`worker:linux`) to be available. Its dependency release sidecar runs once per
+capabilities the issue needs (a `Lab requires:` line adds to the defaults
+`worker:linux`, `worker:macos`, `controller:session` and `controller:gate`) to
+be available. Its dependency release sidecar runs once per
 minute. An issue labelled `area:harness` runs with the `infrastructure`
 profile; any other with `product`, whose session refuses changes to the paths
 in `sortie/guard-policy.json`. The product profile retains its existing
@@ -82,6 +86,26 @@ private Pueue/bzbd state. The Claude machine-safety hook is a cooperative guard,
 not a security boundary. `isolated.sh` points `PUEUE_CONFIG_PATH` at a generated
 workspace-local YAML file; `test-isolated-launcher.sh` drives a real Pueue
 through it and fails when Pueue is missing. It is not a cold-start fixture.
+
+## Operating the lab profile
+
+`sortie/run-lab.sh` is the one entry point: it dispatches every eligible lab
+issue, and each attempt runs, verifies and hands off on its own. To see how an
+issue's runs ended, without opening a dashboard or a worker:
+
+```sh
+nix develop -c python3 scripts/vm/vmctl.py session status --issue NUMBER
+```
+
+It lists every attempt with its turns, worker and outcome, then the latest
+verification: head and base, verdict, and the findings it rests on. `--json`
+adds the records' paths under `build/vm/` (attempts, verifications, gates and
+the platform matrices with their public evidence). `vmctl status` accounts for
+every owned worker. To judge a revision by hand as the session would:
+
+```sh
+nix develop -c python3 scripts/vm/vmctl.py gate --issue NUMBER --revision REV [--base REV]
+```
 
 ## Review loop
 
