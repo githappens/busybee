@@ -241,10 +241,10 @@ class Workers(template.Lab):
     substitute them, and the clock and sleep that waits use."""
 
     def __init__(self, repo, config, prl, reg, free_gib, connect=None, supervise=None, clock=time.time,
-                 sleep=time.sleep, slot_wait_s=None, root=None, source_repo=None):
+                 sleep=time.sleep, slot_wait_s=None, root=None):
         super().__init__(repo, config, prl, reg, root=root)
         # Where revisions come from: the lab checkout, or an issue session's workspace.
-        self.source_repo = Path(source_repo) if source_repo else self.root
+        self.source_repo = self.root
         # Refs the source bundle also carries. A bare revision is no ref, so a
         # source without tags (an issue workspace) needs one or git refuses
         # the bundle as empty.

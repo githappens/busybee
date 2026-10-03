@@ -37,7 +37,6 @@ import re
 import shlex
 import shutil
 import signal
-import socket
 import socketserver
 import subprocess
 import sys
@@ -707,7 +706,10 @@ class Sessions:
         """The reset an agent asked for, once its turn ended: the worker returns
         to its baseline and takes the workspace's branch again."""
         attempt["reset_requested"] = False
-        result = self.c.reset(attempt["run_id"], session["workspace"], session["branch"])
+        try:
+            result = self.c.reset(attempt["run_id"], session["workspace"], session["branch"])
+        except (worker.Refused, guest.GuestError, parallels.ParallelsError, template.DeadlineExceeded) as err:
+            result = {"status": "environment_failure", "summary": f"the reset was not done: {err}"}
         entry = {"at": _now(), "status": result["status"], "summary": result["summary"]}
         if result["status"] == "success":
             try:

@@ -355,6 +355,18 @@ class ScopeTests(Harness):
         self.assertEqual(self.attempt()["resets"][0]["status"], "success", self.attempt()["resets"])
         self.assertEqual((Path(self.c.checkout(run_id)) / "local.txt").read_text(), "never pushed\n")
 
+    def test_a_reset_that_fails_is_recorded_and_the_turn_still_ends(self):
+        self.start()
+
+        def refused(run_id, source_repo, branch):
+            raise worker.Refused("run_deadline_passed", "the run ended")
+        self.c.reset = refused
+        self.assertEqual(self.turn("lab reset > /dev/null"), 0, self.err.getvalue())
+        turn = self.attempt()["turns"][-1]
+        self.assertTrue(turn["finished"])
+        self.assertEqual(turn["reset"]["status"], "environment_failure")
+        self.assertIn("the run ended", turn["reset"]["summary"])
+
     def test_a_reset_waits_for_a_checkpoint_that_kept_the_work(self):
         self.start()
         (self.workspace / "README").write_text("edited on the host\n")
