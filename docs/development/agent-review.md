@@ -150,12 +150,14 @@ conversation IDs do not transfer between providers. CI review remains the same.
 
 | Implementer | Sortie adapter and command | Qualification |
 |---|---|---|
-| Claude | `claude-code`, `claude` | Sortie 1.24 requires `bypassPermissions`; launcher restricts this profile to an allocated worker. |
-| Codex | `codex`, `codex app-server` | Host bootstrap default, with workspace sandbox and noninteractive approval policy. |
-| Cursor | `agent-client-protocol`, `agent acp` | Pinned Sortie 1.24.1 supports the adapter; unattended tools and permissions need worker qualification. |
+| Claude | `claude-code`, `claude` | Sortie 1.24 requires `bypassPermissions`; allowed only in the lab profile, whose turns run in an allocated worker. |
+| Codex | `codex`, `codex app-server` | Host bootstrap default for the product profile; in the lab profile it runs in the worker. |
+| Cursor | `agent-client-protocol`, `agent acp` | Pinned Sortie 1.24.1 supports the adapter; not yet qualified inside workers, so the lab profile refuses it. |
 
-The worker launcher sets `BUSYBEE_SORTIE_WORKER=1` inside its allocated guest.
-Do not set it on a shared host to bypass the environment check. Sortie's
+Lab turns run in the worker through `vmctl session agent`
+([agent sessions](../design/agent-lab.md#agent-sessions)), which sets
+`BUSYBEE_SORTIE_WORKER=1` inside the guest. Do not set it on a shared host to
+bypass the environment check. Sortie's
 `self_review` uses the author's context and does not replace these CI sessions.
 
 Sources: [Claude Actions](https://code.claude.com/docs/en/github-actions),

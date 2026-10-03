@@ -245,6 +245,24 @@ class CoverageTests(unittest.TestCase):
         self.assertTrue(evidence.coverage(records[1:] + records[:1])["s"]["verified"])
         self.assertEqual(evidence.coverage([]), {})
 
+    def test_coverage_counts_only_runs_of_the_current_head(self):
+        def run(mode, status, head):
+            return {"scenario": "s", "mode": mode, "status": status, "required_modes": ["cold", "prepared"],
+                    "provenance": {"head": head}}
+        # A cold pass on an old head cannot combine with a prepared pass on a new one.
+        records = [run("cold", "success", "old"), run("prepared", "success", "new")]
+        covered = evidence.coverage(records, head="new")["s"]
+        self.assertEqual((covered["head"], covered["modes"], covered["missing"]), ("new", {"prepared": "success"},
+                                                                                   ["cold"]))
+        self.assertFalse(covered["verified"])
+        self.assertEqual(covered["other_head_runs"], 1)
+        # Without an explicit head, the latest run's head is the current one.
+        self.assertEqual(evidence.coverage(records)["s"]["head"], "new")
+        self.assertTrue(evidence.coverage(records + [run("cold", "success", "new")])["s"]["verified"])
+        # A scenario that ran only on another head is reported, never verified.
+        stale = evidence.coverage([run("cold", "success", "old")], head="new")["s"]
+        self.assertEqual((stale["modes"], stale["verified"], stale["other_head_runs"]), ({}, False, 1))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,9 @@ macOS without asking a person to operate its development environment.
 operations, and Linux workers with `exec`, `inspect`, `signal`, `console
 capture`, `collect`, run supervision, exec handles (`status`, `wait`, `read`),
 the public `export`, Linux regression `scenario` runs and the `terminal`
-operations (`scripts/vm/vmctl.py`, `tests/scenarios/`) have shipped.
+operations (`scripts/vm/vmctl.py`, `tests/scenarios/`), macOS workers and
+`verify`, and issue sessions that run the lab dispatcher's agents in their own
+workers (§Agent sessions) have shipped.
 Until the rest lands, [CLAUDE.md](../../CLAUDE.md) and the
 [Sortie workflow](../../sortie/README.md) remain the operational instructions.
 
@@ -161,6 +163,7 @@ dependency-warming step above. A reset then costs about the boot time.
    §macOS workers), and transfer the checkout. Start with
    one active worker; concurrency is a controller setting bounded by a total
    resource budget. Assign a run ID and an overall deadline before execution.
+   The lab dispatcher does this per attempt (§Agent sessions).
 3. **Reproduce the failure.** Build the workspace from the recorded source.
    Run a bounded reproduction and save the failing assertion, command, output,
    and state. Distinguish a product failure from missing tools, failed boot,
@@ -378,7 +381,9 @@ The unit tests under `scripts/vm/tests` need no Parallels. The acceptance tests
 that build, validate and compare real candidates, and drive real workers, run
 against the local config when opted in: `BUSYBEE_VM_LAB=1 python3 -m unittest
 test_real_template test_real_worker test_real_supervision test_real_scenarios
-test_real_terminal test_real_macos` in that directory. The scenario runner's own tests need neither:
+test_real_terminal test_real_macos test_real_session` in that directory;
+`BUSYBEE_VM_LAB_ROOT` names another worktree of the repository that holds the
+lab state. The scenario runner's own tests need neither:
 `python3 -m unittest discover -s tests/scenarios/tests`.
 
 Long commands return a run handle with status, elapsed time, last-output time,
@@ -390,6 +395,114 @@ Ownership is recorded when a clone is created. Cleanup targets that worker's
 identity, not arbitrary VM names, process-name matches, or every daemon visible
 on the host. The registry survives controller restarts so an interrupted
 controller can reconcile its workers and their deadlines.
+
+## Agent sessions
+
+The lab dispatcher (`sortie/LAB_WORKFLOW.md`) runs every agent turn inside an
+owned Linux worker. Issue selection stays in the dispatcher and VM lifecycle in
+the controller; `scripts/vm/session.py` connects the two through `vmctl session`.
+
+**Eligibility.** `sortie/lab.py` releases a ready lab issue for dispatch only
+when every native blocker was completed by a merged PR into `main` and every
+capability it needs is available now. Every issue needs `worker:linux` and
+`controller:session`; an issue body adds more on a `Lab requires:` line (for
+example `**Lab requires:** worker:macos`). Availability comes from the trusted
+controller's read-only `doctor`: `worker:<os>` is the promoted baseline being
+`ready`, and `controller:<name>` is an operation that controller provides. An
+unknown capability is `unsupported`; a missing one names its cause. `release
+--dry-run` prints each ready issue's decision and changes nothing; a real
+release only adds or removes the `sortie` marker of ready lab issues.
+
+**Trusted controller.** The launcher snapshots the selected reviewed revision
+(`sortie/snapshot.sh`: dispatch scripts, guard policy, controller, scenario
+runner, review skills) outside every workspace and runs the controller from it
+with `--root` naming the checkout that holds `build/vm`. Nothing from an issue
+branch runs on the host; editing the controller, dispatch or guard files in a
+branch changes only the branch.
+
+**Profiles.** `sortie/guard-policy.json` names the paths each execution profile
+may not change. An issue is `infrastructure` only when it carries one of the
+policy's authorized labels; otherwise it is `product`, which may not change
+`sortie/`, `.github/workflows/`, the review skills, the controller or the
+review contract. The profile is decided per issue by the trusted `lab.py
+profile`, so one dispatcher can serve both.
+
+**Attempts.** Sortie's `before_run` hook runs `session start`: it closes an
+attempt that no `session end` closed (`interrupted`), then opens one in a fresh
+worker created from the workspace's branch head with its uncommitted changes
+as the patch. The worker's checkout is put on the branch with origin/main
+beside it, and is also reachable at the workspace's own absolute path, so an
+agent protocol that names its working directory resolves in the guest. The
+agent's saved conversation state (`.claude/projects`, `.codex/sessions` in the
+guest home) is restored, so a resumed turn finds its session in a new worker.
+`after_run` runs `session end`. Concurrency stays one active worker; a
+session holds its worker only during an attempt, never while its PR waits for
+review.
+
+**Turns.** Sortie's agent command is `vmctl session agent -- <runner argv>`,
+run in the workspace. It runs the runner in the worker over SSH, in the
+checkout's development shell (`.#worker-agent` for Claude and Codex), with
+stdin and stdout carrying the runner's own protocol and stderr kept per turn.
+The runner's streams pass through a relay (`scripts/vm/turn_relay.py`), so a
+daemon it leaves running cannot hold the SSH channel open: the turn ends
+with the runner, whose exit status the relay records for the controller.
+Model credentials named for the runner (`CLAUDE_CODE_OAUTH_TOKEN`,
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`; `OPENAI_API_KEY`,
+`CODEX_API_KEY`) reach the turn through a mode-0600 file under `/run` (tmpfs)
+that the turn deletes before the runner starts; a runner without one fails the
+turn (`credentials_missing`) rather than running unauthenticated. Nothing
+else from the dispatcher's environment enters the guest. No
+credential is written to the worker's disk, its snapshots, the run's evidence
+or the session's records. Sortie's generated `--mcp-config` names a host-side
+tool server and is dropped, with a notice. A turn is bounded by `timeout(1)`
+in the guest at the worker's remaining run deadline (or `--timeout`), and by
+the host; SIGTERM, SIGINT or SIGHUP cancels it. Its kind is `exited`,
+`timeout`, `cancelled` or `adapter_failure` (a worker that stops answering, a
+runner that does not start, exit 126 or 127, or a turn that ended without the
+runner's status, such as a branch whose flake lacks the agent shell). A turn that finds its worker no
+longer ready (expired, stopped) closes that attempt and continues in a fresh
+worker from the workspace.
+
+**Checkpoints.** After every turn, and on `lab checkpoint`, `push` or
+`handoff`, the worker's commits since the last transfer come back as a bundle
+and its uncommitted changes as a diff; the workspace takes them only if it
+still holds exactly what it last gave the worker. Otherwise they are kept
+under `sessions/<issue>/conflicts/`. Changes touching a forbidden path are
+never adopted: they are kept under `violations/`, pushes are refused, and the
+attempt ends `blocked` with the paths in `.sortie/blocker.md`. Paths are
+compared exactly as named, both sides of a rename; a workspace without
+origin/main to compare against is a failed checkpoint, never an unchecked one. An agent's own
+`.sortie/status` of `blocked` and its `blocker.md` are copied back; the review
+handoff is written only by the trusted helper.
+
+**The agent's controller.** Each turn forwards a broker socket into the guest
+and stages the `lab` client (`scripts/vm/lab_client.py`) on its PATH. Every
+request is served for the attempt's own run: `exec`, `status`, `wait`, `read`,
+`terminal open|send|resize|capture`, `inspect`, `signal`, `console`,
+`scenario` and `collect` call the worker operations above; `checkpoint`,
+`reset`, `fetch`, `push`, `pr status|create|ready|comment|view` and `handoff`
+act for the session. A request naming another run (`target_not_assigned`),
+any target but the worker (`host_target_refused`) or another operation
+(`operation_not_permitted`) is refused. Pushes go only to the session's branch
+and pull-request calls only to its PR, from the host workspace with the
+dispatcher's GitHub identity; `pr create` reuses the branch's open PR. Inside
+its guest the agent is root and needs no permission to install tools, restart
+daemons or break things. `reset` is applied when the turn ends, since it
+restarts the guest the agent runs in: the work is checkpointed, the worker
+restored to its recorded baseline, and the branch transferred again. When
+that checkpoint did not take the work (a conflict, a guard violation or a
+failure), the reset is skipped and recorded as such. A reset also marks the
+run's terminals collected before it as final, since the restore removes them
+from the guest.
+
+**Exits.** `session end` checkpoints a ready worker, derives the outcome
+unless one is given, destroys the worker (collecting first; a collection that
+fails retains it, stopped) and exports its public evidence. Outcomes:
+`success` (handoff of the current head), `blocked`, `no_handoff`, `timeout`,
+`cancelled`, `adapter_failure` (including a worker that could not be created)
+and `interrupted`. `sessions/<issue>/attempts/<n>/attempt.json` records the
+run, every turn, every reset and checkpoint, and the end: outcome, reason,
+the worker's final state, and the collected manifest and public export.
 
 ## Bound execution and preserve failures
 
@@ -486,9 +599,11 @@ The controller checks that result against the runner's exit status and the
 declared assertions. Output that is not a valid result is an environment
 failure, never a product failure. It writes `runs/<run>/scenarios/<exec>/result.json`;
 a scenario refused before its exec was queued ran nothing and leaves no record.
-Coverage takes the latest run in each mode: a scenario is verified only when
-every required mode's latest run passed, and a prepared pass is reported
-alongside a missing or failing cold run, never in its place. The runner covers
+Coverage takes the latest run in each mode of the current head (the guest
+checkout's head when collected, the scenario's own head when it reports): a
+scenario is verified only when every required mode's latest run on that head
+passed, and a prepared pass is reported alongside a missing or failing cold
+run, never in its place. Runs of other heads are counted, never combined. The runner covers
 Linux and macOS; on another platform it reports `platform_unsupported`. On
 macOS, where the exec runs as the lab account, it starts through `sudo`, drops
 privileges without `setpriv` (its interpreter clears the groups, then sets the

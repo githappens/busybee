@@ -89,6 +89,15 @@ class Guest:
         files keep everything the guest sent."""
         return subprocess.Popen(self._ssh() + [self._command(command)], stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
 
+    def session(self, command, forward, stdin=None, stdout=None, stderr=None):
+        """An issue agent's turn: `command` with this process's streams, and the
+        session broker's host socket (`forward` = (guest path, host path))
+        forwarded into the guest. A forward that cannot be set up ends it."""
+        remote, local = forward
+        extra = ["-T", "-o", "ExitOnForwardFailure=yes", "-R", f"{remote}:{local}"]
+        return subprocess.Popen(self._ssh(extra) + [self._command(command)], stdin=stdin, stdout=stdout,
+                                stderr=stderr)
+
     def wait(self, deadline):
         """Until the guest accepts a command, or the deadline passes."""
         last = "no attempt"

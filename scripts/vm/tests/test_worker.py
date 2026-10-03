@@ -329,6 +329,24 @@ class CreateTests(unittest.TestCase):
         self.assertEqual(list(self.lab.reg.entries()), [BASELINE_VM])
 
 
+class UntaggedSourceTests(unittest.TestCase):
+    def test_a_source_without_tags_transfers_through_its_branch(self):
+        lab = Lab(self)
+        source = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, source, True)
+        env = dict(os.environ, GIT_AUTHOR_NAME="F", GIT_AUTHOR_EMAIL="f@example.test", GIT_COMMITTER_NAME="F",
+                   GIT_COMMITTER_EMAIL="f@example.test")
+        for argv in (["init", "-q", "-b", "work"], ["commit", "-q", "--allow-empty", "-m", "c"]):
+            subprocess.run(["git", *argv], cwd=source, env=env, check=True)
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source, capture_output=True, text=True).stdout.strip()
+        lab.guest.head = sha
+        w = lab.workers()
+        w.source_repo, w.transfer_refs = source, ("refs/heads/work",)
+        self.assertEqual(w.create("linux", sha)["status"], "success")
+        bundles = [stdin for c, stdin in lab.guest.commands if "source.bundle" in c and stdin]
+        self.assertTrue(bundles and bundles[0].startswith(b"# v2 git bundle"))
+
+
 class SourceTests(unittest.TestCase):
     def setUp(self):
         self.lab = Lab(self)
@@ -448,6 +466,19 @@ class LifecycleTests(unittest.TestCase):
         # Collected before restoring, and the source is back afterwards.
         self.assertTrue(result["data"]["collected"]["artifacts"])
         self.assertEqual(sum("source.bundle" in c for c, _ in self.lab.guest.commands), 2)
+
+    def test_a_terminal_collected_before_a_reset_is_not_fetched_again(self):
+        hdir = worker.run_dir(self.lab.state, self.run_id) / "terminal" / "0001"
+        hdir.mkdir(parents=True)
+        guest_dir = f"/var/tmp/busybee-terminal/{self.run_id}/0001"
+        (hdir / "handle.json").write_text(json.dumps({"handle": "0001", "guest_dir": guest_dir}))
+        w = self.lab.workers()
+        w._fetch_terminals = lambda g, rdir: []  # the collection before the restore fetched it
+        self.assertEqual(w.reset(self.run_id)["status"], "success")
+        self.assertIsNotNone(json.loads((hdir / "handle.json").read_text())["final_at"])
+        # The restored guest no longer has the terminal; collection keeps the host's copy.
+        self.lab.guest.fail_on = guest_dir
+        self.assertEqual(self.lab.workers()._fetch_terminals(self.lab.guest, hdir.parents[1]), [])
 
     def test_a_reset_whose_transfer_fails_is_explicit_and_destroyable(self):
         self.lab.guest.fail_on = "source.bundle"

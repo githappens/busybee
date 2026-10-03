@@ -91,6 +91,25 @@
             pkgs.gh
             pkgs.actionlint
           ];
+          # inputsFrom does not carry environment attributes; the session
+          # broker renders terminal captures with this font.
+          BUSYBEE_TERMINAL_FONTS = "${pkgs.dejavu_fonts}/share/fonts/truetype";
         };
+
+        # An issue agent's turn inside its VM worker (scripts/vm/session.py):
+        # the project tools plus the agent runners. Claude Code is unfree, so
+        # it alone is allowed here; credentials arrive per turn, never in Nix.
+        devShells.worker-agent =
+          let
+            agentPkgs = import nixpkgs {
+              inherit system;
+              config.allowUnfreePredicate = pkg: nixpkgs.lib.getName pkg == "claude-code";
+            };
+          in
+          pkgs.mkShell {
+            inputsFrom = [ self.devShells.${system}.default ];
+            packages = [ agentPkgs.codex agentPkgs.claude-code ];
+            BUSYBEE_TERMINAL_FONTS = "${pkgs.dejavu_fonts}/share/fonts/truetype";
+          };
       });
 }

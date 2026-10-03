@@ -10,8 +10,14 @@ No global installation or host configuration change is needed.
 | Product | `sortie/run.sh` | `bzbd: shared CPU token pool` | `build/sortie.db`, `build/sortie-workspaces/` | 7678 |
 | Lab | `sortie/run-lab.sh` | `agent lab: autonomous VM development` | `build/sortie-lab/` | 7679 |
 
-The lab profile dispatches and reviews issues for the planned
-[VM lab](../docs/design/agent-lab.md).
+The lab profile dispatches and reviews issues for the
+[VM lab](../docs/design/agent-lab.md). Each of its attempts runs in a fresh
+owned Linux worker: the `before_run` and `after_run` hooks open and close the
+attempt, and every agent turn runs in the worker through `vmctl session
+agent` (see [Agent sessions](../docs/design/agent-lab.md#agent-sessions)).
+It needs the lab's local configuration and a promoted Linux baseline in this
+checkout, and the runner's model credential in the launcher's environment
+(`CLAUDE_CODE_OAUTH_TOKEN` or an API key; Codex: `OPENAI_API_KEY`).
 
 ## Start and validate
 
@@ -34,8 +40,9 @@ Per-runner qualification, including why Claude is allowed only inside an
 allocated worker, is in [runner support](../docs/development/agent-review.md#runner-support).
 `BUSYBEE_CURSOR_COMMAND` can select another compatible ACP command for Cursor.
 
-A running process snapshots committed controller scripts, skills, and policy
-from `origin/main` outside the task checkouts. Fetch `main` before launch.
+A running process snapshots committed dispatch scripts, the VM controller,
+skills, and policy from `origin/main` outside the task checkouts
+(`sortie/snapshot.sh`). Fetch `main` before launch.
 `BUSYBEE_SORTIE_TRUSTED_REF` may select a deliberately reviewed bootstrap
 commit; it must never point to an automatically chosen candidate branch.
 Candidate edits cannot replace the policy supervising that session.
@@ -47,17 +54,29 @@ URL and the selected profile's dashboard port when needed.
 Issue states are `sortie:ready`, `sortie:working`, `sortie:review`, and
 `sortie:done`; the `sortie` marker enables dispatch. Sortie owns state changes.
 The lab controller rejects tracking/parked issues and requires prerequisites
-to be completed by a merged PR into `main`, not merely closed. Its dependency
-release sidecar runs once per minute. The product profile retains its existing
+to be completed by a merged PR into `main`, not merely closed, and the worker
+capabilities the issue needs (a `Lab requires:` line adds to the default
+`worker:linux`) to be available. Its dependency release sidecar runs once per
+minute. An issue labelled `area:harness` runs with the `infrastructure`
+profile; any other with `product`, whose session refuses changes to the paths
+in `sortie/guard-policy.json`. The product profile retains its existing
 `unblock.sh` dependency release behavior. Inspect lab eligibility manually with:
 
 ```sh
 nix develop .#agent -c python3 sortie/lab.py check --issue NUMBER
 nix develop .#agent -c python3 sortie/lab.py release --dry-run
+nix develop .#agent -c python3 sortie/lab.py profile --issue NUMBER
 ```
 
+`check` and `release` read worker capabilities from the trusted controller's
+`doctor`, so they need `BUSYBEE_LAB_ROOT` naming this checkout (the launcher
+sets it).
+
 `prepare-workspace.sh` preserves `sortie/<issue>` or `sortie-lab/<issue>` across
-continuations, including unfinished work and remotely existing branches. It
+continuations, including unfinished work and remotely existing branches. In the
+lab profile that workspace is also the checkpoint of the worker's work, and
+`vmctl session status --issue NUMBER` lists an issue's attempts and how each
+ended. It
 sets credentials only inside the disposable checkout. Product tests must own
 private Pueue/bzbd state. The Claude machine-safety hook is a cooperative guard,
 not a security boundary. `isolated.sh` points `PUEUE_CONFIG_PATH` at a generated
