@@ -119,7 +119,7 @@ async fn log_chunk_returns_plaintext_for_repetitive_output() {
     let id = enqueue(
         &mut client,
         TaskSpec {
-            command: format!("sh -c 'for i in $(seq 1 {repeats}); do echo {line}; done'"),
+            command: format!("i=0; while [ $i -lt {repeats} ]; do echo {line}; i=$((i+1)); done"),
             cwd: std::env::current_dir().unwrap(),
             env: Default::default(),
             label: None,
