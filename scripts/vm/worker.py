@@ -780,8 +780,9 @@ class Workers(template.Lab):
             # storage_gib before it is destroyed; reserve that before checking
             # whether one more fits.  Using the full allocation rather than
             # what the clone has grown to so far is simpler and errs safe.
-            reserved = sum(w["allocation"]["storage_gib"] for w in workers
-                           if w["role"] == "worker" and w["allocation"])
+            reserved = sum(
+                w["allocation"]["storage_gib"] if w["allocation"] else allotted
+                for w in workers if w["role"] == "worker")
             free -= reserved
         if free < allotted:
             return contracts.result(op, "environment_failure", "not enough storage", [
