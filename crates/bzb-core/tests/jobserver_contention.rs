@@ -1,8 +1,10 @@
 //! Tests for `Jobserver::acquire` under hot-reader contention: a simulated
 //! jobserver build competes for the fifo with the blocking drain in `acquire`.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -55,7 +57,35 @@ fn static_drain_collects_its_grant_against_a_hot_reader() {
         let js_r = Arc::clone(&js);
         let stop_r = Arc::clone(&stop);
         handles.push(std::thread::spawn(move || {
-            let mut rd = File::open(&path).expect("open fifo for blocking read");
+            // Open with O_NONBLOCK so the call never hangs on macOS (where an
+            // O_RDWR fd may not satisfy the "writer present" requirement for a
+            // blocking O_RDONLY open).  Then clear the flag so reads block,
+            // placing this thread in the kernel's exclusive rd_wait queue just
+            // as a real make reader would be.
+            let rd_file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+                .expect("open fifo for blocking read");
+            let flags = unsafe { libc::fcntl(rd_file.as_raw_fd(), libc::F_GETFL) };
+            assert!(
+                flags >= 0,
+                "F_GETFL failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let r = unsafe {
+                libc::fcntl(
+                    rd_file.as_raw_fd(),
+                    libc::F_SETFL,
+                    flags & !libc::O_NONBLOCK,
+                )
+            };
+            assert!(
+                r >= 0,
+                "F_SETFL failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let mut rd = rd_file;
             let mut buf = [0u8; 1];
             loop {
                 if rd.read_exact(&mut buf).is_err() {
