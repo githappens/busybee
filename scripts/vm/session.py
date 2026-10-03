@@ -1000,7 +1000,9 @@ class Broker:
     # Transport: one JSON request and one JSON reply per connection
 
     def start(self):
-        self.tmp = tempfile.mkdtemp(prefix="bzl-")
+        # A short directory: a socket path must fit sun_path (104 bytes on
+        # macOS, whose per-user TMPDIR alone takes about half of it).
+        self.tmp = tempfile.mkdtemp(prefix="bzl-", dir="/tmp")
         path = os.path.join(self.tmp, "broker.sock")
         broker = self
 

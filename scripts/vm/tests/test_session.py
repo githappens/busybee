@@ -134,7 +134,8 @@ class FakeController:
         self.root = root
         self.state = root / "state"
         self.config = CONFIG
-        self.guest_run = str(root / "guest-run")
+        # The guest's /run: short, like the real one, for its socket path.
+        self.guest_run = tempfile.mkdtemp(prefix="bzg-", dir="/tmp")
         self.guests = root / "guests"
         self.calls = []
         self.fail_create = None
@@ -256,6 +257,7 @@ class Harness(unittest.TestCase):
         os.environ["FAKE_GH_STATE"] = str(self.gh_state)
         self.addCleanup(os.environ.pop, "FAKE_GH_STATE", None)
         self.c = FakeController(self.tmp)
+        self.addCleanup(shutil.rmtree, self.c.guest_run, True)
         self.c.env["PATH"] = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
         self.err = io.StringIO()
         self.sessions = self.make_sessions()
