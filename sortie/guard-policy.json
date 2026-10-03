@@ -1,0 +1,20 @@
+{
+  "schema": "busybee.lab.guard/v1",
+  "infrastructure_labels": ["area:harness"],
+  "profiles": {
+    "product": {
+      "forbidden_paths": [
+        "sortie/",
+        ".github/workflows/",
+        "skills/",
+        ".agents/",
+        ".claude/",
+        "scripts/vm/",
+        "docs/development/agent-review.md"
+      ]
+    },
+    "infrastructure": {
+      "forbidden_paths": []
+    }
+  }
+}

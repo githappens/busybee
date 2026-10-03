@@ -19,21 +19,24 @@ import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[3]
+# The checkout holding the lab state (build/vm); another worktree of the same
+# repository can run these tests against it.
+ROOT = Path(os.environ.get("BUSYBEE_VM_LAB_ROOT") or REPO).resolve()
 VMCTL = REPO / "scripts" / "vm" / "vmctl.py"
-STATE = REPO / "build" / "vm"
+STATE = ROOT / "build" / "vm"
 REAL = os.environ.get("BUSYBEE_VM_LAB") == "1"
 sys.path.insert(0, str(REPO / "scripts" / "vm"))
 import worker  # noqa: E402
 
 
 def vmctl(*args):
-    out = subprocess.run([sys.executable, str(VMCTL), "--json", *args], capture_output=True, text=True)
+    out = subprocess.run([sys.executable, str(VMCTL), "--json", "--root", str(ROOT), *args], capture_output=True, text=True)
     return json.loads(out.stdout)
 
 
 def spawn(*args):
     """A controller process in its own process group, so the test can kill it and everything it started."""
-    return subprocess.Popen([sys.executable, str(VMCTL), "--json", *args], stdout=subprocess.DEVNULL,
+    return subprocess.Popen([sys.executable, str(VMCTL), "--json", "--root", str(ROOT), *args], stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL, start_new_session=True)
 
 
@@ -292,7 +295,7 @@ class RealSupervisionTests(unittest.TestCase):
         self.assertEqual(exported["status"], "success", exported["findings"])
         out = STATE / exported["data"]["path"]
         blob = b"".join(p.read_bytes() for p in sorted(out.rglob("*")) if p.is_file())
-        private = [secret, str(REPO), str(Path.home()), getpass.getuser(), socket.gethostname().split(".")[0],
+        private = [secret, str(REPO), str(ROOT), str(Path.home()), getpass.getuser(), socket.gethostname().split(".")[0],
                    guest_ip, *macs, *(m.upper() for m in macs), rec["worker"], run_id, rec["vm_id"],
                    rec["vm_id"].strip("{}"), rec["reset_snapshot_id"], rec["baseline_vm_id"]]
         for value in private:

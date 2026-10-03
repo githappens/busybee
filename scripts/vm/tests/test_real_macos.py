@@ -16,8 +16,11 @@ import tomllib
 import unittest
 
 REPO = Path(__file__).resolve().parents[3]
+# The checkout holding the lab state (build/vm); another worktree of the same
+# repository can run these tests against it.
+ROOT = Path(os.environ.get("BUSYBEE_VM_LAB_ROOT") or REPO).resolve()
 VMCTL = REPO / "scripts" / "vm" / "vmctl.py"
-STATE = REPO / "build" / "vm"
+STATE = ROOT / "build" / "vm"
 CONFIG = STATE / "local.toml"
 REAL = os.environ.get("BUSYBEE_VM_LAB") == "1"
 BUILD_S = "1800"
@@ -27,7 +30,7 @@ MARKERS = ("/tmp/bzlab-marker", "~/bzlab-marker", "/usr/local/bzlab-marker")
 
 def vmctl(*args, config=None):
     extra = ["--config", str(config)] if config else []
-    out = subprocess.run([sys.executable, str(VMCTL), "--json", *args, *extra], capture_output=True, text=True)
+    out = subprocess.run([sys.executable, str(VMCTL), "--json", "--root", str(ROOT), *args, *extra], capture_output=True, text=True)
     return json.loads(out.stdout)
 
 

@@ -15,8 +15,11 @@ import tomllib
 import unittest
 
 REPO = Path(__file__).resolve().parents[3]
+# The checkout holding the lab state (build/vm); another worktree of the same
+# repository can run these tests against it.
+ROOT = Path(os.environ.get("BUSYBEE_VM_LAB_ROOT") or REPO).resolve()
 VMCTL = REPO / "scripts" / "vm" / "vmctl.py"
-STATE = REPO / "build" / "vm"
+STATE = ROOT / "build" / "vm"
 REAL = os.environ.get("BUSYBEE_VM_LAB") == "1"
 BUILD_S = "1800"
 AFFECTED = tomllib.loads((REPO / "tests" / "scenarios" / "umask-startup.toml").read_text())["affected_revision"]
@@ -25,7 +28,7 @@ NOBODY = "nobody"
 
 
 def vmctl(*args):
-    out = subprocess.run([sys.executable, str(VMCTL), "--json", *args], capture_output=True, text=True)
+    out = subprocess.run([sys.executable, str(VMCTL), "--json", "--root", str(ROOT), *args], capture_output=True, text=True)
     return json.loads(out.stdout)
 
 

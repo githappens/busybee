@@ -169,9 +169,13 @@ class Lab:
     CAPABILITIES = CAPABILITIES
     TTY = "/dev/pts/"
 
-    def __init__(self, repo, config, prl, reg, connect=guest.Guest, lease=guest.wait_for_lease):
+    def __init__(self, repo, config, prl, reg, connect=guest.Guest, lease=guest.wait_for_lease, root=None):
+        # `repo` holds the controller's own code; `root` the checkout whose
+        # build/vm state it operates on. They differ when the controller runs
+        # from a trusted snapshot (docs/design/agent-lab.md §Agent sessions).
         self.repo, self.config, self.prl, self.reg = Path(repo), config, prl, reg
-        self.state = contracts.state_dir(config, self.repo)
+        self.root = Path(root) if root else self.repo
+        self.state = contracts.state_dir(config, self.root)
         self.deadline = None
         self.open_guest, self.lease = connect, lease
 

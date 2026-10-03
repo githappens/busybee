@@ -43,7 +43,10 @@ if [ "$mode" = validate ]; then
   exit
 fi
 
-command -v "${agent_command%% *}" >/dev/null || { echo "Agent executable unavailable: ${agent_command%% *}" >&2; exit 1; }
+# Lab turns run the agent inside the worker, from its development shell.
+if [ "$profile" = product ]; then
+  command -v "${agent_command%% *}" >/dev/null || { echo "Agent executable unavailable: ${agent_command%% *}" >&2; exit 1; }
+fi
 if [ -z "${GITHUB_TOKEN:-}" ]; then
   GITHUB_TOKEN=$(gh auth token)
   export GITHUB_TOKEN
@@ -51,28 +54,32 @@ fi
 if [ "$mode" = dry-run ]; then
   exec sortie --dry-run "$root/sortie/$workflow"
 fi
-if [ "$runner" = claude ] && [ "${BUSYBEE_SORTIE_WORKER:-}" != 1 ]; then
-  echo 'Sortie 1.24 requires Claude bypassPermissions; this profile requires an allocated worker. Use Codex for host bootstrap.' >&2
+# Lab agents run each turn inside their own VM worker (scripts/vm/session.py);
+# product agents run on this host, where Claude's required bypassPermissions
+# mode is refused.
+if [ "$profile" = product ] && [ "$runner" = claude ] && [ "${BUSYBEE_SORTIE_WORKER:-}" != 1 ]; then
+  echo 'Sortie 1.24 requires Claude bypassPermissions; on this host only the lab profile, whose turns run in an allocated worker, may use it. Use Codex for host bootstrap.' >&2
+  exit 1
+fi
+if [ "$profile" = lab ] && [ "$runner" = cursor ]; then
+  echo 'Cursor has not been qualified inside lab workers; use claude or codex with the lab profile.' >&2
   exit 1
 fi
 
-# Snapshot committed, reviewed policy outside every issue checkout. Never
-# execute a candidate branch's launcher or replace policy during a session.
+# Snapshot committed, reviewed policy and controller outside every issue
+# checkout. Never execute a candidate branch's launcher or replace policy
+# during a session.
 ref=${BUSYBEE_SORTIE_TRUSTED_REF:-origin/main}
-sha=$(git rev-parse --verify "$ref^{commit}")
-git cat-file -e "$sha:sortie/prepare-workspace.sh" || {
-  echo 'The selected trusted revision has no current controller; land the bootstrap first.' >&2
-  exit 1
-}
-mkdir -p "$BUSYBEE_SORTIE_STATE/trusted"
-trusted="$BUSYBEE_SORTIE_STATE/trusted/$sha"
-if [ ! -d "$trusted" ]; then
-  candidate=$(mktemp -d "$BUSYBEE_SORTIE_STATE/trusted/.candidate.XXXXXX")
-  git archive "$sha" sortie skills docs/development/agent-review.md AGENTS.md CLAUDE.md \
-    .github/workflows/agent-review-gate.yml | tar -x -C "$candidate"
-  mv "$candidate" "$trusted"
-fi
+trusted=$(bash "$root/sortie/snapshot.sh" "$ref" "$BUSYBEE_SORTIE_STATE")
 export BUSYBEE_SORTIE_TRUSTED=$trusted
+if [ "$profile" = lab ]; then
+  # Sortie splits the command on whitespace; refuse paths it would break.
+  case "$root$trusted" in
+    *[[:space:]]*) echo 'The lab profile needs a checkout path without whitespace.' >&2; exit 1 ;;
+  esac
+  export BUSYBEE_LAB_ROOT=$root
+  export SORTIE_AGENT_COMMAND="python3 $trusted/scripts/vm/vmctl.py --root $root session agent -- $agent_command"
+fi
 sortie validate "$trusted/sortie/$workflow"
 
 # A mkdir lock prevents a second process from dispatching the same issues.

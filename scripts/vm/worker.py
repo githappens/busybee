@@ -241,8 +241,14 @@ class Workers(template.Lab):
     substitute them, and the clock and sleep that waits use."""
 
     def __init__(self, repo, config, prl, reg, free_gib, connect=None, supervise=None, clock=time.time,
-                 sleep=time.sleep, slot_wait_s=None):
-        super().__init__(repo, config, prl, reg)
+                 sleep=time.sleep, slot_wait_s=None, root=None):
+        super().__init__(repo, config, prl, reg, root=root)
+        # Where revisions come from: the lab checkout, or an issue session's workspace.
+        self.source_repo = self.root
+        # Refs the source bundle also carries. A bare revision is no ref, so a
+        # source without tags (an issue workspace) needs one or git refuses
+        # the bundle as empty.
+        self.transfer_refs = ()
         self.connect = connect or self._ssh
         self.free_gib = free_gib
         self.supervise = supervise
@@ -382,7 +388,8 @@ class Workers(template.Lab):
         """The recorded revision with its history and tags, as a guest-local checkout."""
         revision = record["source"]["revision"]
         co = self.checkout(record)
-        bundle = subprocess.run(["git", "bundle", "create", "-", revision, "--tags"], cwd=self.repo,
+        bundle = subprocess.run(["git", "bundle", "create", "-", revision, *self.transfer_refs, "--tags"],
+                                cwd=self.source_repo,
                                 capture_output=True, check=True).stdout
         # A bare revision is no ref in the bundle, so unbundle and recreate the tags.
         g.run(f"rm -rf {co} /var/tmp/source.bundle && cat > /var/tmp/source.bundle && "
@@ -732,7 +739,7 @@ class Workers(template.Lab):
         return rdir, _now(), self._start()
 
     def _source(self, revision, patch):
-        found = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"], cwd=self.repo,
+        found = subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"{revision}^{{commit}}"], cwd=self.source_repo,
                                capture_output=True, text=True)
         if found.returncode != 0:
             raise Refused("source_invalid", f"{revision!r} is not a commit in this repository")
@@ -923,12 +930,12 @@ class Workers(template.Lab):
                              "findings": [f["code"] for f in done["findings"]] if done else []})
         return commands
 
-    def _scenarios(self, rdir):
+    def _scenarios(self, rdir, head=None):
         records = evidence.scenario_records(rdir)
         results = [{"exec": r["exec"], "scenario": r["scenario"], "mode": r["mode"], "status": r["status"],
                     "failed": r["failed"], "path": self._rel(rdir / "scenarios" / r["exec"] / "result.json")}
                    for r in records]
-        return {"results": results, "coverage": evidence.coverage(records)}
+        return {"results": results, "coverage": evidence.coverage(records, head)}
 
     def collect_run(self, record, reachable=True):
         """Export source changes and evidence; return the manifest, its path and
@@ -1010,7 +1017,8 @@ class Workers(template.Lab):
                     "template": baseline, "allocation": record["allocation"], "deadline": record["deadline"],
                     "commands": self._commands(rdir), "observations": observations,
                     "cleanup": self.events(record["run_id"]), "artifacts": artifacts,
-                    "acknowledged": acknowledged, "missing": missing, "scenarios": self._scenarios(rdir),
+                    "acknowledged": acknowledged, "missing": missing,
+                    "scenarios": self._scenarios(rdir, (source or {}).get("head")),
                     "terminals": screen.handles(rdir)}
         path = cdir / "collected.json"
         try:
@@ -1027,6 +1035,8 @@ class Workers(template.Lab):
         missing = []
         for meta_path in sorted(rdir.glob("terminal/*/handle.json")):
             meta = json.loads(meta_path.read_text())
+            if meta.get("final_at"):
+                continue  # collected before a reset removed it from the guest
             try:
                 fetch_terminal(g, self._bound("command"), meta["guest_dir"], meta_path.parent)
                 screen.render_handle(meta_path.parent)
@@ -1102,6 +1112,12 @@ class Workers(template.Lab):
                     return self.retain(op, record, missing)
             if self.prl.info(vm)["state"] != "stopped":
                 self.prl.stop(vm, kill=True)
+            # The restore removes every terminal from the guest; what the
+            # collection above fetched of each is now its final record.
+            for meta_path in sorted(run_dir(self.state, run_id).glob("terminal/*/handle.json")):
+                meta = json.loads(meta_path.read_text())
+                if not meta.get("final_at"):
+                    template._write_json(meta_path, {**meta, "final_at": _stamp(_now())})
             self.prl.snapshot_switch(vm, record["reset_snapshot_id"])
             record["status"] = "provisioning"
             self._save(record)
@@ -1218,7 +1234,7 @@ class Workers(template.Lab):
         record = _load(run_dir(self.state, run_id) / "worker.json")
         if record is None:
             raise Refused("target_not_owned", f"no recorded run {run_id}")
-        out = evidence.export(self.repo, self.state, record)
+        out = evidence.export(self.root, self.state, record, self.repo)
         return contracts.result("export", "success", f"public evidence for run {run_id}",
                                 [contracts.finding("artifact_missing", m, "warning") for m in out["missing"]], {
             "run_id": run_id, "path": self._rel(out["path"]), "files": len(out["files"]),

@@ -18,6 +18,7 @@ scenario's required fixture modes.
 import hashlib
 import io
 import json
+from pathlib import Path
 import re
 import shlex
 import subprocess
@@ -111,7 +112,12 @@ def terminals(workers, run_id, record, name, reported):
 
 
 def _controller(repo):
-    """The controller checkout the runner came from."""
+    """The controller checkout the runner came from, or the trusted snapshot
+    (sortie/snapshot.sh), which records its revision and cannot be dirty."""
+    snapshot = Path(repo) / ".revision"
+    if snapshot.is_file():
+        return {"head": snapshot.read_text().strip(), "scenarios_dirty": False}
+
     def git(*args):
         return subprocess.run(["git", *args], cwd=repo, capture_output=True, text=True).stdout.strip()
     return {"head": git("rev-parse", "HEAD") or None,
@@ -188,7 +194,8 @@ def run(workers, run_id, scenario_id, mode, bin_dir="build/debug"):
              "runner": {"sha256": digest, **_controller(workers.repo)}, "terminals": shown, "result": parsed}
     path = worker.run_dir(workers.state, run_id) / "scenarios" / name / "result.json"
     evidence.durable(path, (json.dumps(entry, indent=2) + "\n").encode())
-    covered = evidence.coverage(evidence.scenario_records(worker.run_dir(workers.state, run_id)))[scenario_id]
+    covered = evidence.coverage(evidence.scenario_records(worker.run_dir(workers.state, run_id)),
+                                (entry["provenance"] or {}).get("head"))[scenario_id]
     notes = [contracts.finding("required_mode_missing", f"{scenario_id} is verified only by a {m} run, which "
                                f"this run has not had; a {mode} result cannot stand in for it", "warning")
              for m in covered["missing"]]

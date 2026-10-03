@@ -22,6 +22,7 @@ import macos
 import parallels
 import registry
 import scenario
+import session
 import supervisor
 import template
 import terminal_ops
@@ -182,6 +183,12 @@ def check_template(repo, name, entry, config, adapter, vms, findings):
     return {**summary, "state": "ready" if eligible else "ineligible"}
 
 
+# Controller operations an issue session may rely on; lab dispatch requires
+# `controller:<name>` for the ones an issue declares (sortie/lab.py).
+CAPABILITIES = ("session", "exec", "terminal", "scenario", "inspect", "signal", "console", "collect", "reset",
+                "verify")
+
+
 def doctor(repo, config_path, host, runner=parallels.run):
     """Read-only preflight. Starts, creates and changes nothing."""
     findings = []
@@ -190,7 +197,8 @@ def doctor(repo, config_path, host, runner=parallels.run):
     prlsrvctl, prlsrvctl_source = resolve_tool("prlsrvctl", config, host, findings)
     data = {"host": {"os": host.os_name(), "arch": host.arch()},
             "tools": {"prlctl": prlctl_source or "missing", "prlsrvctl": prlsrvctl_source or "missing"},
-            "config": {"path": display(config_path, repo), "valid": config is not None}}
+            "config": {"path": display(config_path, repo), "valid": config is not None},
+            "controller": {"capabilities": list(CAPABILITIES)}}
 
     adapter, vms = None, None
     if prlctl and prlsrvctl:
@@ -242,7 +250,7 @@ def template_operation(repo, args, host):
         return template.promote(state, args.name, args.candidate)
     if args.action == "prune":
         return template.prune(state, args.name, prl, reg)
-    lab = (macos.MacLab if args.name == "macos" else template.Lab)(repo, config, prl, reg)
+    lab = (macos.MacLab if args.name == "macos" else template.Lab)(REPO, config, prl, reg, root=repo)
     if args.action == "build":
         return lab.build(args.name, args.arch)
     return lab.validate(args.name, args.candidate)
@@ -254,10 +262,13 @@ def worker_operation(repo, args, host, operation):
         return failed
     config, reg, prl = ready
     state = contracts.state_dir(config, repo)
-    workers = worker.Workers(repo, config, prl, reg, host.free_storage_gib,
+    workers = worker.Workers(REPO, config, prl, reg, host.free_storage_gib,
                              supervise=lambda run_id, lease=None: supervisor.ensure(
-                                 state, run_id, supervisor.argv(repo, args.config, run_id), lease=lease))
+                                 state, run_id, supervisor.argv(REPO, args.config, run_id, repo), lease=lease),
+                             root=repo)
     try:
+        if operation.startswith("session "):
+            return session_operation(workers, args, operation)
         if operation == "supervise":
             supervisor.serve(workers, args.run_id, args.lease_fd)
             return None
@@ -306,6 +317,19 @@ def worker_operation(repo, args, host, operation):
                                 [contracts.finding("worker_unreachable", str(err))])
 
 
+def session_operation(workers, args, operation):
+    """An issue session (§Agent sessions), run by the controller of this
+    checkout, which the dispatcher snapshots from a trusted revision."""
+    sessions = session.Sessions(session.Controller(workers), REPO)
+    if operation == "session start":
+        return sessions.start(args.issue, args.workspace, args.profile)
+    if operation == "session agent":
+        return sessions.agent(Path.cwd(), args.command, args.timeout)
+    if operation == "session end":
+        return sessions.end(args.workspace, args.outcome, args.reason)
+    return sessions.status(args.issue)
+
+
 def summary(result):
     lines = [f"{result['operation']}: {result['status']} ({result['summary']})"]
     lines += [f"  {f['severity']:<7} {f['code']}: {f['message']}" for f in result["findings"]]
@@ -327,12 +351,14 @@ def parser():
     root = argparse.ArgumentParser(prog="vmctl", description=__doc__,
                                    formatter_class=argparse.RawDescriptionHelpFormatter)
     root.add_argument("--json", action="store_true", help="print the result as JSON")
+    root.add_argument("--root", type=Path, default=REPO,
+                      help="the checkout whose build/vm state and revisions to use; default this one")
     ops = root.add_subparsers(dest="operation", required=True)
     doc = ops.add_parser("doctor", help="read-only host and configuration preflight")
-    doc.add_argument("--config", type=Path, default=REPO / DEFAULT_CONFIG)
+    doc.add_argument("--config", type=Path, help="default: build/vm/local.toml under --root")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("name")
-    common.add_argument("--config", type=Path, default=REPO / DEFAULT_CONFIG)
+    common.add_argument("--config", type=Path, help="default: build/vm/local.toml under --root")
     actions = ops.add_parser("template", help="build, validate and promote worker templates") \
         .add_subparsers(dest="action", required=True)
     actions.add_parser("build", parents=[common], help="provision a candidate from the pinned installer") \
@@ -344,7 +370,7 @@ def parser():
 
     target = argparse.ArgumentParser(add_help=False)
     target.add_argument("run_id", help="run id printed by worker create")
-    target.add_argument("--config", type=Path, default=REPO / DEFAULT_CONFIG)
+    target.add_argument("--config", type=Path, help="default: build/vm/local.toml under --root")
     workers = ops.add_parser("worker", help="create, reset and destroy owned workers") \
         .add_subparsers(dest="action", required=True)
     create = workers.add_parser("create", parents=[common],
@@ -363,7 +389,7 @@ def parser():
     status = ops.add_parser("status", help="owned workers after reconciling them, or one worker or exec")
     status.add_argument("run_id", nargs="?")
     status.add_argument("exec", nargs="?")
-    status.add_argument("--config", type=Path, default=REPO / DEFAULT_CONFIG)
+    status.add_argument("--config", type=Path, help="default: build/vm/local.toml under --root")
     ops.add_parser("wait", parents=[handle], help="wait for an exec's result") \
         .add_argument("--timeout", type=int, help="seconds; default as long as the supervisor may take")
     read = ops.add_parser("read", parents=[handle], help="an exec's output from a byte offset")
@@ -376,7 +402,7 @@ def parser():
     check.add_argument("--patch", type=Path, help="patch applied on top of the revision")
     check.add_argument("--platform", action="append", choices=contracts.GUEST_OS,
                        help="a required platform; repeatable; default all")
-    check.add_argument("--config", type=Path, default=REPO / DEFAULT_CONFIG)
+    check.add_argument("--config", type=Path, help="default: build/vm/local.toml under --root")
     run_scenario = ops.add_parser("scenario", parents=[target], help="run a tests/scenarios scenario in a worker")
     run_scenario.add_argument("scenario", help="scenario id: tests/scenarios/<id>.toml")
     run_scenario.add_argument("--mode", required=True, choices=("cold", "prepared"))
@@ -384,6 +410,23 @@ def parser():
                               help="the built busybee and bzbd, relative to the worker checkout")
     ops.add_parser("supervise", parents=[target], help="internal: the run's watchdog, started by the controller") \
         .add_argument("--lease-fd", type=int, help="the macOS slot lease it inherits from worker create")
+    configured = argparse.ArgumentParser(add_help=False)
+    configured.add_argument("--config", type=Path, help="default: build/vm/local.toml under --root")
+    sessions = ops.add_parser("session", help="an issue agent's attempts in owned workers (dispatcher hooks)") \
+        .add_subparsers(dest="action", required=True)
+    sstart = sessions.add_parser("start", parents=[configured],
+                                 help="close any unclosed attempt, then open one in a fresh worker")
+    sstart.add_argument("--issue", type=int, required=True)
+    sstart.add_argument("--workspace", type=Path, required=True, help="the issue's checkout on its branch")
+    sstart.add_argument("--profile", required=True, help="a profile of sortie/guard-policy.json")
+    sessions.add_parser("agent", parents=[configured],
+                        help="one agent turn in the attempt's worker: session agent -- ARGV (cwd: the workspace)") \
+        .add_argument("--timeout", type=int, help="seconds; default what the worker's run deadline leaves")
+    send = sessions.add_parser("end", parents=[configured], help="checkpoint, collect, destroy and account")
+    send.add_argument("--workspace", type=Path, required=True)
+    send.add_argument("--outcome", choices=session.OUTCOMES, help="default: derived from the attempt")
+    send.add_argument("--reason")
+    sessions.add_parser("status", parents=[configured]).add_argument("--issue", type=int, required=True)
     sig = ops.add_parser("signal", parents=[target], help="signal a process in a worker")
     sig.add_argument("signal")
     sig.add_argument("pid")
@@ -423,15 +466,24 @@ def main(argv=None):
     split = argv.index("--") if "--" in argv else len(argv)
     args = parser().parse_args(argv[:split])
     args.command = argv[split + 1:]
+    args.root = args.root.resolve()
+    if getattr(args, "config", None) is None:
+        args.config = args.root / DEFAULT_CONFIG
     if args.operation == "doctor":
-        outcome = doctor(REPO, args.config, Host())
+        outcome = doctor(args.root, args.config, Host())
     elif args.operation == "template":
-        outcome = template_operation(REPO, args, Host())
+        outcome = template_operation(args.root, args, Host())
     else:
         operation = " ".join(filter(None, (args.operation, getattr(args, "action", None))))
-        outcome = worker_operation(REPO, args, Host(), operation)
+        outcome = worker_operation(args.root, args, Host(), operation)
         if outcome is None:  # the supervisor, which reports through the run's events
             return EXIT_OK
+        if operation == "session agent":
+            # stdout carries the agent's own protocol; the turn's status is the exit code.
+            if isinstance(outcome, int):
+                return outcome
+            print(summary(outcome), file=sys.stderr)
+            return EXIT_FAILED
     if args.operation == "read" and not args.json and outcome["status"] == "success":
         # Plain `read` is the bytes themselves, so output can be piped.
         sys.stdout.buffer.write(base64.b64decode(outcome["data"]["content_b64"]))

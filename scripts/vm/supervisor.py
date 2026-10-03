@@ -359,6 +359,6 @@ class Supervisor:
             self.w.event(self.run_id, "interrupted", reason="a creation or reset ended before its source was in place")
 
 
-def argv(repo, config_path, run_id):
-    return [sys.executable, str(Path(repo) / "scripts" / "vm" / "vmctl.py"), "supervise", run_id,
-            "--config", str(config_path)]
+def argv(repo, config_path, run_id, root=None):
+    return [sys.executable, str(Path(repo) / "scripts" / "vm" / "vmctl.py"), "--root", str(root or repo),
+            "supervise", run_id, "--config", str(config_path)]

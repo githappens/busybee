@@ -105,12 +105,15 @@ def _secrets(rdir):
     return found
 
 
-def literals(repo, state, record):
-    """The machine- and run-specific values the public export must not carry."""
+def literals(repo, state, record, code=None):
+    """The machine- and run-specific values the public export must not carry.
+    `code` is the controller's own checkout when it is not `repo`."""
     values = {str(Path(repo)): "repo", str(Path(repo).resolve()): "repo", str(Path(state)): "state",
               str(Path(state).resolve()): "state", str(Path.home()): "home",
               getpass.getuser(): "user", socket.gethostname(): "host", socket.gethostname().split(".")[0]: "host",
               record["worker"]: "vm-name", record["run_id"]: "run-id", record["candidate"]: "baseline"}
+    if code is not None:
+        values.update({str(Path(code)): "repo", str(Path(code).resolve()): "repo"})
     for key in ("vm_id", "baseline_vm_id", "snapshot_id", "reset_snapshot_id"):
         values[record[key]] = "vm-id"
     # The account a macOS baseline's key logs into (NixOS guests use root).
@@ -121,11 +124,11 @@ def literals(repo, state, record):
     return values
 
 
-def export(repo, state, record):
+def export(repo, state, record, code=None):
     """Write the run's public evidence to runs/<run>/public; returns what it wrote."""
     rdir = Path(state) / "runs" / record["run_id"]
     out = rdir / "public"
-    redact = Redactor({**_secrets(rdir), **literals(repo, state, record)})
+    redact = Redactor({**_secrets(rdir), **literals(repo, state, record, code)})
     shutil.rmtree(out, ignore_errors=True)
     files, withheld = {}, {}
     summary = {k: record[k] for k in ("template", "clone_strategy", "allocation", "source", "status", "created_at",
@@ -183,14 +186,26 @@ def scenario_records(rdir):
     return [json.loads(p.read_text()) for p in sorted(Path(rdir).glob("scenarios/*/result.json"))]
 
 
-def coverage(records):
-    """Per scenario: the latest status in each fixture mode it ran in, and
-    whether the latest run in every required mode passed. A required mode with
-    no run is missing; a result in another mode does not stand in for it."""
+def _head(record):
+    return (record.get("provenance") or {}).get("head")
+
+
+def coverage(records, head=None):
+    """Per scenario: the latest status in each fixture mode it ran in on
+    `head` (default: the head of the latest run), and whether the latest run
+    in every required mode passed. Agents commit inside a worker, so runs of
+    another head are only counted (`other_head_runs`), never combined with
+    this one's. A required mode with no run is missing; a result in another
+    mode does not stand in for it."""
+    if head is None and records:
+        head = _head(records[-1])
     out = {}
     for record in records:
-        entry = out.setdefault(record["scenario"], {"modes": {}})
+        entry = out.setdefault(record["scenario"], {"head": head, "modes": {}, "other_head_runs": 0})
         entry["required_modes"] = record["required_modes"]
+        if _head(record) != head:
+            entry["other_head_runs"] += 1
+            continue
         entry["modes"][record["mode"]] = record["status"]
     for entry in out.values():
         entry["missing"] = [m for m in entry["required_modes"] if m not in entry["modes"]]

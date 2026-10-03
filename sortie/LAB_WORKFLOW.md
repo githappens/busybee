@@ -22,9 +22,20 @@ polling:
 hooks:
   after_create: |
     git -c credential.helper= -c credential.helper='!gh auth git-credential' clone "$BUSYBEE_SORTIE_CLONE_URL" .
+  # Each attempt runs in a fresh Linux worker from the trusted controller:
+  # before_run closes an unclosed attempt and opens one; after_run checkpoints,
+  # collects, destroys and accounts for the worker. Agent turns run there via
+  # the launcher's `session agent` command.
   before_run: |
+    set -e
     bash "$BUSYBEE_SORTIE_TRUSTED/sortie/prepare-workspace.sh"
-  timeout_ms: 120000
+    profile=$(python3 "$BUSYBEE_SORTIE_TRUSTED/sortie/lab.py" profile --issue "$SORTIE_ISSUE_IDENTIFIER")
+    python3 "$BUSYBEE_SORTIE_TRUSTED/scripts/vm/vmctl.py" --root "$BUSYBEE_LAB_ROOT" session start \
+      --issue "$SORTIE_ISSUE_IDENTIFIER" --workspace "$SORTIE_WORKSPACE" --profile "$profile"
+  after_run: |
+    python3 "$BUSYBEE_SORTIE_TRUSTED/scripts/vm/vmctl.py" --root "$BUSYBEE_LAB_ROOT" session end \
+      --workspace "$SORTIE_WORKSPACE"
+  timeout_ms: 900000
 
 agent:
   # launch.sh selects the adapter through Sortie's supported SORTIE_AGENT_*
@@ -40,7 +51,7 @@ agent:
   max_retry_backoff_ms: 300000
 
 claude-code:
-  # Sortie 1.24 requires this mode; launch.sh limits it to an allocated worker.
+  # Sortie 1.24 requires this mode; every lab turn runs in an allocated worker.
   permission_mode: bypassPermissions
   allowed_tools: "Bash Edit MultiEdit Write Read Glob Grep Agent TodoWrite"
   disallowed_tools: "mcp__sortie-tools__tracker_api"
@@ -121,36 +132,50 @@ trusted `docs/development/agent-review.md` under `$BUSYBEE_SORTIE_TRUSTED`.
 The executing policy is outside this workspace. Edits to a candidate policy
 are reviewed code; they do not replace the policy supervising this task.
 
-Use the existing `sortie-lab/{{ .issue.identifier }}` branch and its PR across
-attempts. Do not reset it to main or create a duplicate PR. Read the merged
-prerequisite code. Respect the issue's scope and named tests. Infrastructure
-issues may change only the controller/runner files their scope requires;
-product fixes may not change orchestration or approval policy.
+You work inside your own disposable Linux VM worker, as its administrator:
+install tools, restart or break daemons, signal processes, and reset it as
+your investigation needs, without asking. Your checkout is on the existing
+`sortie-lab/{{ .issue.identifier }}` branch; it is checkpointed to the
+dispatcher after every turn, so work survives a reset or a replaced worker.
+Do not reset the branch to main or create a duplicate PR. `$BUSYBEE_LAB_PR`
+names the PR when one exists. Read the merged prerequisite code. Respect the
+issue's scope and named tests. Infrastructure issues may change only the
+controller/runner files their scope requires; product fixes may not change
+orchestration or approval policy, and the session guard refuses to adopt or
+push such changes.
+
+`lab` (on your PATH) is the controller for your worker only: `lab terminal
+open|send|resize|capture` for a real terminal with decoded screens, `lab
+scenario`, `lab exec`, `lab inspect`, `lab console`, `lab collect`, `lab
+checkpoint`, and `lab reset`, which applies when your turn ends (end the turn
+after asking for it). The worker holds no GitHub credentials: `lab fetch`
+updates origin/main, `lab push [--force-with-lease]` pushes your branch, and
+`lab pr status|create|ready|comment|view` and `lab handoff` act on its PR.
 
 Host configuration and global installations are outside scope. All project Nix,
-provisioning, and tests belong in the repo. Only operate explicitly owned lab
-VMs. Product tests use private Pueue/bzbd state. Never use a developer's daemon.
-The `.claude/isolated.sh` wrapper isolates Pueue state through a generated
-config file, but it is not a cold-start fixture; do not use it as one or work
-around a cold startup bug by preparing its runtime directories.
+provisioning, and tests belong in the repo. Product tests use private
+Pueue/bzbd state even in your worker, and the startup path under test must not
+be prepared by hand: do not work around a cold startup bug by creating its
+runtime directories.
 
 When implementation and required checks are ready:
 
-1. Commit, push, and create/reuse a draft PR with `Closes #{{ .issue.identifier }}`.
-   Use `gh pr create --draft` and `--body-file` for the prepared description.
-2. Mark the implementation ready with `gh pr ready`. CI runs both trusted
+1. Commit, `lab push`, and create/reuse a draft PR with `Closes #{{ .issue.identifier }}`
+   through `lab pr create --title TITLE --body-file FILE`.
+2. Mark the implementation ready with `lab pr ready`. CI runs both trusted
    review skills in separate Claude Opus 5.5 high sessions after Linux/macOS
    checks pass. Local skill reviews are optional early feedback; do not publish
    author review receipts or claim they can satisfy the gate.
-3. Use `$BUSYBEE_SORTIE_TRUSTED/sortie/reviews.py handoff --repo OWNER/REPO
-   --pr NUMBER` to write `.sortie/scm.json` (including the pushed SHA and time)
-   and `.sortie/status`. Hand off immediately; do not wait in an agent session
-   for CI review. `needs-human-review` is Sortie's protocol name: CI supplies
-   the formal review and Sortie handles the resulting continuation or merge.
+3. `lab handoff` runs the trusted `$BUSYBEE_SORTIE_TRUSTED/sortie/reviews.py handoff`
+   on the dispatcher's checkout, writing `.sortie/scm.json` (including the
+   pushed SHA and time) and `.sortie/status`. Hand off immediately; do not wait
+   in an agent session for CI review. `needs-human-review` is Sortie's
+   protocol name: CI supplies the formal review and Sortie handles the
+   resulting continuation or merge.
 4. On a findings continuation, fix valid scoped findings, rerun affected
-   checks, and push to the same PR. Explain declined findings in a PR comment
-   with concrete evidence; CI re-reviews that new disposition even without a
-   code change. Repeat the handoff. CI settles prior findings and reviews the
+   checks, and `lab push` to the same PR. Explain declined findings with
+   `lab pr comment` and concrete evidence; CI re-reviews that new disposition
+   even without a code change. Repeat the handoff. CI settles prior findings and reviews the
    new delta; both final reports and required CI must cover the current head.
 
 Do not change issue labels/state or merge the PR yourself. Do not request the
@@ -176,7 +201,7 @@ review/handoff process. Explain declined findings with concrete reasons.
 CI skill review findings:
 {{ range .bot_review_comments }}- {{ .reviewer }}: {{ .body }}
 {{ end }}
-Read the latest formal CI review on this PR. Fix its scoped findings or explain
+Read the latest formal CI review on this PR (`lab pr view`). Fix its scoped findings or explain
 declined findings with concrete evidence in a PR comment. Retain settled
 decisions. Push changes and hand off again; CI owns the follow-up reviews.
 Do not run an author receipt loop, reply to a clean approval, or make an empty
@@ -190,6 +215,6 @@ and hand off its new head for CI review.
 {{ end }}
 {{ if .merge_conflict }}
 PR #{{ .merge_conflict.pr_number }} conflicts with {{ .merge_conflict.base }}.
-Fetch and rebase only to resolve the actual conflict, preserve scope, run the
-required checks, push with `--force-with-lease`, and review the new head.
+`lab fetch` and rebase only to resolve the actual conflict, preserve scope, run
+the required checks, `lab push --force-with-lease`, and review the new head.
 {{ end }}
