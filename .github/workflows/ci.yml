@@ -35,10 +35,10 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            pueued_asset: pueued-x86_64-unknown-linux-musl
+            pueue_target: x86_64-unknown-linux-musl
             agg_asset: agg-x86_64-unknown-linux-gnu
           - os: macos-latest
-            pueued_asset: pueued-aarch64-apple-darwin
+            pueue_target: aarch64-apple-darwin
             agg_asset: agg-aarch64-apple-darwin
     steps:
       - uses: actions/checkout@v7
@@ -54,13 +54,16 @@ jobs:
           # .cargo/config.toml redirects the target dir to build/.
           workspaces: ". -> build"
 
-      - name: Install pueued ${{ env.PUEUE_VERSION }}
+      - name: Install pueued and pueue ${{ env.PUEUE_VERSION }}
+        # The client is for the agent harness's real launcher test.
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.local/bin"
-          curl -fsSL -o "$HOME/.local/bin/pueued" \
-            "https://github.com/Nukesor/pueue/releases/download/v$PUEUE_VERSION/${{ matrix.pueued_asset }}"
-          chmod +x "$HOME/.local/bin/pueued"
+          for tool in pueued pueue; do
+            curl -fsSL -o "$HOME/.local/bin/$tool" \
+              "https://github.com/Nukesor/pueue/releases/download/v$PUEUE_VERSION/$tool-${{ matrix.pueue_target }}"
+            chmod +x "$HOME/.local/bin/$tool"
+          done
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache GNU make ${{ env.MAKE_VERSION }}
@@ -98,6 +101,7 @@ jobs:
           atleast make 4.4 "$(make --version | sed -n '1s/^GNU Make //p')"
           atleast ninja 1.13 "$(ninja --version)"
           atleast pueued 4.0 "$(pueued --version | awk '{print $2}')"
+          atleast pueue 4.0 "$(pueue --version | awk '{print $2}')"
 
       - run: cargo fmt --all --check
 
@@ -125,6 +129,7 @@ jobs:
           python3 -m unittest discover -s scripts/vm/tests
           python3 -m unittest discover -s tests/scenarios/tests
           bash sortie/test-machine-safety-hook.sh
+          bash sortie/test-isolated-launcher.sh
           bash sortie/test-harness-docs.sh
 
       - run: cargo clippy --workspace --all-targets -- -D warnings

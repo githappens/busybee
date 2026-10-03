@@ -130,9 +130,9 @@ product fixes may not change orchestration or approval policy.
 Host configuration and global installations are outside scope. All project Nix,
 provisioning, and tests belong in the repo. Only operate explicitly owned lab
 VMs. Product tests use private Pueue/bzbd state. Never use a developer's daemon.
-The legacy `.claude/isolated.sh` wrapper has a tracked config-file defect until
-#71 is merged; do not mistake it for a validated fixture or work around a cold
-startup bug by preparing its runtime directories.
+The `.claude/isolated.sh` wrapper isolates Pueue state through a generated
+config file, but it is not a cold-start fixture; do not use it as one or work
+around a cold startup bug by preparing its runtime directories.
 
 When implementation and required checks are ready:
 

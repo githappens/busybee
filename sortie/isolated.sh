@@ -3,8 +3,9 @@
 #
 # Usage: .claude/isolated.sh <busybee|bzb|bzbd|pueued|pueue> [args...]
 #
-# Sets BUSYBEE_STATE_DIR and PUEUE_CONFIG_PATH under this workspace, then
-# execs the tool. This is the only supported way for a sortie agent to launch
+# Sets BUSYBEE_STATE_DIR under this workspace and points PUEUE_CONFIG_PATH at a
+# generated workspace-local Pueue YAML file whose data, runtime, alias and
+# socket paths all sit in that workspace, then execs the tool. This is the only supported way for a sortie agent to launch
 # those programs; the PreToolUse hook denies every other spelling.
 set -euo pipefail
 
@@ -46,9 +47,57 @@ ensure_workspace_dir() {
   esac
 }
 
+case "$root" in
+  *[[:cntrl:]]*) echo "isolated.sh: workspace path contains a control character" >&2; exit 2 ;;
+esac
+ensure_workspace_dir "$state_root"
 ensure_workspace_dir "$busybee_state"
 ensure_workspace_dir "$pueue_state"
 
+# sun_path holds the socket path and its terminating NUL. A longer path fails
+# at bind time with an unclear error, so refuse it here instead.
+case "$(uname -s)" in
+  Darwin|*BSD) socket_limit=104 ;;
+  *) socket_limit=108 ;;
+esac
+check_socket() {
+  local LC_ALL=C
+  if [ $((${#1} + 1)) -gt "$socket_limit" ]; then
+    echo "isolated.sh: socket path $1 is ${#1} bytes; $(uname -s) allows $((socket_limit - 1)). Use a workspace with a shorter path." >&2
+    exit 2
+  fi
+}
+pueue_socket=$pueue_state/pueue.sock
+check_socket "$busybee_state/bzbd.sock"
+check_socket "$pueue_socket"
+
+# Paths become YAML double-quoted scalars. The workspace path was checked for
+# control characters above, so escaping backslash and quote is sufficient.
+yaml_string() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '"%s"' "$s"
+}
+
+# Regenerated on every launch, so it always matches this workspace. Refuse a
+# symlink or other non-file there rather than writing through it.
+pueue_config=$state_root/pueue.yml
+if [ -L "$pueue_config" ] || { [ -e "$pueue_config" ] && [ ! -f "$pueue_config" ]; }; then
+  echo "isolated.sh: $pueue_config exists and is not a regular file" >&2
+  exit 2
+fi
+pueue_config_tmp=$(mktemp "$state_root/.pueue.yml.XXXXXX")
+{
+  printf 'shared:\n'
+  printf '  pueue_directory: %s\n' "$(yaml_string "$pueue_state")"
+  printf '  runtime_directory: %s\n' "$(yaml_string "$pueue_state")"
+  printf '  alias_file: %s\n' "$(yaml_string "$pueue_state/aliases.yml")"
+  printf '  use_unix_socket: true\n'
+  printf '  unix_socket_path: %s\n' "$(yaml_string "$pueue_socket")"
+} >"$pueue_config_tmp"
+mv -f "$pueue_config_tmp" "$pueue_config"
+
 export BUSYBEE_STATE_DIR=$busybee_state
-export PUEUE_CONFIG_PATH=$pueue_state
+export PUEUE_CONFIG_PATH=$pueue_config
 exec "$tool" "$@"

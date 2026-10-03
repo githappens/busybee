@@ -60,7 +60,9 @@ nix develop .#agent -c python3 sortie/lab.py release --dry-run
 continuations, including unfinished work and remotely existing branches. It
 sets credentials only inside the disposable checkout. Product tests must own
 private Pueue/bzbd state. The Claude machine-safety hook is a cooperative guard,
-not a security boundary; the isolated wrapper's cold-start defect remains #71.
+not a security boundary. `isolated.sh` points `PUEUE_CONFIG_PATH` at a generated
+workspace-local YAML file; `test-isolated-launcher.sh` drives a real Pueue
+through it and fails when Pueue is missing. It is not a cold-start fixture.
 
 ## Review loop
 
@@ -85,6 +87,7 @@ Restart a stopped controller to adopt a newly merged policy snapshot.
 ```sh
 nix develop .#agent -c python3 -m unittest discover -s sortie/tests
 nix develop .#agent -c bash sortie/test-machine-safety-hook.sh
+nix develop .#agent -c bash sortie/test-isolated-launcher.sh
 bash sortie/test-harness-docs.sh
 ```
 
