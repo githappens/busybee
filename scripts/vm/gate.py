@@ -21,7 +21,9 @@ and its base:
   overlay's `cargo test`) fails on the base and passes on the candidate. A
   candidate failure the base does not share is `failed`. A failure the base
   shares is listed in `preexisting`, never dropped; the verdict is then
-  `preexisting_failures` rather than `verified`.
+  `preexisting_failures` rather than `verified`. With no regression declared
+  at all, passing checks are `checks_only`: not a verified fix, and accepted
+  only for an infrastructure session, which owes no product regression.
 
 `evaluate` runs or reuses the two matrices and writes the result to
 `gates/<id>/gate.json`, with a redacted `gate.public.json` beside it; `comment`
@@ -44,8 +46,16 @@ import verify
 import worker
 
 SCHEMA = "busybee.vm.gate/v1"
-# Verdicts that let a candidate go to review.
+# Verdicts that show a fix and let a candidate go to review.
 PASSING = ("verified", "preexisting_failures")
+# Passing checks with no regression to show; only infrastructure work may go
+# to review on it (sortie/guard-policy.json's profiles).
+CHECKS_ONLY = "checks_only"
+
+
+def accepted(verdict, profile):
+    """Whether a session of `profile` may hand off a head with `verdict`."""
+    return verdict in PASSING or (verdict == CHECKS_ONLY and profile == "infrastructure")
 # The first line of the pull-request comment that carries the evidence.
 MARKER = "busybee-lab-evidence:v1"
 STALE = ("evidence_stale",)
@@ -209,9 +219,24 @@ def assess(issue, expect, candidate, base, metas, exists, worker_status):
         verdict = "incomplete"
     elif errors:
         verdict = "failed"
+    elif not regressions:
+        verdict = CHECKS_ONLY
     else:
         verdict = "preexisting_failures" if preexisting else "verified"
     return {"verdict": verdict, "findings": findings, "regressions": regressions, "preexisting": preexisting}
+
+
+def _accepted_candidates(ops):
+    """Candidate matrices an earlier gate accepted, by path."""
+    found = set()
+    for path in (ops.state / "gates").glob("*/gate.json"):
+        try:
+            record = json.loads(path.read_text())
+        except ValueError:
+            continue
+        if record.get("verdict") in PASSING + (CHECKS_ONLY,) and record.get("candidate", {}).get("matrix"):
+            found.add(record["candidate"]["matrix"])
+    return found
 
 
 def _reusable(ops, role, expect, platforms):
@@ -219,6 +244,7 @@ def _reusable(ops, role, expect, platforms):
     whose public evidence is still on disk and whose workers are gone."""
     found = []
     exists = lambda rel: (ops.state / rel).exists()  # noqa: E731
+    accepted_before = _accepted_candidates(ops) if role == "candidate" else set()
     for path in (ops.state / "verifications").glob("*/matrix.json"):
         try:
             m = json.loads(path.read_text())
@@ -229,9 +255,12 @@ def _reusable(ops, role, expect, platforms):
         if not problems:
             _complete(role, m, expect, ops.metas(), exists, ops.worker_status, problems)
         # A refused candidate is verified again on request, so a flaky check does
-        # not stick to its head; a base, red on main by design, is reused.
-        settled = ("verified",) if role == "candidate" else ("verified", "failed")
-        if not [f for f in problems if f["severity"] == "error"] and m.get("verdict") in settled \
+        # not stick to its head; one a gate accepted stays settled, as does a
+        # base, red on main by design.
+        settled = m.get("verdict") in ("verified", "failed") if role == "base" else \
+            m.get("verdict") == "verified" or (m.get("verdict") == "failed"
+                                               and str(path.relative_to(ops.state)) in accepted_before)
+        if not [f for f in problems if f["severity"] == "error"] and settled \
                 and set(platforms) <= set(m.get("required_platforms", ())):
             found.append((m["id"], path))
     return max(found)[1] if found else None
@@ -246,9 +275,10 @@ def _matrix(ops, role, revision, overlay, expect, platforms):
     return (ops.state / rel if rel else None), False
 
 
-def evaluate(ops, issue, revision, base, overlay=None, platforms=contracts.GUEST_OS):
+def evaluate(ops, issue, revision, base, overlay=None, platforms=contracts.GUEST_OS, profile=None):
     """Verify (or reuse) `revision` and its `base` (with `overlay`, a test
-    patch) on `platforms`, then assess them; returns a contracts result."""
+    patch) on `platforms`, then assess them; returns a contracts result.
+    `profile` is the session's, which decides whether `checks_only` passes."""
     platforms = list(platforms)
     expect = {"revision": revision, "base": base, "controller": ops.controller(),
               "overlay_sha256": hashlib.sha256(Path(overlay).read_bytes()).hexdigest() if overlay else None,
@@ -279,7 +309,7 @@ def evaluate(ops, issue, revision, base, overlay=None, platforms=contracts.GUEST
     evidence_id = hashlib.sha256(json.dumps(
         {"issue": issue, "expect": expect, "matrices": {r: s["matrix"] for r, s in sides.items()},
          "verdict": result["verdict"]}, sort_keys=True).encode()).hexdigest()
-    record = {"schema": SCHEMA, "id": gid, "issue": issue, "verdict": result["verdict"],
+    record = {"schema": SCHEMA, "id": gid, "issue": issue, "profile": profile, "verdict": result["verdict"],
               "evidence_id": evidence_id, "controller": expect["controller"], "platforms": platforms,
               **sides, "regressions": result["regressions"], "preexisting": result["preexisting"],
               "findings": result["findings"]}
@@ -292,8 +322,8 @@ def evaluate(ops, issue, revision, base, overlay=None, platforms=contracts.GUEST
         public[side] = {k: v for k, v in public[side].items() if k != "runs"}
     evidence.durable(gdir / "gate.public.json", evidence.Redactor(literals).json(
         (json.dumps(public, indent=2) + "\n").encode()))
-    status = {"verified": "success", "preexisting_failures": "success", "failed": "product_failure"}.get(
-        result["verdict"], "environment_failure")
+    status = "success" if accepted(result["verdict"], profile) else {
+        "failed": "product_failure", CHECKS_ONLY: "product_failure"}.get(result["verdict"], "environment_failure")
     summary = f"#{issue} at {revision[:12]} against {base[:12]}: {result['verdict']}"
     return contracts.result("gate", status, summary, result["findings"], {
         "id": gid, "verdict": result["verdict"], "evidence_id": evidence_id,
@@ -305,7 +335,8 @@ def comment(public):
     """The pull-request comment for a gate's public record: a marker line the
     CI review gate reads, a short table, and the record itself."""
     header = {"head": public["candidate"]["revision"], "base": public["base"]["revision"],
-              "issue": public["issue"], "verdict": public["verdict"], "evidence_id": public["evidence_id"]}
+              "issue": public["issue"], "verdict": public["verdict"], "evidence_id": public["evidence_id"],
+              "profile": public.get("profile")}
     lines = [f"<!-- {MARKER} {json.dumps(header, sort_keys=True)} -->",
              f"**Lab evidence** for #{public['issue']} at `{header['head'][:12]}` against base "
              f"`{header['base'][:12]}`: **{public['verdict']}**", "",
@@ -322,12 +353,17 @@ def comment(public):
                 cells.append(", ".join(f"{s} {m} {st}" for s, modes in got["scenarios"].items()
                                        for m, st in modes.items()) or "none")
         lines.append(f"| {platform} | " + " | ".join(cells) + " |")
+    if public["verdict"] == CHECKS_ONLY:
+        lines += ["", f"No regression is declared for #{public['issue']}: no scenario names it and no test "
+                  "overlay was given, so nothing shows a red base. The required checks pass on both platforms; "
+                  f"this is not a verified fix (accepted for review only in an infrastructure session; this one "
+                  f"is `{public.get('profile')}`)."]
     if public["preexisting"]:
         lines += ["", "Failing on the base too: " + ", ".join(
             f"{p['platform']} {p['name']}" + (f" ({p['mode']})" if p.get("mode") else "") for p in public["preexisting"])]
-    errors = [f for f in public["findings"] if f["severity"] == "error"]
-    if errors:
-        lines += ["", *[f"- `{f['code']}`: {f['message']}" for f in errors]]
+    shown = [f for f in public["findings"] if f["severity"] == "error" or f["code"] == "regression_undeclared"]
+    if shown:
+        lines += ["", *[f"- `{f['code']}` ({f['severity']}): {f['message']}" for f in shown]]
     lines += ["", "<details><summary>gate.public.json</summary>", "", "```json",
               json.dumps(public, indent=2), "```", "</details>"]
     return "\n".join(lines) + "\n"

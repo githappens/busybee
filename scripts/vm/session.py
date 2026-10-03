@@ -235,11 +235,11 @@ class Controller:
     def export(self, run_id):
         return self.w.export(run_id)
 
-    def gate(self, issue, revision, base, overlay, source_repo, branch):
+    def gate(self, issue, revision, base, overlay, source_repo, branch, profile):
         """The evidence gate on the lab's own workers; the revisions come from
         the session's workspace."""
         self.w.source_repo, self.w.transfer_refs = Path(source_repo), (f"refs/heads/{branch}",)
-        return gate.evaluate(gate.WorkerOps(self.w), issue, revision, base, overlay)
+        return gate.evaluate(gate.WorkerOps(self.w), issue, revision, base, overlay, profile=profile)
 
     def collected(self, run_id):
         latest = worker._latest_dir(worker.run_dir(self.state, run_id) / "collect")
@@ -790,7 +790,7 @@ class Sessions:
         except (RuntimeError, ValueError) as err:
             return done("environment_failure", f"no base to verify against: {err}")
         try:
-            result = self.c.gate(issue, head, base, overlay, workspace, session["branch"])
+            result = self.c.gate(issue, head, base, overlay, workspace, session["branch"], session["profile"])
         except (worker.Refused, guest.GuestError, parallels.ParallelsError, template.DeadlineExceeded, OSError,
                 ValueError, RuntimeError) as err:  # recorded as verification that could not complete
             result = contracts.result("gate", "environment_failure", "verification did not run", [
@@ -800,7 +800,7 @@ class Sessions:
         attempt["verification"] = {"head": head, "base": base, "verdict": verdict, "record": record,
                                    "gate": result["data"].get("gate")}
         self._save(session, attempt)
-        if verdict not in gate.PASSING:
+        if not gate.accepted(verdict, session["profile"]):
             failed = [f for f in result["findings"] if f["severity"] == "error"]
             summary = f"verification of {head[:12]} is {verdict}: " + "; ".join(
                 f"{f['code']}: {f['message']}" for f in failed[:5])
@@ -872,8 +872,10 @@ class Sessions:
         """The gate's public record on the PR, once per piece of evidence."""
         body = gate.comment(json.loads((self.state / result["data"]["public"]).read_text()))
         marker = body.splitlines()[0]
-        view = json.loads(self._gh(session, "pr", "view", str(request["pr"]), "--json", "comments"))
-        if any((c.get("body") or "").splitlines()[:1] == [marker] for c in view.get("comments", [])):
+        view = json.loads(self._gh(session, "pr", "view", str(request["pr"]), "--json", "author,comments"))
+        author = (view.get("author") or {}).get("login")
+        if any((c.get("body") or "").splitlines()[:1] == [marker] and (c.get("author") or {}).get("login") == author
+               for c in view.get("comments", [])):
             return  # already there: unchanged evidence is not posted again
         self._gh(session, "pr", "comment", str(request["pr"]), "--body-file", "-", stdin=body)
 

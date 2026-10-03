@@ -94,7 +94,8 @@ Trust model:
   evidence for its current head: a comment by the PR's author (the dispatcher
   identity the controller acts as) whose first line is the
   `busybee-lab-evidence:v1` marker with a `verified` or
-  `preexisting_failures` verdict. Without it no review session starts and
+  `preexisting_failures` verdict, or `checks_only` for an `infrastructure`
+  profile. Without it no review session starts and
   the gate waits; an approval whose evidence is gone is revoked. The
   controller refuses agent text carrying the marker. The packet names the
   comment as `lab_evidence`, and it is part of the input fingerprint, so new

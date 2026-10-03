@@ -57,7 +57,8 @@ elif args[:2] == ["pr", "comment"]:
 elif args[:2] == ["pr", "view"]:
     p = next(p for p in state["prs"] if p["number"] == int(args[2]))
     out = json.dumps({"number": p["number"], "isDraft": p["draft"], "state": p["state"].upper(),
-                      "comments": [{"body": c} for c in p.get("comments", [])]})
+                      "author": {"login": "dispatcher"},
+                      "comments": [{"body": c, "author": {"login": "dispatcher"}} for c in p.get("comments", [])]})
 elif args[:2] == ["repo", "view"]:
     out = "owner/repo\n"
 elif args[0] == "api":
@@ -221,12 +222,12 @@ class FakeController:
         path = worker.run_dir(self.state, run_id) / "collect" / "0001" / "collected.json"
         return path if path.is_file() else None
 
-    def gate(self, issue, revision, base, overlay, source_repo, branch):
+    def gate(self, issue, revision, base, overlay, source_repo, branch, profile):
         # The lab's workers verify; the session's own must be gone by now.
         held = [r["run_id"] for r in map(json.loads, (p.read_text() for p in self.state.glob("runs/*/worker.json")))
                 if r["status"] == "ready"]
         self.calls.append(("gate", revision, base, held))
-        return gate.evaluate(self.gate_ops, issue, revision, base, overlay)
+        return gate.evaluate(self.gate_ops, issue, revision, base, overlay, profile=profile)
 
     def operation(self, op, run_id, **args):
         self.calls.append((op, run_id, args))
@@ -588,7 +589,8 @@ class ExitTests(Harness):
         for outcome, (script, timeout, how) in cases.items():
             with self.subTest(outcome=outcome):
                 self.sessions.cancel.clear()
-                run_id = self.start()
+                # No scenario names #42, so only an infrastructure session hands off on passing checks.
+                run_id = self.start("infrastructure" if outcome == "success" else "product")
                 if how == "cancel":
                     threading.Timer(1, self.sessions.cancel.set).start()
                 argv = how if isinstance(how, list) else None
@@ -660,6 +662,11 @@ class GateTests(Harness):
     def setUp(self):
         super().setUp()
         (self.tmp / "body.md").write_text("Closes #42\n")
+
+    def start(self, profile="infrastructure"):
+        # No scenario names #42: only an infrastructure session may hand off
+        # a head whose checks pass without a regression to show.
+        return super().start(profile)
 
     def handoff(self, change, push="lab push"):
         return self.turn(f"""
@@ -763,6 +770,21 @@ class GateTests(Harness):
         # This attempt only read the result; it asked for no review.
         self.assert_accounted(self.sessions.end(self.workspace)["data"], "no_handoff")
         self.assertEqual(self.sessions.status(ISSUE)["data"]["latest_verification"]["verdict"], "failed")
+
+    def test_a_product_fix_without_a_regression_is_not_handed_off(self):
+        self.start("product")
+        self.assertEqual(self.handoff(self.commit("fix.txt", "one")), 0, self.err.getvalue())
+        self.assertIsNone(self.status())
+        self.assertEqual(self.attempt()["verification"]["verdict"], "checks_only")
+        self.assertIn("checks_only", self.err.getvalue())
+
+    def test_unchanged_evidence_is_not_verified_or_posted_again_on_a_red_main(self):
+        def red(m):
+            m["platforms"]["linux"]["checks"]["test"].update(status="product_failure", exit_code=101)
+            return dict(m, verdict="failed")
+        self.c.gate_ops.candidate = lambda rev: red(matrix("candidate", rev))
+        self.c.gate_ops.base = lambda rev, overlay: red(matrix("base", rev, overlay=overlay))
+        self.test_unchanged_evidence_is_not_verified_or_posted_again()
 
     def test_unchanged_evidence_is_not_verified_or_posted_again(self):
         self.start()

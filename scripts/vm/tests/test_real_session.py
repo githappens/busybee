@@ -270,7 +270,9 @@ class RealSessionTests(unittest.TestCase):
         ]
         for outcome, script, how in cases:
             with self.subTest(outcome=outcome):
-                run_id = self.start()["run_id"]
+                # No scenario names the synthetic issue: only an infrastructure
+                # session hands off a head on passing checks alone.
+                run_id = self.start("infrastructure" if outcome == "success" else "product")["run_id"]
                 if "cancel_after" in how:
                     runner = self.agent(script, background=True)
                     time.sleep(how["cancel_after"])
@@ -284,14 +286,14 @@ class RealSessionTests(unittest.TestCase):
                 self.assertEqual((end["outcome"], end["run_id"]), (outcome, run_id), end)
                 if outcome == "success":
                     # Handed off only once the gate accepted the head on both platforms.
-                    self.assertIn(self.attempt()["verification"]["verdict"], ("verified", "preexisting_failures"))
+                    self.assertEqual(self.attempt()["verification"]["verdict"], "checks_only")
                     self.assertEqual((self.workspace / ".sortie" / "status").read_text(), "needs-human-review\n")
                 self.assertEqual(code, {"timeout": 124, "cancelled": 143, "adapter_failure": 127}.get(outcome, 0))
                 public = json.loads((STATE / end["exported"] / "manifest.json").read_text())
                 self.assertEqual(public["missing"], [])
 
     def test_a_claim_of_success_is_handed_off_only_on_evidence(self):
-        self.start()
+        self.start("infrastructure")
         # The agent claims success for a head that breaks formatting.
         code = self.agent("""
             sed -i 's/^fn main() {/fn  main() {/' crates/bzbd/src/main.rs
@@ -329,14 +331,14 @@ class RealSessionTests(unittest.TestCase):
         self.assertEqual(len(comments), 1)
         header = json.loads(comments[0].splitlines()[0].split(" ", 2)[2].rsplit(" -->", 1)[0])
         self.assertEqual(header["head"], git("-C", str(self.workspace), "rev-parse", "HEAD"))
-        self.assertIn(header["verdict"], ("verified", "preexisting_failures"))
+        self.assertEqual((header["verdict"], header["profile"]), ("checks_only", "infrastructure"))
         self.assertEqual(self.end()["outcome"], "success")
 
     @unittest.skipUnless(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN"), "needs a Claude credential in the environment")
     def test_a_model_agent_hands_off_through_the_gate(self):
         # A real model-backed Claude turn in the worker: it changes the branch,
         # opens and readies the PR and asks for review; the gate decides.
-        self.start()
+        self.start("infrastructure")
         prompt = ("You work in a disposable VM on branch sortie-lab/990079 of busybee; `lab` is on your PATH. "
                   "Do exactly this with the Bash tool, then stop: create PILOT.md containing the line "
                   "'model-backed lab turn'; commit it with `git -c user.name=Lab -c user.email=lab@example.test "
@@ -351,7 +353,7 @@ class RealSessionTests(unittest.TestCase):
         self.assertIn('"type":"result"', self.last_log.replace(" ", ""))
         self.assertEqual(git("-C", str(self.workspace), "show", "HEAD:PILOT.md").strip(), "model-backed lab turn")
         verification = self.attempt()["verification"]
-        self.assertIn(verification["verdict"], ("verified", "preexisting_failures"), verification)
+        self.assertEqual(verification["verdict"], "checks_only", verification)
         self.assertEqual((self.workspace / ".sortie" / "status").read_text(), "needs-human-review\n")
         comments = json.loads((self.tmp / "gh.json").read_text())["prs"][0]["comments"]
         self.assertEqual(len(comments), 1)

@@ -12,8 +12,9 @@ reviews = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(reviews)
 
 
-def lab_comment(comment_id, head, verdict, login="author", evidence="e"):
-    header = {"head": head, "base": "f" * 40, "issue": 72, "verdict": verdict, "evidence_id": evidence * 64}
+def lab_comment(comment_id, head, verdict, login="author", evidence="e", profile="product"):
+    header = {"head": head, "base": "f" * 40, "issue": 72, "verdict": verdict, "evidence_id": evidence * 64,
+              "profile": profile}
     return {"id": comment_id, "user": {"login": login, "type": "User"}, "author_association": "OWNER",
             "body": f"<!-- {reviews.LAB_MARKER} {json.dumps(header, sort_keys=True)} -->\n**Lab evidence**\n"}
 
@@ -142,6 +143,11 @@ class ReviewGateTests(unittest.TestCase):
         self.packet["prior_comments"] = [lab_comment(1, self.head, "preexisting_failures")]
         self.record["input_id"] = reviews.input_id(self.packet)
         self.assertEqual(self.decision(), "READY")
+        # Passing checks with no regression shown pass only for an infrastructure issue.
+        for profile, expected in (("product", "WAITING"), ("infrastructure", "READY")):
+            self.packet["prior_comments"] = [lab_comment(1, self.head, "checks_only", profile=profile)]
+            self.record["input_id"] = reviews.input_id(self.packet)
+            self.assertEqual(self.decision(), expected, profile)
         # A PR that is not a lab session's needs none.
         self.pr["head"]["ref"] = "feature/fix"
         self.packet["prior_comments"] = []

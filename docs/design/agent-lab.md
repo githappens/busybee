@@ -782,18 +782,24 @@ to two platform matrices, the candidate's and its base's:
   A failure the base shares, such as a known product bug in another issue, is
   listed under `preexisting` and the verdict is `preexisting_failures`, which
   may go to review with that list in its evidence; it is never dropped.
+- **No regression declared.** When no scenario names the issue and no overlay
+  is given, nothing shows a red base: passing checks are `checks_only`, which
+  is not a verified fix. Its evidence says so in its first lines.
 
-`verified` and `preexisting_failures` pass. The gate reads its evidence and
+`verified` and `preexisting_failures` pass for every session. `checks_only`
+passes only for an `infrastructure` session (`sortie/guard-policy.json`),
+whose lab or harness work owes no product regression; a product session must
+name its regression, through a scenario or `handoff --overlay`. The gate reads its evidence and
 changes none of it, so a refusal keeps every matrix and run for diagnosis.
 Complete matrices bound to the same evidence are reused, so unchanged
-evidence is not verified twice: a verified candidate, and a base whether it
-passed or failed. A refused candidate is verified again when its handoff is
+evidence is not verified twice: a candidate that was verified or that a gate
+accepted, and a base whether it passed or failed. A refused candidate is verified again when its handoff is
 asked for again, so a flaky check does not stick to an unchanged head;
 incomplete matrices are never reused. The pull-request
 comment that carries the public record starts with `<!-- busybee-lab-evidence:v1
-{head, base, issue, verdict, evidence_id} -->`; the CI review gate requires one
-by the PR's author, for the current head, with a passing verdict, before it
-reviews or approves a `sortie-lab/` PR
+{head, base, issue, verdict, evidence_id, profile} -->`; the CI review gate
+requires one by the PR's author, for the current head, with a verdict that
+passes for its profile, before it reviews or approves a `sortie-lab/` PR
 ([review workflow](../development/agent-review.md)).
 
 ## Implementation sequence

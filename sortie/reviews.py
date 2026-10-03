@@ -98,8 +98,10 @@ def lab_errors(packet):
     found = lab_evidence(packet)
     if found is None:
         return [f"No lab evidence for head {packet['head']}; the lab controller posts it when it accepts a handoff"]
-    if found.get("verdict") not in LAB_PASSING:
-        return [f"The lab evidence for head {packet['head']} is {found.get('verdict')}, not accepted"]
+    verdict = found.get("verdict")
+    # Passing checks without a regression to show suffice only for infrastructure work.
+    if verdict not in LAB_PASSING and not (verdict == "checks_only" and found.get("profile") == "infrastructure"):
+        return [f"The lab evidence for head {packet['head']} is {verdict} ({found.get('profile')}), not accepted"]
     return []
 
 

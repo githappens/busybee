@@ -169,11 +169,18 @@ class AssessTests(unittest.TestCase):
         # The overlay must be the one the base ran with.
         self.assertEqual(self.assess(overlay_sha256="0" * 64)["verdict"], "stale")
 
-    def test_an_issue_without_a_declared_regression_says_so(self):
+    def test_an_issue_without_a_declared_regression_is_not_a_verified_fix(self):
+        # Nothing shows a red base: the checks pass, but no fix is shown.
         result = self.assess(issue=80)
-        self.assertEqual(result["verdict"], "verified", result["findings"])
+        self.assertEqual(result["verdict"], "checks_only", result["findings"])
+        self.assertNotIn(result["verdict"], gate.PASSING)
         self.assertEqual(result["regressions"], [])
         self.assertIn("regression_undeclared", {f["code"] for f in result["findings"] if f["severity"] == "warning"})
+        # Only an infrastructure session, which owes no product regression, may hand it off.
+        self.assertTrue(gate.accepted("checks_only", "infrastructure"))
+        self.assertFalse(gate.accepted("checks_only", "product"))
+        self.assertTrue(gate.accepted("preexisting_failures", "product"))
+        self.assertFalse(gate.accepted("failed", "infrastructure"))
 
 
 class FakeOps:
@@ -245,8 +252,12 @@ class EvaluateTests(unittest.TestCase):
         self.assertEqual(self.ops.runs[2:], [("candidate", "d" * 40)])
         # A refused candidate is verified again when asked again (a flaky check
         # must not stick to an unchanged head); its base, red on main, is reused.
-        self.ops.candidate = lambda rev: dict(matrix("candidate", rev), verdict="failed")
-        gate.evaluate(self.ops, ISSUE, "f" * 40, BASE)
+        def refused(rev):
+            m = matrix("candidate", rev)
+            m["platforms"]["linux"]["checks"]["fmt"].update(status="product_failure", exit_code=1)
+            return dict(m, verdict="failed")
+        self.ops.candidate = refused
+        self.assertEqual(gate.evaluate(self.ops, ISSUE, "f" * 40, BASE)["data"]["verdict"], "failed")
         gate.evaluate(self.ops, ISSUE, "f" * 40, BASE)
         self.assertEqual(self.ops.runs[3:], [("candidate", "f" * 40)] * 2)
         # Evidence that could not complete is never reused.
@@ -254,6 +265,31 @@ class EvaluateTests(unittest.TestCase):
         gate.evaluate(self.ops, ISSUE, "e" * 40, BASE)
         gate.evaluate(self.ops, ISSUE, "e" * 40, BASE)
         self.assertEqual(self.ops.runs[5:], [("candidate", "e" * 40)] * 2)
+
+    def test_an_accepted_candidate_on_a_red_main_stays_settled(self):
+        # Today main fails checks of its own; an accepted head fails them too.
+        def red(m):
+            m["platforms"]["linux"]["checks"]["test"].update(status="product_failure", exit_code=101)
+            return dict(m, verdict="failed")
+        self.ops.candidate = lambda rev: red(matrix("candidate", rev))
+        self.ops.base = lambda rev, overlay: red(matrix("base", rev, red=("umask-startup",), overlay=overlay))
+        first = gate.evaluate(self.ops, ISSUE, REV, BASE, profile="product")
+        self.assertEqual(first["data"]["verdict"], "preexisting_failures")
+        runs = list(self.ops.runs)
+        again = gate.evaluate(self.ops, ISSUE, REV, BASE, profile="product")
+        self.assertEqual(self.ops.runs, runs)
+        self.assertEqual(again["data"]["evidence_id"], first["data"]["evidence_id"])
+        body = gate.comment(json.loads((self.state / again["data"]["public"]).read_text()))
+        self.assertEqual(body.splitlines()[0], gate.comment(json.loads(
+            (self.state / first["data"]["public"]).read_text())).splitlines()[0])
+
+    def test_the_comment_says_what_was_not_shown(self):
+        result = gate.evaluate(self.ops, 80, REV, BASE, profile="infrastructure")
+        body = gate.comment(json.loads((self.state / result["data"]["public"]).read_text()))
+        header = json.loads(body.splitlines()[0][len(f"<!-- {gate.MARKER} "):-len(" -->")])
+        self.assertEqual((header["verdict"], header["profile"]), ("checks_only", "infrastructure"))
+        self.assertIn("not a verified fix", body.split("<details>")[0])
+        self.assertIn("regression_undeclared", body.split("<details>")[0])
 
     def test_pilot_replays_red_base_and_green_candidate(self):
         # #69's red run, recorded by the lab on both platforms (the sanitized

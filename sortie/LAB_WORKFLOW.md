@@ -174,7 +174,8 @@ When implementation and required checks are ready:
    controller releases your worker and verifies the head and its merge base
    with main in fresh Linux and macOS workers (required checks, the issue's
    regression scenarios red on the base and green on the head, terminal
-   evidence, cleanup). If you added a regression test, name its files with
+   evidence, cleanup). A product fix must show its regression: a scenario
+   naming the issue, or the regression test files you added, named with
    `lab handoff --overlay PATH...` so the base's red run includes them. Only
    an accepted head is handed to review, with the evidence posted on the PR;
    then the trusted `$BUSYBEE_SORTIE_TRUSTED/sortie/reviews.py handoff`
