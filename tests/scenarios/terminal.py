@@ -131,6 +131,14 @@ def kdl_string(text):
     return f'"{text}"'
 
 
+# zellij can start a pane's command before it sizes the pane's PTY. Started
+# then, `script` records the size as -1x-1 and the program may draw before any
+# size is known, which no replay can lay out. Wait (bounded: 20 x 0.1s) for a
+# size; a pane that never gets one still starts, and its replay fails loudly.
+AWAIT_SIZE = ('i=0; while [ "$(stty size 2>/dev/null)" = "0 0" ] && [ $i -lt 20 ]; do '
+              'sleep 0.1; i=$((i + 1)); done')
+
+
 def run_script(rec, argv, cwd, env):
     """The pane's command: `script` recording argv in advanced timing format,
     flushing every write (-f) so a capture can replay what the screen shows,
@@ -138,7 +146,7 @@ def run_script(rec, argv, cwd, env):
     words = ["env", *(f"{k}={v}" for k, v in env.items()), "script", "-q", "-f", "-e", "-E", "never", "-m", "advanced",
              "-O", str(rec / "output"), "-I", str(rec / "input"), "-T", str(rec / "timing"),
              "-c", "exec " + shlex.join(argv)]
-    return f"#!/bin/sh\ncd {shlex.quote(str(cwd))} || exit 127\nexec {shlex.join(words)}\n"
+    return f"#!/bin/sh\ncd {shlex.quote(str(cwd))} || exit 127\n{AWAIT_SIZE}\nexec {shlex.join(words)}\n"
 
 
 def layout(command):

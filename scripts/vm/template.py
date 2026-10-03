@@ -80,9 +80,9 @@ def task_state_problems(facts, bootstrap_key):
     return problems
 
 
-def ineligibility(checks):
+def ineligibility(checks, capabilities=CAPABILITIES):
     reasons = []
-    for name in CAPABILITIES:
+    for name in capabilities:
         check = checks.get(name)
         if check is None:
             reasons.append(f"{name}: not checked")
@@ -160,12 +160,20 @@ def _sha256(path):
 
 
 class Lab:
-    """Template operations against real Parallels, bounded by the config's deadlines."""
+    """Template operations against real Parallels, bounded by the config's
+    deadlines. `connect` makes a guest.Guest and `lease` finds a VM's address;
+    tests substitute them. Subclasses (macos.MacLab) override the hooks below
+    the guest OS decides: how a guest boots, is reached, identifies itself and
+    halts, and which prerequisites it must have."""
+    OS = "linux"
+    CAPABILITIES = CAPABILITIES
+    TTY = "/dev/pts/"
 
-    def __init__(self, repo, config, prl, reg):
+    def __init__(self, repo, config, prl, reg, connect=guest.Guest, lease=guest.wait_for_lease):
         self.repo, self.config, self.prl, self.reg = Path(repo), config, prl, reg
         self.state = contracts.state_dir(config, self.repo)
         self.deadline = None
+        self.open_guest, self.lease = connect, lease
 
     # Deadlines: the whole operation gets `run`; one command gets `command`,
     # one long step (install, warm) gets `scenario`; none outlives the run.
@@ -366,8 +374,8 @@ class Lab:
         installed.run("bash -s", self._bound("command"), stdin=(self.repo / INFRA / "linux" / "clean.sh").read_bytes())
         return tools
 
-    def _facts(self, g):
-        script = (self.repo / INFRA / "linux" / "facts.sh").read_bytes()
+    def _facts(self, g, os_name=None):
+        script = (self.repo / INFRA / (os_name or self.OS) / "facts.sh").read_bytes()
         return parse_facts(g.run("bash -s", self._bound("command"), stdin=script)[1])
 
     def validate(self, name, run_id):
@@ -377,7 +385,7 @@ class Lab:
             return contracts.result("template validate", "environment_failure", "candidate was not built", [
                 contracts.finding("candidate_not_built", f"candidate {run_id} is {record['status']}")])
         manifest = record["manifest"]
-        strategy = self.config["clone_strategy"]
+        strategy = contracts.clone_strategy(self.config, name)
         val_id = contracts.new_run_id()
         vm = f"{registry.PREFIX}val-{name}-{val_id}"
         vdir = cdir / "validations" / val_id
@@ -387,18 +395,20 @@ class Lab:
         timed_out = False
         try:
             self.reg.claim(vm, "validation", name, val_id, expires)
-            self.prl.clone(record["vm"], vm, manifest["snapshot_id"], self.state / "workers", strategy == "linked")
+            self._clone(record["vm"], vm, manifest["snapshot_id"], strategy)
             info = self.prl.info(vm)
             self.reg.bind(vm, info["vm_id"])
             self._run_checks(vm, info, cdir, vdir, checks)
         except Exception as err:  # recorded against the check that was running
             timed_out = isinstance(err, DeadlineExceeded)
-            pending = next(c for c in CAPABILITIES if checks.get(c, {}).get("status") != "pass")
+            pending = next(c for c in self.CAPABILITIES if checks.get(c, {}).get("status") != "pass")
             checks.setdefault(pending, {"status": "fail", "reason": str(err)})
+            if getattr(err, "code", None):
+                checks[pending]["code"] = err.code
         finally:
             notes = self._dispose(vm, vdir / "final-console.png")
 
-        reasons = ineligibility(checks)
+        reasons = ineligibility(checks, self.CAPABILITIES)
         if notes:
             reasons += [f"cleanup: {n}" for n in notes]
         report = {"validation": val_id, "clone_strategy": strategy, "checks": checks, "ineligible": reasons}
@@ -411,9 +421,36 @@ class Lab:
         _write_json(cdir / "candidate.json", record)
         if reasons:
             status = "timeout" if timed_out else "environment_failure"
+            named = [contracts.finding(c["code"], c["reason"]) for c in checks.values() if c.get("code")]
             return contracts.result("template validate", status, f"candidate {run_id} is not eligible",
-                                    [contracts.finding("capability_failed", r) for r in reasons], report)
+                                    [contracts.finding("capability_failed", r) for r in reasons] + named, report)
         return contracts.result("template validate", "success", f"candidate {run_id} is eligible", data=report)
+
+    # Hooks the guest OS decides
+
+    def _clone(self, source, vm, snapshot_id, strategy):
+        if strategy == "full":
+            # A full clone copies the VM's current state: make that the baseline's.
+            self.prl.snapshot_switch(source, snapshot_id)
+        self.prl.clone(source, vm, snapshot_id, self.state / "workers", strategy == "linked")
+
+    def _boot(self, vm):
+        self.prl.start(vm)
+
+    def _access(self, ip, cdir, known_hosts):
+        """Command access with the candidate's key, pinned to its host key."""
+        known_hosts.write_text(f"{ip} {' '.join((cdir / 'host.pub').read_text().split()[:2])}\n")
+        return self.open_guest(ip, cdir / "access", known_hosts)
+
+    def _prerequisites(self, g, passed):
+        """Checks a guest must pass beyond command access; none on NixOS,
+        whose configuration provides everything."""
+
+    def _identity(self, g):
+        return {"nixos": g.run("nixos-version", self._bound("command"))[1].strip()}
+
+    def _halt(self, vm, g):
+        self._shutdown(vm)
 
     def _run_checks(self, vm, info, cdir, vdir, checks):
         def passed(name, **detail):
@@ -425,25 +462,25 @@ class Lab:
             raise RuntimeError("clone has host devices")
         passed("host_isolation")
 
-        self.prl.start(vm)
-        ip = guest.wait_for_lease(info["mac"], self._until(self.config["deadlines"]["command"]))
-        (vdir / "known_hosts").write_text(f"{ip} {' '.join((cdir / 'host.pub').read_text().split()[:2])}\n")
-        g = guest.Guest(ip, cdir / "access", vdir / "known_hosts")
+        self._boot(vm)
+        ip = self.lease(info["mac"], self._until(self.config["deadlines"]["command"]))
+        g = self._access(ip, cdir, vdir / "known_hosts")
         g.wait(self._until(self.config["deadlines"]["command"]))
         passed("boot", ip_assigned=True)
+        self._prerequisites(g, passed)
 
-        passed("command_access", nixos=g.run("nixos-version", self._bound("command"))[1].strip())
+        passed("command_access", **self._identity(g))
 
         payload = secrets.token_bytes(1 << 20)
-        g.run("cat > /root/roundtrip", self._bound("command"), stdin=payload)
-        back = g.run("cat /root/roundtrip && rm /root/roundtrip", self._bound("command"), raw=True)[1]
+        g.run("cat > roundtrip", self._bound("command"), stdin=payload)
+        back = g.run("cat roundtrip && rm roundtrip", self._bound("command"), raw=True)[1]
         if back != payload:
             raise RuntimeError("file round-trip returned different bytes")
         passed("file_roundtrip", bytes=len(payload))
 
         _, out, _ = g.run("tty; stty size", self._bound("command"), tty=True)
         lines = out.split()
-        if not lines or not lines[0].startswith("/dev/pts/"):
+        if not lines or not lines[0].startswith(self.TTY):
             raise RuntimeError(f"no pseudo-terminal over the transport: {out.strip()!r}")
         passed("terminal_transport", tty=lines[0], size=" ".join(lines[1:3]))
 
@@ -461,17 +498,17 @@ class Lab:
             raise RuntimeError("clone carries task state")
         passed("task_state")
 
-        self._shutdown(vm)
+        self._halt(vm, g)
         passed("shutdown")
 
         reset = self.prl.snapshot(vm, "validation reset point")
-        self.prl.start(vm)
+        self._boot(vm)
         g.wait(self._until(self.config["deadlines"]["command"]))
-        g.run("touch /root/reset-marker", self._bound("command"))
-        self._shutdown(vm)
+        g.run("touch reset-marker", self._bound("command"))
+        self._halt(vm, g)
         self.prl.snapshot_switch(vm, reset)
-        self.prl.start(vm)
+        self._boot(vm)
         g.wait(self._until(self.config["deadlines"]["command"]))
-        if g.run("test -e /root/reset-marker", self._bound("command"), check=False)[0] == 0:
+        if g.run("test -e reset-marker", self._bound("command"), check=False)[0] == 0:
             raise RuntimeError("a file written after the snapshot survived the reset")
         passed("snapshot_reset", snapshot_id=reset)

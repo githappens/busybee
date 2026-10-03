@@ -4,6 +4,7 @@ The guest's address comes from Parallels' DHCP lease for the VM's MAC, so the
 host runs no listener the guest calls back to.
 """
 from pathlib import Path
+import shlex
 import socket
 import subprocess
 import time
@@ -50,21 +51,28 @@ def wait_for_port(ip, port, deadline):
 
 
 class Guest:
-    def __init__(self, ip, key, known_hosts, accept_new=False):
+    """`user` is the account the key logs into. `posix` runs every command
+    under /bin/sh instead of that account's login shell: macOS's is zsh, which
+    aborts a command on a glob that matches nothing."""
+
+    def __init__(self, ip, key, known_hosts, accept_new=False, user="root", posix=False):
         self.ip, self.key, self.known_hosts = ip, Path(key), Path(known_hosts)
-        self.accept_new = accept_new
+        self.accept_new, self.user, self.posix = accept_new, user, posix
+
+    def _command(self, command):
+        return f"exec /bin/sh -c {shlex.quote(command)}" if self.posix else command
 
     def _ssh(self, extra=()):
         return ["ssh", "-i", str(self.key), "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                 "-o", f"UserKnownHostsFile={self.known_hosts}",
                 "-o", f"StrictHostKeyChecking={'accept-new' if self.accept_new else 'yes'}",
                 "-o", f"ConnectTimeout={SSH_CONNECT_S}", "-o", "ServerAliveInterval=15", *extra,
-                f"root@{self.ip}"]
+                f"{self.user}@{self.ip}"]
 
     def run(self, command, timeout, stdin=None, tty=False, check=True, raw=False):
         """Run a shell command in the guest; returns (exit status, stdout, stderr).
         `raw` keeps stdout as bytes, for content that must round-trip exactly."""
-        argv = self._ssh(["-tt"] if tty else []) + [command]
+        argv = self._ssh(["-tt"] if tty else []) + [self._command(command)]
         try:
             done = subprocess.run(argv, input=stdin, capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired as err:
@@ -79,7 +87,7 @@ class Guest:
         """Start a command with its output written straight to open files and
         return the process to poll. It outlives a controller that dies, so the
         files keep everything the guest sent."""
-        return subprocess.Popen(self._ssh() + [command], stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
+        return subprocess.Popen(self._ssh() + [self._command(command)], stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr)
 
     def wait(self, deadline):
         """Until the guest accepts a command, or the deadline passes."""

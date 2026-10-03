@@ -297,14 +297,33 @@ class ConfigTests(unittest.TestCase):
     def test_a_nested_state_dir_is_allowed(self):
         self.assertEqual(self.errors(VALID_CONFIG.replace('"build/vm"', '"build/vm/state"')), [])
 
+    def test_macos_needs_full_clones_explicitly(self):
+        # Linked macOS clones boot to a black screen; the config must say full
+        # for macOS rather than the controller switching on its own.
+        macos = '\n[templates.macos]\nmanifest = "templates/macos/manifest.json"\n'
+        inherited = self.errors(VALID_CONFIG + macos)
+        self.assertIn("clone_mode_unsupported", [code for code, _ in inherited])
+        full = macos + 'clone_strategy = "full"\nsource = "my-prepared-mac"\nuser = "lab"\n' \
+                       'bootstrap_key = "keys/bootstrap"\n'
+        self.assertEqual(self.errors(VALID_CONFIG + full), [])
+        for name, text in {"linked macos": full.replace('"full"', '"linked"'),
+                           "macos source on linux": VALID_CONFIG.replace(
+                               '[templates.linux]\n', '[templates.linux]\nsource = "x"\n'),
+                           "escaping key": full.replace('"keys/bootstrap"', '"../../../.ssh/id"'),
+                           "absolute key": full.replace('"keys/bootstrap"', '"/etc/key"'),
+                           "numeric user": full.replace('"lab"', '42')}.items():
+            with self.subTest(name):
+                self.assertTrue(self.errors(VALID_CONFIG + text if "linux" not in name else text), name)
+
 
 class ManifestTests(unittest.TestCase):
     def test_manifest_schema(self):
         self.assertEqual(contracts.manifest_errors(manifest()), [])
         for broken in (manifest(schema="other"), manifest(os="windows"), manifest(clone_modes=["magic"]),
                        manifest(clone_modes=[]), {k: v for k, v in manifest().items() if k != "snapshot_id"},
-                       manifest(extra=1)):
+                       manifest(extra=1), manifest(os="macos", clone_modes=["linked", "full"])):
             self.assertTrue(contracts.manifest_errors(broken), broken)
+        self.assertEqual(contracts.manifest_errors(manifest(os="macos", clone_modes=["full"])), [])
 
 
 class ContractTests(unittest.TestCase):
@@ -330,6 +349,10 @@ class ContractTests(unittest.TestCase):
         self.assertTrue(contracts.worker_errors({**record, "deadline": "2026-09-30T00:00:00Z"}))
         self.assertTrue(contracts.worker_errors({**record, "reset_snapshot_id": "latest"}))
         self.assertTrue(contracts.worker_errors({**record, "source": {"revision": "main"}}))
+        # A macOS worker is a lease on the slot guest, not a per-run clone.
+        leased = {**record, "template": "macos", "clone_strategy": "full", "worker": "busybee-lab-macos-slot"}
+        self.assertEqual(contracts.worker_errors(leased), [])
+        self.assertTrue(contracts.worker_errors({**leased, "worker": "someone-elses-mac"}))
 
     def test_result_states_are_the_documented_set(self):
         self.assertEqual(set(contracts.RESULT_STATES), {
@@ -360,6 +383,14 @@ class CliTests(unittest.TestCase):
                     self.assertEqual(result["operation"], " ".join(argv[:2]))
                     self.assertEqual(result["status"], "environment_failure")
                     self.assertEqual({f["code"] for f in result["findings"]}, {"config_missing"})
+
+    def test_verify_is_implemented(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = self.run_cli("--json", "verify", "--revision", "HEAD", "--config", str(Path(tmp) / "absent.toml"))
+            self.assertEqual(out.returncode, vmctl.EXIT_FAILED, out.stderr)
+            result = json.loads(out.stdout)
+            self.assertEqual((result["operation"], result["status"]), ("verify", "environment_failure"))
+            self.assertEqual({f["code"] for f in result["findings"]}, {"config_missing"})
 
     def test_template_operations_need_a_valid_config(self):
         with tempfile.TemporaryDirectory() as tmp:

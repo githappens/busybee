@@ -37,6 +37,21 @@ class ParallelsError(RuntimeError):
     pass
 
 
+class StartRefused(ParallelsError):
+    """`prlctl start` failed; Parallels gives the reason only in the VM's own
+    log, so it is named here (`code`) from that log."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+# What a macOS guest's parallels.log says when Apple's limit of two running
+# macOS guests per host is reached; prlctl itself prints only "An unexpected
+# error occurred".
+GUEST_LIMIT = "maximum supported number of active virtual machines"
+
+
 def is_read_only(argv):
     tool, rest = Path(argv[0]).name, tuple(argv[1:])
     if (tool, rest) in READ_ONLY:
@@ -127,10 +142,37 @@ class Parallels:
         vm = json.loads(self._owned(name, ["list", "--info", "--json"], timeout=QUERY_TIMEOUT_S))[0]
         disk = re.fullmatch(r"(\d+)Mb", vm["Hardware"].get("hdd0", {}).get("size", ""))
         return {"vm_id": braced(vm["ID"]), "state": vm["State"], "mac": vm["Hardware"]["net0"]["mac"],
-                "devices": sorted(vm["Hardware"]), "disk_mib": int(disk.group(1)) if disk else None}
+                "devices": sorted(vm["Hardware"]), "disk_mib": int(disk.group(1)) if disk else None,
+                "home": vm.get("Home")}
 
     def start(self, name):
         self._owned(name, ["start"])
+
+    def start_reporting(self, name):
+        """Start, and on failure name the reason the VM's parallels.log gives."""
+        log = Path(self.info(name)["home"] or ".") / "parallels.log"
+        offset = log.stat().st_size if log.is_file() else 0
+        try:
+            self.start(name)
+        except ParallelsError as err:
+            new = ""
+            if log.is_file():
+                with open(log, errors="replace") as f:
+                    f.seek(offset)
+                    new = f.read()
+            if GUEST_LIMIT in new:
+                raise StartRefused("macos_guest_limit", f"{name} did not start: the host already runs the two "
+                                   "macOS guests Apple allows; stop one of them") from err
+            lines = [line for line in new.splitlines() if " E " in line or "rror" in line]
+            raise StartRefused("vm_start_failed", f"{err}; its log says: {lines[-1] if lines else 'nothing new'}") \
+                from err
+
+    def isolate(self, name, devices, host_devices):
+        """A macOS clone: drop the host devices it has, and the sharing a
+        prepared desktop VM comes with."""
+        for device in sorted(set(devices) & set(host_devices)):
+            self._owned(name, ["set", "--device-del", device])
+        self._owned(name, ["set", "--isolate-vm", "on", "--auto-share-camera", "off", "--startup-view", "headless"])
 
     def stop(self, name, kill=False):
         self._owned(name, ["stop", "--kill"] if kill else ["stop", "--acpi"])
@@ -154,6 +196,14 @@ class Parallels:
 
     def snapshot_switch(self, name, snapshot_id):
         self._owned(name, ["snapshot-switch", "--id", snapshot_id, "--skip-resume"])
+
+    def clone_source(self, source, name, dst):
+        """A full clone of an operator-prepared VM the controller does not own.
+        Only the claimed clone is created; the source is read, never changed."""
+        if self.owned is None or not self.owned.owns(name):
+            raise ParallelsError(f"refusing to create {name!r}: it is not claimed")
+        self.runner([self.tools["prlctl"], "clone", source, "--name", name, "--dst", str(dst)],
+                    timeout=LIFECYCLE_TIMEOUT_S)
 
     def clone(self, source, name, snapshot_id, dst, linked):
         if self.owned is None or not self.owned.owns(name):

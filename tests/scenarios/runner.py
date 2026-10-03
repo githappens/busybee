@@ -55,8 +55,6 @@ META_SCHEMA = "busybee.scenario/v1"
 RESULT_SCHEMA = "busybee.scenario.result/v1"
 MODES = ("cold", "prepared")
 PLATFORMS = ("linux", "macos")
-# Where this runner can drop privileges and account for processes.
-SUPPORTED = ("linux",)
 EXIT = {"success": 0, "product_failure": 1, "environment_failure": 2, "timeout": 3}
 EXIT_USAGE = 64
 WORKSPACE = ("busybee", "bzbd")
@@ -190,7 +188,10 @@ class Probe:
         return done.stdout.strip() if done.returncode == 0 else None
 
     def describe(self, checkout):
-        done = subprocess.run(["git", "-C", str(checkout), "describe", "--tags", "--long", "--match",
+        # The runner is root; on macOS the checkout belongs to the lab account,
+        # which git would otherwise refuse as dubious ownership.
+        done = subprocess.run(["git", "-c", "safe.directory=*", "-C", str(checkout), "describe", "--tags", "--long",
+                               "--match",
                                "[0-9]*.[0-9]*.[0-9]*", "--match", "v[0-9]*.[0-9]*.[0-9]*"],
                               capture_output=True, text=True, timeout=10)
         return done.stdout.strip() if done.returncode == 0 else None
@@ -203,11 +204,11 @@ def preflight(meta, bin_dir, checkout, probe):
     if platform not in meta["platforms"]:
         findings.append(finding("platform_not_applicable", f"{meta['id']} declares {', '.join(meta['platforms'])}, "
                                 f"not {platform}"))
-    if platform not in SUPPORTED:
-        findings.append(finding("platform_unsupported", f"this runner supports {', '.join(SUPPORTED)}, not {platform}"))
+    if platform not in PLATFORMS:
+        findings.append(finding("platform_unsupported", f"this runner supports {', '.join(PLATFORMS)}, not {platform}"))
     if probe.euid() != 0:
         findings.append(finding("runner_not_root", "the runner drops to an unprivileged user and must start as root"))
-    if not probe.which("setpriv"):
+    if platform == "linux" and not probe.which("setpriv"):
         findings.append(finding("tool_missing", "setpriv is not on PATH; the runner needs it to drop privileges"))
     expected = version_from_describe(probe.describe(checkout))
     if expected is None:
@@ -250,9 +251,18 @@ class User:
         return {"name": self.name, "uid": self.uid, "gid": self.gid}
 
 
-def scenario_user():
+# macOS has no setpriv: this interpreter clears the supplementary groups, sets
+# the group and then the user, and execs the command.
+DROP = ("import os, sys; os.setgroups([]); os.setgid(int(sys.argv[2])); os.setuid(int(sys.argv[1])); "
+        "os.execvp(sys.argv[3], sys.argv[3:])")
+
+
+def scenario_user(platform):
     import pwd
     user = pwd.getpwnam("nobody")
+    if platform == "macos":
+        return User("nobody", user.pw_uid, user.pw_gid, [sys.executable, "-c", DROP, str(user.pw_uid),
+                                                         str(user.pw_gid)])
     return User("nobody", user.pw_uid, user.pw_gid,
                 ["setpriv", f"--reuid={user.pw_uid}", f"--regid={user.pw_gid}", "--clear-groups", "--"])
 
@@ -282,6 +292,33 @@ def scenario_processes(root, uid):
             found.append({"pid": int(entry.name), "comm": comm, "uid": owner,
                           "umask": fields.get("Umask", "").strip() or None})
     return sorted(found, key=lambda p: p["pid"])
+
+
+def parse_ps(names, environ, root, uid):
+    """macOS has no /proc: `ps -axo pid=,uid=,ucomm=` names each process and
+    `ps -axEww -o pid=,command=` appends its environment, which root can read.
+    BSD reports no umask."""
+    marker = f"{MARKER}={root}"
+    marked = set()
+    for line in environ.splitlines():
+        pid, _, rest = line.strip().partition(" ")
+        if pid.isdigit() and marker in rest.split(" "):
+            marked.add(int(pid))
+    found = []
+    for line in names.splitlines():
+        fields = line.split(None, 2)
+        if len(fields) != 3 or not fields[0].isdigit() or int(fields[0]) == os.getpid():
+            continue
+        pid, owner, comm = int(fields[0]), int(fields[1]) % 2 ** 32, fields[2].strip()
+        if pid in marked or (owner == uid and comm in DAEMONS):
+            found.append({"pid": pid, "comm": comm, "uid": owner, "umask": None})
+    return sorted(found, key=lambda p: p["pid"])
+
+
+def ps_processes(root, uid):
+    def ps(*args):
+        return subprocess.run(["ps", *args], capture_output=True, text=True, check=True).stdout
+    return parse_ps(ps("-axo", "pid=,uid=,ucomm="), ps("-axEww", "-o", "pid=,command="), root, uid)
 
 
 def _kill(pid, sig):
@@ -618,7 +655,8 @@ def main(argv=None):
         return EXIT_USAGE
 
     def make(mode, platform, bin_dir, workspace):
-        return Fixture(mode, platform, bin_dir, workspace, scenario_user())
+        procs = ps_processes if platform == "macos" else scenario_processes
+        return Fixture(mode, platform, bin_dir, workspace, scenario_user(platform), procs=procs)
 
     result = run_scenario(meta, args.mode, args.bin_dir.resolve(), args.checkout, args.cleanup_s, Probe(), make)
     sys.stdout.write(json.dumps(result, indent=2) + "\n")

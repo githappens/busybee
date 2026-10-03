@@ -18,12 +18,14 @@ import tomllib
 
 import contracts
 import guest
+import macos
 import parallels
 import registry
 import scenario
 import supervisor
 import template
 import terminal_ops
+import verify
 import worker
 
 REPO = Path(__file__).resolve().parents[2]
@@ -159,9 +161,10 @@ def check_template(repo, name, entry, config, adapter, vms, findings):
     summary = {"os": manifest["os"], "arch": manifest["arch"], "clone_modes": manifest["clone_modes"],
                "provisioning_revision": manifest["provisioning_revision"]}
     # Present, but not for the configured clone strategy: not a worker source.
-    eligible = config["clone_strategy"] in manifest["clone_modes"]
+    strategy = contracts.clone_strategy(config, name)
+    eligible = strategy in manifest["clone_modes"]
     if not eligible:
-        findings.append(contracts.finding("clone_mode_unsupported", f"clone_strategy {config['clone_strategy']} "
+        findings.append(contracts.finding("clone_mode_unsupported", f"clone_strategy {strategy} "
                                           f"was not validated for the {name} baseline ({', '.join(manifest['clone_modes'])})"))
     if vms is None:
         return {**summary, "state": "unverified"}
@@ -239,10 +242,7 @@ def template_operation(repo, args, host):
         return template.promote(state, args.name, args.candidate)
     if args.action == "prune":
         return template.prune(state, args.name, prl, reg)
-    if args.name != "linux":
-        return contracts.result(operation, "unsupported", f"{args.name} templates are not provisioned here", [
-            contracts.finding("template_unsupported", "only the linux template is provisioned by this controller")])
-    lab = template.Lab(repo, config, prl, reg)
+    lab = (macos.MacLab if args.name == "macos" else template.Lab)(repo, config, prl, reg)
     if args.action == "build":
         return lab.build(args.name, args.arch)
     return lab.validate(args.name, args.candidate)
@@ -254,14 +254,19 @@ def worker_operation(repo, args, host, operation):
         return failed
     config, reg, prl = ready
     state = contracts.state_dir(config, repo)
-    workers = worker.Workers(repo, config, prl, reg, host.free_storage_gib, supervise=lambda run_id: supervisor.ensure(
-        state, run_id, supervisor.argv(repo, args.config, run_id)))
+    workers = worker.Workers(repo, config, prl, reg, host.free_storage_gib,
+                             supervise=lambda run_id, lease=None: supervisor.ensure(
+                                 state, run_id, supervisor.argv(repo, args.config, run_id), lease=lease))
     try:
         if operation == "supervise":
-            supervisor.serve(workers, args.run_id)
+            supervisor.serve(workers, args.run_id, args.lease_fd)
             return None
         if operation == "worker create":
             return workers.create(args.name, args.revision, args.patch)
+        if operation == "verify":
+            revision = workers._source(args.revision, args.patch)["revision"]
+            return verify.run(verify.WorkerOps(workers), args.platform or list(contracts.GUEST_OS), revision,
+                              args.patch, state)
         if operation in ("exec", "terminal open"):
             malformed = [item for item in args.env if "=" not in item]
             if malformed:
@@ -342,7 +347,8 @@ def parser():
     target.add_argument("--config", type=Path, default=REPO / DEFAULT_CONFIG)
     workers = ops.add_parser("worker", help="create, reset and destroy owned workers") \
         .add_subparsers(dest="action", required=True)
-    create = workers.add_parser("create", parents=[common], help="clone the promoted baseline")
+    create = workers.add_parser("create", parents=[common],
+                                help="clone the promoted baseline; macos: wait for and lease the macOS slot")
     create.add_argument("--revision", required=True, help="commit to check out in the worker")
     create.add_argument("--patch", type=Path, help="patch applied on top of the revision")
     workers.add_parser("reset", parents=[target], help="collect, then restore the recorded baseline")
@@ -365,12 +371,19 @@ def parser():
     read.add_argument("--offset", type=int, default=0)
     read.add_argument("--limit", type=int, default=worker.READ_LIMIT)
     ops.add_parser("export", parents=[target], help="write the run's sanitized public evidence")
+    check = ops.add_parser("verify", help="build, check and run the scenarios of one revision on every platform")
+    check.add_argument("--revision", required=True, help="commit to verify")
+    check.add_argument("--patch", type=Path, help="patch applied on top of the revision")
+    check.add_argument("--platform", action="append", choices=contracts.GUEST_OS,
+                       help="a required platform; repeatable; default all")
+    check.add_argument("--config", type=Path, default=REPO / DEFAULT_CONFIG)
     run_scenario = ops.add_parser("scenario", parents=[target], help="run a tests/scenarios scenario in a worker")
     run_scenario.add_argument("scenario", help="scenario id: tests/scenarios/<id>.toml")
     run_scenario.add_argument("--mode", required=True, choices=("cold", "prepared"))
     run_scenario.add_argument("--bin-dir", default="build/debug",
                               help="the built busybee and bzbd, relative to the worker checkout")
-    ops.add_parser("supervise", parents=[target], help="internal: the run's watchdog, started by the controller")
+    ops.add_parser("supervise", parents=[target], help="internal: the run's watchdog, started by the controller") \
+        .add_argument("--lease-fd", type=int, help="the macOS slot lease it inherits from worker create")
     sig = ops.add_parser("signal", parents=[target], help="signal a process in a worker")
     sig.add_argument("signal")
     sig.add_argument("pid")

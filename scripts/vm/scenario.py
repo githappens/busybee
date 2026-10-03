@@ -159,9 +159,13 @@ def run(workers, run_id, scenario_id, mode, bin_dir="build/debug"):
     if record["status"] != "ready":
         raise worker.Refused("worker_not_ready", f"worker {run_id} is {record['status']}")
     stage, digest = stage_runner(workers, run_id, record)
-    argv = ["nix", "develop", "-c", "python3", f"{stage}/runner.py", "run", scenario_id, "--mode", mode,
-            "--bin-dir", bin_dir, "--cleanup-s", str(CLEANUP_S)]
-    done = workers.exec(run_id, argv, worker.CHECKOUT, {}, timeout)
+    argv = ["python3", f"{stage}/runner.py", "run", scenario_id, "--mode", mode, "--bin-dir", bin_dir,
+            "--cleanup-s", str(CLEANUP_S)]
+    if record["template"] == "macos":
+        # The runner starts as root to drop to an unprivileged user; on macOS
+        # the exec runs as the lab account, which has passwordless sudo.
+        argv = ["sudo", "-n", "--preserve-env=PATH", *argv]
+    done = workers.exec(run_id, ["nix", "develop", "-c", *argv], workers.checkout(record), {}, timeout)
     stdout_path = workers.state / done["data"]["stdout"] if "stdout" in done["data"] else None
     stdout = stdout_path.read_bytes() if stdout_path and stdout_path.is_file() else b""
     status, findings, assertions, parsed = interpret(_runner(workers.repo), meta, mode, done, stdout)

@@ -10,7 +10,8 @@ from pathlib import Path
 
 SCHEMA = "busybee.vm.registry/v1"
 PREFIX = "busybee-lab-"
-ROLES = ("candidate", "validation", "worker")
+# A slot is the long-lived macOS guest; its `holder` is the run leasing it.
+ROLES = ("candidate", "validation", "worker", "slot")
 
 
 class Registry:
@@ -57,6 +58,12 @@ class Registry:
     def bind(self, name, vm_id):
         data = self._load()
         data["vms"][name]["vm_id"] = vm_id
+        self._save(data)
+
+    def hold(self, name, run_id, deadline):
+        """Record which run leases a slot, and until when; None frees it."""
+        data = self._load()
+        data["vms"][name].update(holder=run_id, deadline=deadline)
         self._save(data)
 
     def release(self, name):

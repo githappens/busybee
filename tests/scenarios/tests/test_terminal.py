@@ -3,10 +3,12 @@ captures, the version gate and closing, against a substituted zellij and clock
 (pty_records_input_resize_and_cells, pty_quit_drains_output_and_reaps_child)."""
 from pathlib import Path
 import json
+import os
 import shlex
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 
@@ -90,7 +92,8 @@ class TerminalTests(unittest.TestCase):
         t._write()
         run = (t.path / "run.sh").read_text().splitlines()
         self.assertEqual(run[1], "cd /work || exit 127")
-        words = shlex.split(run[2])
+        self.assertEqual(run[2], terminal.AWAIT_SIZE)
+        words = shlex.split(run[3])
         self.assertEqual(words[0], "exec")
         script = words[words.index("script"):]
         # Flushed on every write, the child's exit status, advanced timing, separate logs.
@@ -107,6 +110,23 @@ class TerminalTests(unittest.TestCase):
         config = (t.path / "config.kdl").read_text()
         for line in ("pane_frames false", "session_serialization false", "show_startup_tips false"):
             self.assertIn(line, config)
+
+    def test_the_pane_waits_for_its_size_before_recording(self):
+        # zellij can start the pane before sizing its PTY; started then, script
+        # records -1x-1 and the program may draw before any size is known.
+        import fcntl, pty, struct, subprocess, termios
+        primary, secondary = pty.openpty()
+        self.addCleanup(os.close, primary)
+        size = lambda rows, cols: fcntl.ioctl(secondary, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        size(0, 0)
+        proc = subprocess.Popen(["sh", "-c", terminal.AWAIT_SIZE + "\nstty size"], stdin=secondary,
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+        self.assertIsNone(proc.poll(), "the pane went ahead without a size")
+        size(30, 100)
+        out, _ = proc.communicate(timeout=10)
+        os.close(secondary)
+        self.assertEqual(out.decode().strip(), "30 100")
 
     def test_a_path_the_layout_cannot_hold_is_refused(self):
         with self.assertRaises(terminal.TerminalError) as raised:
