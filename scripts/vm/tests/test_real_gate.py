@@ -71,11 +71,13 @@ class RealGateTests(unittest.TestCase):
         self.assertNotIn(str(Path.home()), public)
         # Every owned worker is accounted for: none is left, the slot is free.
         self.assertEqual(active(), set())
-        # The same evidence is judged again without verifying it again.
+        # Asked again: the base is reused; the refused candidate is verified
+        # again, so a flaky check cannot stick to it, and is refused again.
         again = vmctl("gate", "--issue", str(PILOT), "--revision", main, "--base", main)
-        self.assertEqual(again["data"]["evidence_id"], result["data"]["evidence_id"])
-        reused = json.loads((STATE / again["data"]["gate"]).read_text())
-        self.assertEqual((reused["candidate"]["reused"], reused["base"]["reused"]), (True, True))
+        record = json.loads((STATE / again["data"]["gate"]).read_text())
+        self.assertEqual((record["candidate"]["reused"], record["base"]["reused"]), (False, True))
+        self.assertEqual(record["verdict"], "failed", record["findings"])
+        self.assertEqual(active(), set())
 
 
 if __name__ == "__main__":
