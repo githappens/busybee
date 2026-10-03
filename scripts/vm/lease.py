@@ -7,6 +7,9 @@ the lease's lifetime: whenever that process ends, however it ends, the kernel
 frees the slot. Waiters take numbered tickets and are served in arrival order;
 a ticket whose process is gone is dropped. The lease is independent of
 busybee, which is the software under test.
+
+`Queue` is that line on its own; Linux workers wait in one too
+(`queues/linux/`) when the configured number of them is already active.
 """
 import fcntl
 import json
@@ -31,15 +34,12 @@ def alive(pid):
     return True
 
 
-class Slot:
-    def __init__(self, state, alive=alive, clock=time.monotonic, sleep=time.sleep):
-        self.dir = Path(state) / "slots" / "macos"
-        self.alive, self.clock, self.sleep = alive, clock, sleep
+class Queue:
+    """Numbered tickets in `dir`, served in arrival order; a ticket whose
+    process is gone is dropped."""
 
-    @property
-    def record_path(self):
-        """The slot guest's record: its VM, the baseline it was cloned from and its reset snapshot."""
-        return self.dir / "slot.json"
+    def __init__(self, dir, alive=alive):
+        self.dir, self.alive = Path(dir), alive
 
     def _edit(self, change):
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -67,6 +67,17 @@ class Slot:
 
     def leave(self, ticket):
         self._edit(lambda queue: queue.update(waiting=[w for w in queue["waiting"] if w["ticket"] != ticket]))
+
+
+class Slot(Queue):
+    def __init__(self, state, alive=alive, clock=time.monotonic, sleep=time.sleep):
+        super().__init__(Path(state) / "slots" / "macos", alive)
+        self.clock, self.sleep = clock, sleep
+
+    @property
+    def record_path(self):
+        """The slot guest's record: its VM, the baseline it was cloned from and its reset snapshot."""
+        return self.dir / "slot.json"
 
     def try_hold(self):
         """The slot's lock as an open file, or None while another process holds it."""

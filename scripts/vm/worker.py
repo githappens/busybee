@@ -36,8 +36,9 @@ import parallels
 import screen
 import template
 
-# One active worker until concurrency becomes a budgeted controller setting.
-MAX_ACTIVE = 1
+# Seconds between admission attempts while a Linux creation waits in line;
+# each attempt reconciles every owned worker.
+LINUX_POLL_S = 5
 CHECKOUT = template.GUEST_CHECKOUT
 # Seconds timeout(1) waits after TERM before KILL, and the host's margin on top.
 KILL_GRACE_S = 10
@@ -253,9 +254,11 @@ class Workers(template.Lab):
         self.free_gib = free_gib
         self.supervise = supervise
         self.clock, self.sleep = clock, sleep
-        # How long `worker create macos` waits in line for the slot.
+        # How long `worker create` waits in line: for the macOS slot, or for
+        # one of the configured number of Linux workers to come free.
         self.slot_wait_s = config["deadlines"]["run"] if slot_wait_s is None else slot_wait_s
         self.slot = lease.Slot(self.state, clock=clock, sleep=sleep)
+        self.linux_line = lease.Queue(self.state / "queues" / "linux")
 
     # Ownership and records
 
@@ -438,7 +441,7 @@ class Workers(template.Lab):
                            record["status"] in contracts.FROZEN_STATES and self._running(vm)):
                 self.supervise(run_id)
                 record = _load(run_dir(self.state, run_id) / "worker.json")
-            item = {"run_id": run_id, "status": record["status"] if record else "claimed",
+            item = {"run_id": run_id, "role": entry["role"], "status": record["status"] if record else "claimed",
                     "allocation": record["allocation"] if record else None, "deadline": entry["deadline"]}
             if record is None:
                 findings.append(contracts.finding("interrupted_create", f"worker {run_id} was claimed but its "
@@ -464,7 +467,8 @@ class Workers(template.Lab):
             workers, findings = self._reconcile()
         allocated = {k: sum(w["allocation"][k] for w in workers if w["allocation"]) for k in contracts.BUDGET_BOUNDS}
         return contracts.result("status", "success", f"{len(workers)} owned worker(s)", findings, {
-            "workers": workers, "resources": {"allocated": allocated, "budget": self.config["budget"]}})
+            "workers": workers, "resources": {"allocated": allocated, "budget": self.config["budget"],
+                                              "linux_workers": contracts.linux_workers(self.config)}})
 
     def _run_status(self, run_id):
         vm, record = self._owned(run_id)
@@ -513,24 +517,13 @@ class Workers(template.Lab):
         if name == "macos":
             return self._lease(manifest, baseline_vm, revision, patch)
         strategy = contracts.clone_strategy(self.config, name)
-        # Admission and the claim are one step: no other controller process
-        # can admit a worker between this one's check and its claim.
-        with locked(self.state / "controller.lock"):
-            allocation = dict(self.config["worker"])
-            refused = self._admit(op)
-            if refused:
-                return refused
-            # A clone can grow to the baseline's disk size, so that must fit the allocation.
-            disk_mib = self.prl.info(baseline_vm)["disk_mib"]
-            if disk_mib is None or disk_mib > allocation["storage_gib"] * 1024:
-                return contracts.result(op, "environment_failure", "baseline disk exceeds the allocation", [
-                    contracts.finding("storage_exhausted", f"the baseline disk is {disk_mib} MiB; a worker is "
-                                      f"allotted {allocation['storage_gib']} GiB")])
-            source = self._source(revision, patch)
-            run_id = contracts.new_run_id()
-            vm = contracts.worker_name(run_id)
-            rdir, created, expires = self._open_run(run_id, patch)
-            self.reg.claim(vm, "worker", name, run_id, expires, parent=manifest["vm_id"])
+        allocation = dict(self.config["worker"])
+        run_id = contracts.new_run_id()
+        claimed = self._admit_linux(op, run_id, manifest, baseline_vm, allocation, revision, patch)
+        if claimed["status"] != "success":
+            return claimed
+        vm, rdir, source, expires = (claimed["data"][k] for k in ("worker", "rdir", "source", "deadline"))
+        created = claimed["data"]["created"]
         record = None
         with locked(self._lock(run_id)):
             try:
@@ -564,6 +557,57 @@ class Workers(template.Lab):
                     *(contracts.finding("cleanup_incomplete", n) for n in notes)], {"run_id": run_id})
         return contracts.result(op, "success", f"worker {run_id} is ready", data={
             "run_id": run_id, "worker": vm, "deadline": expires, "source": source, "allocation": allocation})
+
+    def _admit_linux(self, op, run_id, manifest, baseline_vm, allocation, revision, patch):
+        """Wait in line until a Linux worker may be active, then claim it.
+        Admission and the claim are one step under controller.lock, so no
+        other controller process can admit a worker between this one's check
+        and its claim. Only the worker limit is waited out; any other refusal
+        returns at once."""
+        until = self.clock() + self.slot_wait_s
+        ticket = self.linux_line.join(run_id)
+        said, notes = None, []
+        try:
+            while True:
+                ahead = self.linux_line.ahead(ticket)
+                if ahead:
+                    why = f"{ahead} waiter(s) ahead"
+                else:
+                    with locked(self.state / "controller.lock"):
+                        refused = self._admit(op, "linux")
+                        if refused is None:
+                            return self._claim_linux(op, run_id, manifest, baseline_vm, allocation, revision,
+                                                     patch)
+                    if "worker_limit" not in {f["code"] for f in refused["findings"]}:
+                        return refused
+                    why, notes = refused["findings"][0]["message"], refused["findings"][1:]
+                if (ahead, why) != said:
+                    print(f"busybee-lab: {run_id} queued for a Linux worker ({ahead} ahead: {why})",
+                          file=sys.stderr, flush=True)
+                    said = (ahead, why)
+                if self.clock() >= until:
+                    return contracts.result(op, "environment_failure", "worker limit reached", [
+                        contracts.finding("worker_limit", f"no Linux worker was free within "
+                                          f"{self.slot_wait_s:.0f}s: {why}"), *notes])
+                self.sleep(LINUX_POLL_S)
+        finally:
+            self.linux_line.leave(ticket)
+
+    def _claim_linux(self, op, run_id, manifest, baseline_vm, allocation, revision, patch):
+        """Under controller.lock, once admitted: the claimed worker, or why the
+        baseline cannot be cloned within the allocation."""
+        # A clone can grow to the baseline's disk size, so that must fit the allocation.
+        disk_mib = self.prl.info(baseline_vm)["disk_mib"]
+        if disk_mib is None or disk_mib > allocation["storage_gib"] * 1024:
+            return contracts.result(op, "environment_failure", "baseline disk exceeds the allocation", [
+                contracts.finding("storage_exhausted", f"the baseline disk is {disk_mib} MiB; a worker is "
+                                  f"allotted {allocation['storage_gib']} GiB")])
+        source = self._source(revision, patch)
+        vm = contracts.worker_name(run_id)
+        rdir, created, expires = self._open_run(run_id, patch)
+        self.reg.claim(vm, "worker", "linux", run_id, expires, parent=manifest["vm_id"])
+        return contracts.result(op, "success", f"worker {run_id} is claimed", data={
+            "worker": vm, "rdir": rdir, "source": source, "deadline": expires, "created": created})
 
     # The macOS slot: one guest, leased (lease.py, §macOS workers)
 
@@ -631,7 +675,7 @@ class Workers(template.Lab):
                                     [contracts.finding("lease_wait_timeout", str(err))])
         try:
             with locked(self.state / "controller.lock"):
-                refused = self._admit(op)
+                refused = self._admit(op, "macos")
                 if refused:
                     return refused
                 allocation = dict(self.config["worker"])
@@ -715,15 +759,20 @@ class Workers(template.Lab):
         self.event(record["run_id"], "released", notes=notes)
         return notes
 
-    def _admit(self, op):
-        """Under controller.lock: the refusal when another worker is active or
-        the host lacks the allocation's storage, else None."""
-        workers, notes = self._reconcile()
-        active = [w["run_id"] for w in workers]
-        if len(active) >= MAX_ACTIVE:
-            return contracts.result(op, "environment_failure", "worker limit reached", [
-                contracts.finding("worker_limit", f"{MAX_ACTIVE} worker(s) may be active; "
-                                  f"destroy {', '.join(active)} first"), *notes])
+    def _admit(self, op, name):
+        """Under controller.lock: the refusal when the configured number of
+        Linux workers is already active (for a Linux worker; the macOS slot
+        has its own lease) or the host lacks the allocation's storage, else
+        None. Every owned Linux worker counts until it is destroyed, whatever
+        its state."""
+        if name == "linux":
+            cap = contracts.linux_workers(self.config)
+            workers, notes = self._reconcile()
+            active = [f"{w['run_id']} ({w['status']})" for w in workers if w["role"] == "worker"]
+            if len(active) >= cap:
+                return contracts.result(op, "environment_failure", "worker limit reached", [
+                    contracts.finding("worker_limit", f"{cap} Linux worker(s) may be active at once: "
+                                      f"{', '.join(active)}"), *notes])
         allotted, free = self.config["worker"]["storage_gib"], self.free_gib(self.state)
         if free < allotted:
             return contracts.result(op, "environment_failure", "not enough storage", [

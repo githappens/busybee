@@ -462,6 +462,17 @@ class LeaseTests(unittest.TestCase):
             self.assertEqual(switch[3], record["reset_snapshot_id"])
             self.assertEqual(self.l.workers().destroy(run_id)["status"], "success")
 
+    def test_the_slot_is_not_counted_against_the_linux_workers(self):
+        # Two Linux workers (claimed, as by creations in flight) fill the Linux
+        # cap; the macOS slot has its own lease and is still granted.
+        for _ in range(2):
+            run_id = contracts.new_run_id()
+            worker.run_dir(self.l.state, run_id).mkdir(parents=True)
+            self.l.reg.claim(contracts.worker_name(run_id), "worker", "linux", run_id, "2026-10-01T00:00:00Z",
+                             parent=BASELINE_ID)
+        run_id = self.l.create()
+        self.assertEqual(self.l.reg.get(self.l.slot()[0])["holder"], run_id)
+
     def test_a_second_lease_waits_in_line(self):
         first = self.l.create()
         result = self.l.workers().create("macos", self.l.revision)

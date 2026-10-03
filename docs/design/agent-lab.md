@@ -159,11 +159,12 @@ dependency-warming step above. A reset then costs about the boot time.
 1. **Prepare the task.** Read its scope, acceptance criteria, named regressions,
    and relevant broker specification. Record the base revision and the required
    platform checks. Reuse an existing issue branch and PR when continuing work.
-2. **Allocate a worker.** Validate the selected template, reserve the configured
-   CPU and memory budget, create a clone (macOS: lease the single guest, see
-   §macOS workers), and transfer the checkout. Start with
-   one active worker; concurrency is a controller setting bounded by a total
-   resource budget. Assign a run ID and an overall deadline before execution.
+2. **Allocate a worker.** Validate the selected template, reserve the
+   configured worker allocation, which must fit the per-worker `[budget]`,
+   create a clone (macOS: lease the single guest, see §macOS workers), and
+   transfer the checkout. Up to `[concurrency] linux_workers` Linux workers
+   (default 2) are active at once, plus the macOS slot; a further creation
+   waits in line. Assign a run ID and an overall deadline before execution.
    The lab dispatcher does this per attempt (§Agent sessions).
 3. **Reproduce the failure.** Build the workspace from the recorded source.
    Run a bounded reproduction and save the failing assertion, command, output,
@@ -209,7 +210,7 @@ CLI usable by different agent runners.
 |---|---|
 | `doctor` | Check host prerequisites, local configuration, template eligibility, and available resource budget without changing host configuration. |
 | `template build`, `validate`, `promote` | Provision a candidate, prove its capabilities, and register its baseline version. |
-| `worker create` | Clone an explicit baseline, allocate a run ID, and return the worker identity and deadline. For macOS, wait for and lease the single guest instead of cloning (§macOS workers). |
+| `worker create` | Clone an explicit baseline, allocate a run ID, and return the worker identity and deadline, waiting in line while the configured number of Linux workers is active. For macOS, wait for and lease the single guest instead of cloning (§macOS workers). |
 | `exec` | Run argv in the guest with a working directory, environment, deadline, separate stdout/stderr, and exit status. |
 | `terminal open`, `send`, `resize`, `capture` | Operate a real PTY; expose input, dimensions, screen cells, images, and a timestamped terminal recording. |
 | `inspect`, `signal` | Read process and daemon state and signal processes belonging to the worker. |
@@ -271,9 +272,23 @@ registry, naming the baseline it depends on, then clones the promoted
 baseline's snapshot with the configured strategy, applies the `[worker]`
 allocation, and snapshots the clone before it first starts. The run record
 `build/vm/runs/<run-id>/worker.json` holds that reset snapshot, the source
-revision and patch hash, and the run deadline. One worker is active at a time,
-its allocation must fit `[budget]`, its `storage_gib` must cover the baseline's
-disk, which a clone can grow to, and the host must have that storage free.
+revision and patch hash, and the run deadline. `[budget]` bounds one VM: each
+worker's `[worker]` allocation must fit it (and a template build is given
+it). Up to `[concurrency] linux_workers` Linux workers (default 2, at most 16)
+are active at once, each owned by its own run; the macOS slot is apart and
+not counted. Every registered Linux worker counts until it is destroyed,
+whatever its state, so a retained worker holds its place. A creation that
+finds them all active takes a FIFO ticket under `queues/linux/` and waits,
+retrying admission every few seconds without holding the controller lock,
+for up to the run deadline; it then fails `worker_limit`, naming the active
+runs. Admission and the claim are one step under `controller.lock`, so two
+controller processes cannot both take the last place. Only the limit is
+waited out: a storage or baseline refusal returns at once. Each worker's
+`storage_gib` must cover the baseline's disk, which a clone can grow to, and
+the host must have that storage free when it is admitted. `doctor` reports
+the cap and the peak the configured workers need together (Linux workers and
+the macOS slot, each with the allocation; the slot's disk is its baseline's
+own) and warns (`concurrency_exceeds_host`) when the host has less.
 The revision travels as a Git bundle with its history and tags, so the guest
 checkout versions its build like the host's. `exec RUN --cwd DIR [--env
 NAME=VALUE] [--timeout S] -- ARGV` quotes every word, bounds the command by
@@ -415,9 +430,13 @@ The lab dispatcher (`sortie/LAB_WORKFLOW.md`) runs every agent turn inside an
 owned Linux worker. Issue selection stays in the dispatcher and VM lifecycle in
 the controller; `scripts/vm/session.py` connects the two through `vmctl session`.
 
-**Eligibility.** `sortie/lab.py` releases a ready lab issue for dispatch only
-when every native blocker was completed by a merged PR into `main` and every
-capability it needs is available now. Every issue needs `worker:linux` and
+**Eligibility.** The dispatcher considers every open issue in the repository
+that carries the `sortie` marker, whatever its milestone. `sortie/lab.py`
+gives an open `sortie:ready` issue that marker (and takes it back) only when
+every issue it is *blocked by* (GitHub's native issue dependencies) was
+completed by a merged PR into `main` and every capability it needs is
+available now. Those relations are the only ordering: not milestones, issue
+numbers or labels. Every issue needs `worker:linux` and
 `controller:session`; an issue body adds more on a `Lab requires:` line (for
 example `**Lab requires:** controller:terminal`). Every issue also needs
 `worker:macos` and `controller:gate`, since its handoff is verified on both
@@ -450,9 +469,14 @@ beside it, and is also reachable at the workspace's own absolute path, so an
 agent protocol that names its working directory resolves in the guest. The
 agent's saved conversation state (`.claude/projects`, `.codex/sessions` in the
 guest home) is restored, so a resumed turn finds its session in a new worker.
-`after_run` runs `session end`. Concurrency stays one active worker; a
-session holds its worker only during an attempt, never while its PR waits for
-review, and releases it before its handoff is verified.
+`after_run` runs `session end`. The dispatcher runs up to two sessions at
+once (`agent.max_concurrent_agents`), matching the default two Linux
+workers. A session holds its worker only during an attempt, never while its
+PR waits for review, and releases it before its handoff is verified, so two
+sessions need at most two Linux workers at a time: two attempts, or an
+attempt and a verification. A verification that still finds none free (a
+retained worker, an operator's own) waits in line for one, like the macOS
+slot, rather than ending `incomplete`.
 
 **Turns.** Sortie's agent command is `vmctl session agent -- <runner argv>`,
 run in the workspace. It runs the runner in the worker over SSH, in the
@@ -518,7 +542,14 @@ from the guest.
 and carried out when the turn ends, after the checkpoint: the attempt's
 worker is collected and destroyed, origin/main is fetched, and the evidence
 gate judges the head against its merge base with main (`gate`, with the
-candidate's changes to the overlay paths as the base's test overlay). The
+candidate's changes to the overlay paths as the base's test overlay). A
+product issue therefore declares its regression: test-only files named with
+`--overlay` (the usual form for a bug fix or a feature; they must fail on the
+base, where code they need may not even compile, and pass on the head), or a
+scenario whose `issue` is the issue's number. Without either the verdict is
+`checks_only`, which only an infrastructure session may hand off; a product
+change that cannot fail on its base (documentation, a pure refactor) is
+reported blocked by its agent rather than given an invented test. The
 session's records keep each result (`sessions/<issue>/verifications/`). A
 head the gate accepts gets its public record posted on the PR, once per
 piece of evidence, and then the trusted `reviews.py handoff` writes

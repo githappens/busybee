@@ -141,8 +141,27 @@ def check_resources(repo, config, host, findings):
     for key, have in available.items():
         want = config["budget"][key] if config else None
         if want is not None and want > have:
-            findings.append(contracts.finding("budget_exceeds_host", f"budget {key} = {want} but the host has {have}"))
+            findings.append(contracts.finding("budget_exceeds_host", f"budget {key} = {want} (one worker's "
+                                              f"ceiling) but the host has {have}"))
     return available
+
+
+def check_concurrency(config, available, findings):
+    """The resources every worker active at once needs: the configured number
+    of Linux workers and, when configured, the macOS slot, each with the
+    [worker] allocation. The slot guest's disk is its baseline's own, so it
+    adds no storage. Workers are admitted one at a time against the host, so
+    a peak beyond it is a warning, not a failure."""
+    cap, allocation = contracts.linux_workers(config), config["worker"]
+    slot = 1 if "macos" in config.get("templates", {}) else 0
+    peak = {"cpus": (cap + slot) * allocation["cpus"], "memory_mib": (cap + slot) * allocation["memory_mib"],
+            "storage_gib": cap * allocation["storage_gib"]}
+    for key, need in peak.items():
+        if need > available[key]:
+            findings.append(contracts.finding("concurrency_exceeds_host", f"{cap} Linux worker(s)"
+                                              f"{' and the macOS slot' if slot else ''} at once need {key} = "
+                                              f"{need}; the host has {available[key]}", "warning"))
+    return peak
 
 
 def check_template(repo, name, entry, config, adapter, vms, findings):
@@ -209,7 +228,9 @@ def doctor(repo, config_path, host, runner=parallels.run):
 
     if config:
         data["config"].update({"clone_strategy": config["clone_strategy"], "deadlines": config["deadlines"],
-                               "budget": config["budget"]})
+                               "budget": config["budget"],
+                               "concurrency": {"linux_workers": contracts.linux_workers(config)},
+                               "peak": check_concurrency(config, data["host"]["available"], findings)})
         templates = config.get("templates", {})
         if not templates:
             findings.append(contracts.finding("baseline_missing", "no template is configured"))
@@ -266,7 +287,7 @@ def worker_operation(repo, args, host, operation):
     workers = worker.Workers(REPO, config, prl, reg, host.free_storage_gib,
                              supervise=lambda run_id, lease=None: supervisor.ensure(
                                  state, run_id, supervisor.argv(REPO, args.config, run_id, repo), lease=lease),
-                             root=repo)
+                             slot_wait_s=getattr(args, "wait", None), root=repo)
     try:
         if operation.startswith("session "):
             return session_operation(workers, args, operation)
@@ -352,10 +373,24 @@ def summary(result):
         a = data["host"]["available"]
         lines.append(f"  host {data['host']['os']} {data['host']['arch']}: {a['cpus']} cpus, "
                      f"{a['memory_mib']} MiB, {a['storage_gib']} GiB free")
+    if "peak" in data.get("config", {}):
+        c = data["config"]
+        b, peak = c["budget"], c["peak"]
+        slot = " and the macOS slot" if "macos" in data.get("templates", {}) else ""
+        lines.append(f"  workers: up to {c['concurrency']['linux_workers']} Linux at once{slot}, each within the "
+                     f"per-worker budget of {b['cpus']} cpus, {b['memory_mib']} MiB, {b['storage_gib']} GiB; "
+                     f"together {peak['cpus']} cpus, {peak['memory_mib']} MiB, {peak['storage_gib']} GiB")
     for name, template in data.get("templates", {}).items():
         lines.append(f"  template {name}: {template['state']}")
     lines += [f"  {line}" for line in data.get("view", [])]
     return "\n".join(lines)
+
+
+def seconds(text):
+    value = int(text)
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"{text} is not a number of seconds")
+    return value
 
 
 def parser():
@@ -388,6 +423,8 @@ def parser():
                                 help="clone the promoted baseline; macos: wait for and lease the macOS slot")
     create.add_argument("--revision", required=True, help="commit to check out in the worker")
     create.add_argument("--patch", type=Path, help="patch applied on top of the revision")
+    create.add_argument("--wait", type=seconds, help="seconds to wait in line for a free Linux worker or the "
+                        "macOS slot; default deadlines.run")
     workers.add_parser("reset", parents=[target], help="collect, then restore the recorded baseline")
     workers.add_parser("destroy", parents=[target], help="collect, then delete the clone")
     run = ops.add_parser("exec", parents=[target], help="run argv in a worker: exec RUN_ID --cwd DIR -- ARGV...")

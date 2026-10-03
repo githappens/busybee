@@ -24,21 +24,30 @@ scenario = 3600
 run = 14400
 cleanup = 300
 
-# Total resources all active workers may use.
+# The most one VM may use: every worker's allocation must fit it, and a
+# template build is given it. It is per worker, not a total.
 [budget]
 cpus = 4
 memory_mib = 8192
 storage_gib = 64
 
-# One worker's allocation, within the budget. One worker is active at a time;
-# storage_gib must cover the baseline's disk (16 GiB), which a clone can grow to.
-# artifact_mib caps the host storage one run's logs and evidence may use; a
-# command that outgrows it is stopped with an explicit failure.
+# One worker's allocation, within the budget. storage_gib must cover the
+# baseline's disk (16 GiB), which a clone can grow to. artifact_mib caps the
+# host storage one run's logs and evidence may use; a command that outgrows it
+# is stopped with an explicit failure.
 [worker]
 cpus = 4
 memory_mib = 8192
 storage_gib = 16
 artifact_mib = 2048
+
+# Linux workers active at once (default 2: two lab sessions, or a session and
+# a verification), each with the [worker] allocation; a further `worker create
+# linux` waits in line. The macOS slot is one more guest on top. With the
+# values above two sessions need 12 cpus, 24 GiB of memory and 32 GiB of free
+# storage at their peak; doctor warns when the host has less.
+[concurrency]
+linux_workers = 2
 
 # Baselines, by guest OS. Each manifest path is relative to state_dir and is
 # written by template promotion (busybee.vm.template/v2).

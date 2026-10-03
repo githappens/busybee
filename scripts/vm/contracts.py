@@ -33,9 +33,12 @@ STATE_ROOT = Path("build/vm")
 DEADLINE_BOUNDS = {"command": (1, 6 * 3600), "scenario": (1, 12 * 3600), "run": (1, 24 * 3600),
                    "cleanup": (1, 3600)}
 BUDGET_BOUNDS = {"cpus": (1, 256), "memory_mib": (1024, 1024 * 1024), "storage_gib": (8, 16 * 1024)}
-# One worker's allocation: a share of the budget, plus the host storage its run's
-# logs and evidence may use.
+# One worker's allocation, within the per-worker budget, plus the host storage
+# its run's logs and evidence may use.
 WORKER_BOUNDS = {**BUDGET_BOUNDS, "artifact_mib": (16, 1024 * 1024)}
+# How many Linux workers may be active at once; the macOS slot is apart.
+CONCURRENCY_BOUNDS = {"linux_workers": (1, 16)}
+DEFAULT_LINUX_WORKERS = 2
 
 # provisioning: its source is not (or no longer) in the guest; ready: running
 # with its source; stopped: halted after guest control failed; retained:
@@ -72,6 +75,12 @@ def _bounded(section, values, bounds, errors):
             errors.append(("config_invalid", f"[{section}] {key} = {value} is outside {low}..{high}"))
 
 
+def linux_workers(config):
+    """How many Linux workers may be active at once: `[concurrency]
+    linux_workers`, or DEFAULT_LINUX_WORKERS when the table is absent."""
+    return config.get("concurrency", {}).get("linux_workers", DEFAULT_LINUX_WORKERS)
+
+
 def state_dir(config, repo):
     return (repo / config["state_dir"]).resolve()
 
@@ -79,7 +88,8 @@ def state_dir(config, repo):
 def config_errors(config, repo):
     """Every problem with a parsed local config, as (code, message) pairs."""
     errors = []
-    known = {"schema", "state_dir", "clone_strategy", "parallels", "deadlines", "budget", "worker", "templates"}
+    known = {"schema", "state_dir", "clone_strategy", "parallels", "deadlines", "budget", "worker", "concurrency",
+             "templates"}
     for key in sorted(set(config) - known):
         errors.append(("config_invalid", f"unknown key {key!r}"))
     if config.get("schema") != CONFIG_SCHEMA:
@@ -111,9 +121,11 @@ def config_errors(config, repo):
     if isinstance(deadlines, dict) and all(_integer(deadlines.get(k)) for k in ("command", "scenario", "run")):
         if not deadlines["command"] <= deadlines["scenario"] <= deadlines["run"]:
             errors.append(("config_invalid", "deadlines must nest: command <= scenario <= run"))
+    # [budget] bounds one VM: each worker's allocation, and a template build.
     _bounded("budget", config.get("budget"), BUDGET_BOUNDS, errors)
-    # One worker's allocation; all active workers together stay within the budget.
     _bounded("worker", config.get("worker"), WORKER_BOUNDS, errors)
+    if "concurrency" in config:
+        _bounded("concurrency", config["concurrency"], CONCURRENCY_BOUNDS, errors)
     budget, allocation = config.get("budget"), config.get("worker")
     if isinstance(budget, dict) and isinstance(allocation, dict):
         for key in BUDGET_BOUNDS:
