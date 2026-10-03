@@ -173,6 +173,8 @@ No silent fallbacks anywhere: if bzbd cannot create its fifo or socket it refuse
 | bzbd is told to stop (SIGTERM) | running tasks are left alone; `leases.json` is written for the daemon that takes them over; the socket is unlinked; the fifo is left for the tasks that hold it |
 | fifo accounting drift | bzbd periodically checks `FIONREAD + Σ held ≤ pool_size`; excess tokens (a tool wrote extra bytes) are drained; a deficit is logged and corrected when the holding lease ends |
 
+An admission held back behind an unsettled teardown or submission is an admission. The scheduler has already counted the lease as admitted and sized it, its drain target and a jobserver build's fair share `cores`, under the `pool_size` and `max_concurrent` in force when it admitted it; the daemon only delays starting it until the machine is accounted for. A [reload](#configuration) in that window does not revisit it: `Scheduler::set_params` never revokes an admission, so the held lease starts with the parameters it was sized under, exactly as a lease already running when the reload came keeps them. After a reload that lowers either value it can start with a fair share computed from the old pool, and one more lease can be running than the new `max_concurrent` allows. It cannot oversubscribe the pool: the shrink has already been taken from the fifo or booked as owed, a drain collects only what the fifo holds, and a jobserver build is bounded by the fifo whatever its `MAKEFLAGS` says. Requeueing held admissions on reload is not done; it needs a scheduler operation that un-admits a lease, the same surface the parked #18 will need, and is decided there.
+
 ## Configuration
 
 `$XDG_CONFIG_HOME/busybee/config.toml`, falling back to
