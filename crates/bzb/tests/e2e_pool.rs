@@ -9,7 +9,7 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::Path,
     process::{Output, Stdio},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use bzb_test_support::counter;
@@ -216,6 +216,112 @@ fn a_static_task_drains_the_pool_and_hands_it_back() {
     assert_pool_idle(&busybee);
 }
 
+/// The static fair share counts every admitted lease: with two builds live it
+/// is `ceil(6 / 3) = 2`, so a request for three is clamped to two.
+#[test]
+#[serial_test::serial]
+fn a_static_task_beside_two_builds_gets_a_third_of_the_pool() {
+    let Some(busybee) = fixture() else {
+        return;
+    };
+    /// What `--cores 3` is clamped to beside two admitted builds.
+    const GRANTED: u32 = 2;
+    /// Two builds' implicit jobs plus the tokens the static task leaves.
+    const THREE_WAY_CEILING: u32 = POOL - GRANTED + 2;
+    // Per build; together they outlast a slow drain plus the 2 s task.
+    const TARGETS: u32 = 100;
+    // One directory, so each sample carries the combined total.
+    let build = busybee.tmp.path().join("three-way");
+    counter::make_build(&build, TARGETS, "0.5");
+
+    let builds: Vec<_> = ["a", "b"]
+        .iter()
+        .map(|name| {
+            busybee
+                .cmd(&["--", "make", "run"])
+                .current_dir(&build)
+                .env("COUNTER_NAME", name)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start a build")
+        })
+        .collect();
+    busybee.wait_for("both builds to be admitted", |status| {
+        status
+            .leases
+            .iter()
+            .filter(|l| l.tool == "make" && l.state == "running")
+            .count()
+            == 2
+    });
+
+    let held = busybee.tmp.path().join("held");
+    let handed_back = busybee.tmp.path().join("handed-back");
+    let out = busybee
+        .cmd(&[
+            "--class",
+            "static",
+            "--cores",
+            "3",
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "echo $BUSYBEE_CORES; touch {}; sleep 2; touch {}",
+                held.display(),
+                handed_back.display()
+            ),
+        ])
+        .output()
+        .expect("run the static task");
+
+    assert!(out.status.success(), "stderr: {}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        format!("{GRANTED}\n"),
+        "a request for 3 beside two admitted leases is clamped to the fair share"
+    );
+    assert_preamble(
+        &out,
+        &running(
+            "<shell>",
+            &format!(r"static, holding {GRANTED}/{POOL} cores \(2 other tasks active\)"),
+        ),
+    );
+
+    let (from, to) = (mtime(&held), mtime(&handed_back));
+    let during: Vec<u32> = counter::samples(&build)
+        .iter()
+        .filter(|s| s.at >= from && s.at <= to)
+        .map(|s| s.total)
+        .collect();
+    assert!(
+        during.len() >= 2,
+        "the builds logged {} job(s) while the static task held its cores; \
+         they have to be running through the window for this to mean anything",
+        during.len()
+    );
+    let peak = during.iter().copied().max().expect("samples in the window");
+    assert!(
+        peak <= THREE_WAY_CEILING,
+        "the two builds ran {peak} jobs at once while {GRANTED} of {POOL} tokens \
+         were held, expected at most {THREE_WAY_CEILING}"
+    );
+
+    for build in builds {
+        let out = build.wait_with_output().expect("wait for a build");
+        assert!(out.status.success(), "stderr: {}", stderr(&out));
+    }
+    assert_eq!(
+        counter::samples(&build).len(),
+        2 * TARGETS as usize,
+        "both builds must run all their targets"
+    );
+
+    assert_pool_idle(&busybee);
+}
+
 #[test]
 #[serial_test::serial]
 fn an_unrecognised_command_waits_for_the_pool_then_has_it_alone() {
@@ -348,6 +454,89 @@ fn interrupting_a_queued_client_leaves_the_running_build_alone() {
     assert_pool_idle(&busybee);
 }
 
+/// A queued lease holds nothing: the build keeps the whole pool for as long as
+/// an exclusive client waits behind it, not only after the client is gone.
+#[test]
+#[serial_test::serial]
+fn a_queued_lease_holds_no_tokens_while_it_waits() {
+    let Some(busybee) = fixture() else {
+        return;
+    };
+    /// Long enough for several rounds of the build's jobs.
+    const WINDOW: Duration = Duration::from_secs(3);
+    // Outlasts the queueing plus the window at full width.
+    const TARGETS: u32 = 80;
+    let build = busybee.tmp.path().join("waiting");
+    counter::make_build(&build, TARGETS, "0.5");
+
+    let make = busybee
+        .cmd(&["--", "make", "run"])
+        .current_dir(&build)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start the build");
+    busybee.wait_for_a_running_task();
+
+    // `none` wants the whole pool, so it waits for the build to end.
+    let mut queued = busybee
+        .cmd(&["--", "echo", "exclusive"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start the client that queues behind the build");
+    busybee.wait_for("the exclusive client to be queued", |status| {
+        status.leases.iter().any(|l| l.state == "queued")
+    });
+    let from = mark(&busybee, "queued-from");
+    std::thread::sleep(WINDOW);
+    let to = mark(&busybee, "queued-to");
+
+    // The window only counts if the client was queued through all of it.
+    let status = busybee.status().expect("bzbd answers status");
+    let waiting: Vec<_> = status.leases.iter().filter(|l| l.tool != "make").collect();
+    assert!(
+        waiting.len() == 1 && waiting[0].state == "queued" && waiting[0].cores == 0,
+        "the exclusive client was not still queued, holding nothing, when the \
+         window closed: {:?}",
+        status.leases
+    );
+
+    let during: Vec<u32> = counter::samples(&build)
+        .iter()
+        .filter(|s| s.at >= from && s.at <= to)
+        .map(|s| s.total)
+        .collect();
+    assert!(
+        during.len() >= 6,
+        "the build logged {} job(s) while the client was queued; it has to be \
+         running through the window for this to mean anything",
+        during.len()
+    );
+    // A queued lease that drained tokens early would throttle the build here.
+    let peak = during.iter().copied().max().expect("samples in the window");
+    assert!(
+        (5..=CEILING).contains(&peak),
+        "peak concurrency {peak} while a client was queued, expected 5..={CEILING}: \
+         a queued lease must leave the whole pool to the build"
+    );
+
+    // SAFETY: an unreaped child's pid.
+    unsafe { libc::kill(queued.id() as i32, libc::SIGINT) };
+    let status = queued.wait().expect("wait for the interrupted client");
+    assert_eq!(
+        status.code(),
+        Some(130),
+        "the client was admitted before it was interrupted (exit {:?}); \
+         the build ended inside the window",
+        status.code()
+    );
+
+    let make = make.wait_with_output().expect("wait for the build");
+    assert!(make.status.success(), "stderr: {}", stderr(&make));
+    assert_pool_idle(&busybee);
+}
+
 /// Line shapes from bzbd.md §Client output contract; admission is [`running`].
 const QUEUED: &str = r"^busybee: queued \(\d+ ahead\)$";
 const MOVED: &str = r"^busybee: (?:\d+ ahead…|still queued \(\d+ ahead\))$";
@@ -414,6 +603,14 @@ fn assert_pool_idle(busybee: &Busybee) {
         "status was {}",
         stdout(&status)
     );
+}
+
+/// Touches a file in the test's tempdir and returns its mtime, a timestamp on
+/// the same clock as the build's samples.
+fn mark(busybee: &Busybee, name: &str) -> SystemTime {
+    let path = busybee.tmp.path().join(name);
+    fs::write(&path, "").expect("write a time marker");
+    mtime(&path)
 }
 
 fn mtime(path: &Path) -> SystemTime {
