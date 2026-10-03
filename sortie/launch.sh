@@ -77,6 +77,10 @@ case "$root$trusted$BUSYBEE_SORTIE_WORKSPACE_ROOT" in
 esac
 export BUSYBEE_LAB_ROOT=$root
 export SORTIE_AGENT_COMMAND="python3 $trusted/scripts/vm/vmctl.py --root $root session agent -- $agent_command"
+# Hooks see only SORTIE_* copies of these (sortie/README.md, "What hooks see").
+export SORTIE_BUSYBEE_TRUSTED=$trusted SORTIE_BUSYBEE_LAB_ROOT=$root
+export SORTIE_BUSYBEE_CLONE_URL=$BUSYBEE_SORTIE_CLONE_URL SORTIE_BUSYBEE_AGENT_KIND=$kind
+export SORTIE_BUSYBEE_WORKSPACES=${BUSYBEE_SORTIE_WORKSPACES:-} SORTIE_BUSYBEE_GITHUB_TOKEN=$GITHUB_TOKEN
 sortie validate "$trusted/sortie/$workflow"
 
 # A mkdir lock prevents a second process from dispatching the same issues.

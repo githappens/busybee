@@ -53,7 +53,7 @@ grep -qxF '/.sortie/' "$gitdir" || printf '/.sortie/\n' >> "$gitdir"
 # issue branch's launcher. Claude's existing guard is a cooperative safeguard;
 # the VM worker is the boundary.
 printf '%s\n' "$trusted" > .sortie/trusted-controller
-if [ "$BUSYBEE_SORTIE_AGENT_KIND" = claude-code ]; then
+if [ "${BUSYBEE_SORTIE_AGENT_KIND:?agent kind required}" = claude-code ]; then
   for path in /.claude/hooks/ /.claude/settings.json /.claude/isolated.sh; do
     grep -qxF "$path" "$gitdir" || printf '%s\n' "$path" >> "$gitdir"
   done
