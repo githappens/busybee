@@ -5,6 +5,11 @@
 //! last build exits. Reads and `FIONREAD` use a separate read-only handle: on
 //! macOS a fifo is a socket pair and `FIONREAD` on a read-write descriptor
 //! reports the always-empty write side.
+//!
+//! Token acquisition uses a third handle opened without `O_NONBLOCK`.  A
+//! blocking read places the daemon in the kernel's wait queue alongside the
+//! jobserver build's own readers, so they compete on equal terms.  The
+//! non-blocking handle (`fd_r`) is kept for `FIONREAD` only.
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -23,8 +28,12 @@ pub struct Jobserver {
     /// Opened read-write so the fifo stays alive with zero clients; tokens
     /// are written back through it.
     fd_rw: File,
-    /// Read-only handle for `read` and `FIONREAD`.
+    /// Read-only, non-blocking handle for `FIONREAD`.
     fd_r: File,
+    /// Read-only, blocking handle used by [`read_tokens`](Self::read_tokens).
+    /// A blocking `read` places the daemon in the kernel's wait queue, so it
+    /// competes fairly with jobserver build readers already blocked there.
+    fd_b: File,
     /// Set by [`leave`](Self::leave): `Drop` keeps the fifo.
     left: bool,
 }
@@ -70,9 +79,12 @@ impl Jobserver {
         }
         let handles = open_nonblocking(&path, true).and_then(|rw| {
             let r = open_nonblocking(&path, false)?;
-            Ok((rw, r))
+            // Blocking open succeeds immediately: fd_rw (O_RDWR) is already
+            // open, satisfying the "writer exists" requirement for O_RDONLY.
+            let b = fs::OpenOptions::new().read(true).open(&path)?;
+            Ok((rw, r, b))
         });
-        let (fd_rw, fd_r) = match handles {
+        let (fd_rw, fd_r, fd_b) = match handles {
             Ok(h) => h,
             Err(err) => {
                 return Err(match unlink(&path) {
@@ -87,6 +99,7 @@ impl Jobserver {
             path,
             fd_rw,
             fd_r,
+            fd_b,
             left: false,
         };
         js.release(pool_size)?;
@@ -108,10 +121,10 @@ impl Jobserver {
         Ok(n as u32)
     }
 
-    /// Take up to `n` tokens, sleeping in `poll(2)` until tokens arrive or
-    /// `deadline` elapses. Returns how many were taken (`0..=n`); the caller
-    /// owns them until it calls [`release`](Self::release). On error nothing
-    /// is owned: tokens read before the failure are written back first.
+    /// Take up to `n` tokens within `deadline`.  Returns how many were taken
+    /// (`0..=n`); the caller owns them until it calls [`release`](Self::release).
+    /// On error nothing is owned: tokens read before the failure are written
+    /// back first.
     pub fn acquire(&self, n: u32, deadline: Duration) -> io::Result<u32> {
         let mut got = 0u32;
         match self.read_tokens(n, deadline, &mut got) {
@@ -128,11 +141,49 @@ impl Jobserver {
 
     /// Body of [`acquire`](Self::acquire); `got` counts tokens read so far
     /// so the caller can return them when this fails.
+    ///
+    /// Uses `poll(2)` to enforce the deadline, then reads from the blocking
+    /// handle `fd_b`.  A blocking `read` keeps the daemon in the kernel's
+    /// wait queue: if another reader (a jobserver build already blocked in
+    /// `read(2)`) takes the byte that triggered `POLLIN`, the daemon does not
+    /// have to restart the whole `poll` cycle — it stays queued and picks up
+    /// the next token when one arrives.
     fn read_tokens(&self, n: u32, deadline: Duration, got: &mut u32) -> io::Result<()> {
         let end = Instant::now() + deadline;
         let mut buf = vec![0u8; n as usize];
         while *got < n {
-            match (&self.fd_r).read(&mut buf[..(n - *got) as usize]) {
+            let now = Instant::now();
+            // Use saturating_duration_since so an already-elapsed deadline
+            // yields timeout_ms = 0 rather than a panic.  poll(timeout=0) is
+            // an immediate availability check: it returns POLLIN if data is
+            // already in the pipe (e.g. drain_excess with Duration::ZERO), and
+            // 0 (timed out) if the pipe is empty — which breaks the loop.
+            let timeout_ms = end
+                .saturating_duration_since(now)
+                .as_micros()
+                .div_ceil(1000)
+                .min(i32::MAX as u128);
+            let mut pfd = libc::pollfd {
+                fd: self.fd_b.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pfd is a valid array of one pollfd.
+            let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms as i32) };
+            if ret < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() != io::ErrorKind::Interrupted {
+                    return Err(err);
+                }
+                continue;
+            }
+            if ret == 0 {
+                break; // deadline elapsed
+            }
+            // poll(2) reported POLLIN.  Read from the blocking handle so that
+            // if another reader consumed the byte first, we stay in the
+            // kernel's wait queue rather than restarting the poll cycle.
+            match (&self.fd_b).read(&mut buf[..(n - *got) as usize]) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -140,26 +191,7 @@ impl Jobserver {
                     ))
                 }
                 Ok(k) => *got += k as u32,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let now = Instant::now();
-                    if now >= end {
-                        break;
-                    }
-                    let timeout_ms = (end - now).as_micros().div_ceil(1000).min(i32::MAX as u128);
-                    let mut pfd = libc::pollfd {
-                        fd: self.fd_r.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    // SAFETY: pfd is a valid array of one pollfd.
-                    if unsafe { libc::poll(&mut pfd, 1, timeout_ms as i32) } < 0 {
-                        let err = io::Error::last_os_error();
-                        if err.kind() != io::ErrorKind::Interrupted {
-                            return Err(err);
-                        }
-                    }
-                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
         }

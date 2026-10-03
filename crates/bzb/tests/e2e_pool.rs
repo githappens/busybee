@@ -16,10 +16,10 @@ use bzb_test_support::counter;
 use common::{stderr, stdout, Busybee};
 use regex::Regex;
 
-/// The drain deadline is 5x the default: make re-reads a token as soon as it
-/// returns one, so draining off a busy build is a race. At 2 s a 3-token drain
-/// fell short 6/25 times; at 10 s, 0/25 (slowest ~3 s).
-const CONFIG: &str = "pool_size = 6\nmax_concurrent = 4\ndrain_deadline_ms = 10000\n";
+/// The drain uses blocking reads so it competes fairly with make's own readers.
+/// Before the fix (poll then non-blocking read), at 2 s a 3-token drain fell
+/// short 6/25 times and the test required 10 s.  The default now suffices.
+const CONFIG: &str = "pool_size = 6\nmax_concurrent = 4\ndrain_deadline_ms = 2000\n";
 const POOL: u32 = 6;
 
 /// The pool plus the one job a jobserver build runs without a token.
