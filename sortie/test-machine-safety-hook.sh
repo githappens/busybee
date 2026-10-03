@@ -155,12 +155,31 @@ EOF
 chmod +x "$fake_bin/bzb"
 launch_out=$(PATH="$fake_bin:$PATH" CLAUDE_PROJECT_DIR="$root" "$launcher" bzb)
 if [[ $launch_out == *"BUSYBEE_STATE_DIR=$root/build/sortie-agent-state/busybee"* ]] &&
-   [[ $launch_out == *"PUEUE_CONFIG_PATH=$root/build/sortie-agent-state/pueue"* ]]; then
-  printf 'ok - isolated.sh exports workspace-local state\n'
+   [[ $launch_out == *"PUEUE_CONFIG_PATH=$root/build/sortie-agent-state/pueue.yml"* ]] &&
+   [ -f "$root/build/sortie-agent-state/pueue.yml" ]; then
+  printf 'ok - isolated.sh exports workspace-local state and a Pueue config file\n'
 else
-  printf 'not ok - isolated.sh exports workspace-local state\n%s\n' "$launch_out" >&2
+  printf 'not ok - isolated.sh exports workspace-local state and a Pueue config file\n%s\n' \
+    "$launch_out" >&2
   failures=$((failures + 1))
 fi
+
+# A socket path past the platform's sun_path limit is refused before launch.
+long_root=$(mktemp -d)/$(printf 'w%.0s' $(seq 120))
+mkdir -p "$long_root"
+: >"$long_root/flake.nix"
+if PATH="$fake_bin:$PATH" CLAUDE_PROJECT_DIR="$long_root" "$launcher" bzb \
+  >/dev/null 2>"$fake_bin/long.err"; then
+  printf 'not ok - isolated.sh refuses a socket path over the platform limit\n' >&2
+  failures=$((failures + 1))
+elif grep -q 'socket path .* bytes' "$fake_bin/long.err"; then
+  printf 'ok - isolated.sh refuses a socket path over the platform limit\n'
+else
+  printf 'not ok - isolated.sh refuses a socket path over the platform limit\n%s\n' \
+    "$(cat "$fake_bin/long.err")" >&2
+  failures=$((failures + 1))
+fi
+rm -rf "$(dirname "$long_root")"
 if PATH="$fake_bin:$PATH" CLAUDE_PROJECT_DIR="$root" "$launcher" bash -c true \
   >/dev/null 2>"$fake_bin/err"; then
   printf 'not ok - isolated.sh rejects a non-stateful first arg\n' >&2
