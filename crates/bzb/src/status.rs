@@ -146,11 +146,15 @@ pub(crate) fn printable(text: &str) -> String {
 pub(crate) fn cores(lease: &LeaseView) -> String {
     match lease.ahead {
         Some(ahead) => format!("{ahead} ahead"),
-        // A jobserver count is the daemon's estimate.
-        None if lease.class == "jobserver" => format!("using ~{}", lease.cores),
         // A `none` lease owns the machine but drains no tokens.
         None if lease.class == "none" => "exclusive".to_string(),
-        None => format!("holding {}", lease.cores),
+        // Jobserver per-lease attribution: show estimate when available,
+        // otherwise "sharing" (spec §Observability, issue #50).
+        None if lease.class == "jobserver" => match lease.cores {
+            Some(n) => format!("using ~{n}"),
+            None => "sharing".to_string(),
+        },
+        None => format!("holding {}", lease.cores.unwrap_or(0)),
     }
 }
 
@@ -173,7 +177,7 @@ mod tests {
                 label: "ui build".into(),
                 tool: "xcodebuild".into(),
                 class: "static".into(),
-                cores: 9,
+                cores: Some(9),
                 state: "running".into(),
                 elapsed_ms: 132_000,
                 ahead: None,
@@ -218,12 +222,60 @@ mod tests {
         reply.free = 18;
         reply.held = 0;
         reply.leases[0].class = "none".into();
-        reply.leases[0].cores = 0;
+        reply.leases[0].cores = Some(0);
 
         let rendered = render(&reply);
 
         assert!(rendered.contains("exclusive"), "rendered {rendered:?}");
         assert!(!rendered.contains("holding"), "rendered {rendered:?}");
+    }
+
+    #[test]
+    fn a_running_jobserver_lease_without_attribution_shows_sharing() {
+        let lease = LeaseView {
+            id: 1,
+            label: "make build".into(),
+            tool: "make".into(),
+            class: "jobserver".into(),
+            cores: None,
+            state: "running".into(),
+            elapsed_ms: 30_000,
+            ahead: None,
+            pueue_task_id: Some(1),
+        };
+        assert_eq!(cores(&lease), "sharing");
+    }
+
+    #[test]
+    fn a_running_static_lease_shows_holding_n() {
+        let lease = LeaseView {
+            id: 2,
+            label: "xcode build".into(),
+            tool: "xcodebuild".into(),
+            class: "static".into(),
+            cores: Some(9),
+            state: "running".into(),
+            elapsed_ms: 60_000,
+            ahead: None,
+            pueue_task_id: Some(2),
+        };
+        assert_eq!(cores(&lease), "holding 9");
+    }
+
+    #[test]
+    fn a_jobserver_lease_with_attributed_cores_shows_using_n() {
+        let lease = LeaseView {
+            id: 3,
+            label: "cmake build".into(),
+            tool: "cmake".into(),
+            class: "jobserver".into(),
+            cores: Some(5),
+            state: "running".into(),
+            elapsed_ms: 20_000,
+            ahead: None,
+            pueue_task_id: Some(3),
+        };
+        assert_eq!(cores(&lease), "using ~5");
     }
 
     #[test]

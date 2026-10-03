@@ -996,7 +996,9 @@ impl Leases {
                     label: lease.map(Lease::label).unwrap_or_default(),
                     tool: lease.map(|l| l.plan.tool.clone()).unwrap_or_default(),
                     class: class.as_str().to_string(),
-                    cores,
+                    // Jobserver leases hold no fixed tokens; per-process
+                    // attribution is not yet implemented, so usage is unknown.
+                    cores: (class != Class::Jobserver).then_some(cores),
                     state: state.to_string(),
                     elapsed_ms: lease.map_or(0, |l| elapsed_ms(l.started_at)),
                     ahead: (!running).then_some(position),

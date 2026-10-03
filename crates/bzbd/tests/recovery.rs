@@ -149,7 +149,7 @@ async fn a_restarted_daemon_adopts_the_static_lease_it_left_running() {
     assert_eq!(orphan.id, id);
     assert_eq!(orphan.pueue_task_id, Some(task));
     assert_eq!(orphan.state, "orphaned");
-    assert_eq!(orphan.cores, 3);
+    assert_eq!(orphan.cores, Some(3));
     assert_eq!((status.held, status.free), (3, 1));
     assert_eq!(fifo_tokens(&daemon.fifo_path()), 1);
 

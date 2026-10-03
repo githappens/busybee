@@ -9,8 +9,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
 use crate::classify::Class;
 
 /// Bumped on every incompatible change to the types below; the handshake
-/// matches it exactly. 2: `LeaseView::tool`, 3: `detached`, 4: `ConfigReload`.
-pub const PROTOCOL_VERSION: u32 = 4;
+/// matches it exactly. 2: `LeaseView::tool`, 3: `detached`, 4: `ConfigReload`,
+/// 5: `LeaseView::cores` is `Option<u32>` (null when attribution unavailable).
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The longest line either end will read, so a newline-free stream cannot
 /// exhaust the daemon's (or a client's) memory.
@@ -150,7 +151,10 @@ pub struct LeaseView {
     /// The tool that decided the class; `label` is the caller's `--name`.
     pub tool: String,
     pub class: String,
-    pub cores: u32,
+    /// Token count for this lease, or `null` / absent when unavailable.
+    /// Static leases hold a fixed count; jobserver leases carry `null` until
+    /// per-process attribution is implemented (spec §Observability).
+    pub cores: Option<u32>,
     /// `queued`, `running`, or `orphaned` (adopted from a dead daemon, no
     /// client; spec §Failure and recovery).
     pub state: String,
@@ -258,6 +262,39 @@ mod tests {
         assert_ne!(
             PROTOCOL_VERSION, 1,
             "a required field the previous version never sent needs a version bump"
+        );
+    }
+
+    /// v5 encodes `cores` as `null` for jobserver leases; v4 always sent a
+    /// number. The version check in the handshake gates this, but verify the
+    /// structural change itself.
+    #[test]
+    fn a_jobserver_lease_view_with_null_cores_round_trips() {
+        let view = LeaseView {
+            id: 42,
+            label: "cmake build".into(),
+            tool: "cmake".into(),
+            class: "jobserver".into(),
+            cores: None,
+            state: "running".into(),
+            elapsed_ms: 40_000,
+            ahead: None,
+            pueue_task_id: Some(2),
+        };
+        let encoded = serde_json::to_string(&view).expect("encode");
+        assert!(
+            encoded.contains(r#""cores":null"#),
+            "expected null cores, got {encoded:?}"
+        );
+        let decoded: LeaseView = serde_json::from_str(&encoded).expect("decode");
+        assert!(
+            decoded.cores.is_none(),
+            "expected None, got {:?}",
+            decoded.cores
+        );
+        assert_ne!(
+            PROTOCOL_VERSION, 4,
+            "cores became optional in v5; this is a protocol bump"
         );
     }
 

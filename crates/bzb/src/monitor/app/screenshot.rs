@@ -35,7 +35,14 @@ const BACKGROUND: &str = "#1a1b26";
 const FOREGROUND: &str = "#c0caf5";
 const FRAME: &str = "#414868";
 
-fn lease(id: u64, label: &str, tool: &str, class: &str, cores: u32, elapsed_ms: u64) -> LeaseView {
+fn lease(
+    id: u64,
+    label: &str,
+    tool: &str,
+    class: &str,
+    cores: Option<u32>,
+    elapsed_ms: u64,
+) -> LeaseView {
     LeaseView {
         id,
         label: label.into(),
@@ -52,7 +59,7 @@ fn lease(id: u64, label: &str, tool: &str, class: &str, cores: u32, elapsed_ms: 
 #[test]
 #[ignore = "writes build/monitor.svg, the source of docs/images/monitor.png"]
 fn screenshot() {
-    let mut queued = lease(44, "workspace tests", "cargo", "jobserver", 0, 9_000);
+    let mut queued = lease(44, "workspace tests", "cargo", "jobserver", None, 9_000);
     queued.state = "queued".into();
     queued.ahead = Some(2);
     let reply = StatusReply {
@@ -60,8 +67,8 @@ fn screenshot() {
         free: 8,
         held: 12,
         leases: vec![
-            lease(41, "ui build", "xcodebuild", "static", 12, 132_000),
-            lease(42, "renderer", "make", "jobserver", 4, 48_000),
+            lease(41, "ui build", "xcodebuild", "static", Some(12), 132_000),
+            lease(42, "renderer", "make", "jobserver", None, 48_000),
             queued,
         ],
     };

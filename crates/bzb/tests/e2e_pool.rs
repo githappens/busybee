@@ -496,7 +496,7 @@ fn a_queued_lease_holds_no_tokens_while_it_waits() {
     let status = busybee.status().expect("bzbd answers status");
     let waiting: Vec<_> = status.leases.iter().filter(|l| l.tool != "make").collect();
     assert!(
-        waiting.len() == 1 && waiting[0].state == "queued" && waiting[0].cores == 0,
+        waiting.len() == 1 && waiting[0].state == "queued" && waiting[0].cores == Some(0),
         "the exclusive client was not still queued, holding nothing, when the \
          window closed: {:?}",
         status.leases
