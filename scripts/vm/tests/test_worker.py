@@ -164,15 +164,6 @@ class FakeGuest:
                 self._pid_files.pop(pid_path, None)
             out = (f"status: {status}\nhead: {self.head}\ndirty: 0\n"
                    f"binary: {'a' * 64}  build/debug/busybee\n").encode()
-        elif command.startswith("printf \"status:"):
-            # Old _after_exec format (kept for compatibility): remove pid file.
-            status = "" if self.status is None else self.status
-            self.status = None
-            pid_path = _find_pid_path(command)
-            if pid_path:
-                self._pid_files.pop(pid_path, None)
-            out = (f"status: {status}\nhead: {self.head}\ndirty: 0\n"
-                   f"binary: {'a' * 64}  build/debug/busybee\n").encode()
         elif "git status --porcelain" in command:
             out = b" M crates/bzb/src/main.rs\n"
         elif "diff --cached --binary" in command:

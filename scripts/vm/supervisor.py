@@ -21,7 +21,6 @@ outlives it.
 """
 import os
 from pathlib import Path
-import platform
 import signal
 import subprocess
 import sys
@@ -38,26 +37,16 @@ KILL_WAIT_S = 5
 
 
 def _ssh_start_time(pid):
-    """Stable process identity token for `pid`: clock ticks since boot on
-    Linux (field 22 of /proc/{pid}/stat), or the formatted start timestamp
-    from ps on other platforms. Returns None when the process cannot be
-    queried — callers treat None as "identity unknown, skip the check"."""
-    if platform.system() == "Linux":
-        try:
-            text = Path(f"/proc/{pid}/stat").read_text()
-            idx = text.rfind(")")
-            if idx < 0:
-                return None
-            return int(text[idx + 2:].split()[19])
-        except (OSError, ValueError, IndexError):
-            return None
-    else:
-        try:
-            out = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
-                                 capture_output=True, text=True, timeout=2).stdout.strip()
-            return out or None
-        except Exception:
-            return None
+    """Stable process identity token for `pid`: the formatted start timestamp
+    from ps. Returns None when the process cannot be queried — callers treat
+    None as "identity unknown, skip the check". procps supports lstart too,
+    so this works on Linux as well."""
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                             capture_output=True, text=True, timeout=2).stdout.strip()
+        return out or None
+    except Exception:
+        return None
 
 
 def ensure(state, run_id, argv, wait_s=10, lease=None):
@@ -183,6 +172,15 @@ class Supervisor:
         current = self.start_time(pid)
         return current is None or current == recorded
 
+    def _reused(self, name, pid, state):
+        """True if the adopted pid no longer matches its recorded start time.
+        Emits adopted_pid_reused when it does not match."""
+        if self._ident(pid, state):
+            return False
+        self.w.event(self.run_id, "adopted_pid_reused", exec=name, pid=pid,
+                     reason="start time does not match; pid was reused by another process")
+        return True
+
     def _step(self, name):
         state = worker._load(self._edir(name) / "state.json")
         if state is None:
@@ -200,9 +198,7 @@ class Supervisor:
             pid = state["ssh_pid"]
             if not (pid and self.alive(pid)):
                 done = True
-            elif not self._ident(pid, state):
-                self.w.event(self.run_id, "adopted_pid_reused", exec=name, pid=pid,
-                             reason="start time does not match; pid was reused by another process")
+            elif self._reused(name, pid, state):
                 done = True
             else:
                 done = False
@@ -323,10 +319,7 @@ class Supervisor:
             proc.kill()
             proc.wait()
         elif not proc and pid and self.alive(pid):
-            if not self._ident(pid, state):
-                self.w.event(self.run_id, "adopted_pid_reused", exec=name, pid=pid,
-                             reason="start time does not match; pid was reused by another process")
-            else:
+            if not self._reused(name, pid, state):
                 os.kill(pid, signal.SIGKILL)
 
     # The worker
