@@ -26,9 +26,9 @@ fn pytest_no_n_is_serial_with_one_core() {
         "expected cores_wanted=1 for serial pytest"
     );
     assert!(
-        !p.env_append.iter().any(|(k, _)| k == "PYTEST_ADDOPTS"),
+        !p.env_set.iter().any(|(k, _)| k == "PYTEST_ADDOPTS"),
         "PYTEST_ADDOPTS must not be touched: {:?}",
-        p.env_append
+        p.env_set
     );
     assert!(
         p.argv_replacements.is_empty(),
@@ -45,9 +45,9 @@ fn pytest_bare_is_serial_with_one_core() {
     assert_eq!(p.class, Class::Static);
     assert_eq!(p.cores_wanted, Some(1));
     assert!(
-        !p.env_append.iter().any(|(k, _)| k == "PYTEST_ADDOPTS"),
-        "PYTEST_ADDOPTS must not appear in env_append: {:?}",
-        p.env_append
+        !p.env_set.iter().any(|(k, _)| k == "PYTEST_ADDOPTS"),
+        "PYTEST_ADDOPTS must not appear in env_set: {:?}",
+        p.env_set
     );
     assert!(p.argv_replacements.is_empty());
     assert!(p.notices.is_empty(), "unexpected notices: {:?}", p.notices);
@@ -199,9 +199,9 @@ fn pytest_class_none_skips_injection() {
         p.argv_replacements
     );
     assert!(
-        !p.env_append.iter().any(|(k, _)| k == "PYTEST_ADDOPTS"),
+        !p.env_set.iter().any(|(k, _)| k == "PYTEST_ADDOPTS"),
         "--class none must not touch PYTEST_ADDOPTS: {:?}",
-        p.env_append
+        p.env_set
     );
 }
 
@@ -232,9 +232,9 @@ fn pytest_class_none_no_n_no_injection() {
     assert_eq!(p.class, Class::None);
     assert!(p.argv_replacements.is_empty());
     assert!(
-        !p.env_append.iter().any(|(k, _)| k == "PYTEST_ADDOPTS"),
+        !p.env_set.iter().any(|(k, _)| k == "PYTEST_ADDOPTS"),
         "PYTEST_ADDOPTS must not appear: {:?}",
-        p.env_append
+        p.env_set
     );
 }
 
@@ -252,10 +252,10 @@ fn pytest_never_appends_to_pytest_addopts() {
     ] {
         let p = plan(&argv);
         assert!(
-            !p.env_append.iter().any(|(k, _)| k == "PYTEST_ADDOPTS"),
-            "PYTEST_ADDOPTS found in env_append for {:?}: {:?}",
+            !p.env_set.iter().any(|(k, _)| k == "PYTEST_ADDOPTS"),
+            "PYTEST_ADDOPTS found in env_set for {:?}: {:?}",
             argv,
-            p.env_append
+            p.env_set
         );
     }
 }

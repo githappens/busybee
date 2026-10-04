@@ -163,8 +163,6 @@ pub struct Plan {
     pub tool: String,
     /// Variables to set; values may contain `{fifo}` / `{cores}`.
     pub env_set: Vec<(String, String)>,
-    /// Variables to append to (space-separated); values may contain `{cores}`.
-    pub env_append: Vec<(String, String)>,
     pub env_unset: Vec<String>,
     /// Full command line to run, possibly with `{cores}` / `{cores-1}` tokens.
     pub argv: Vec<String>,
@@ -291,7 +289,6 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
         class,
         tool,
         env_set: Vec::new(),
-        env_append: Vec::new(),
         env_unset: Vec::new(),
         argv: argv.to_vec(),
         argv_replacements: Vec::new(),
@@ -364,7 +361,6 @@ fn drop_shadowed_env(plan: &mut Plan, assigned: &[&str]) {
     let hit: Vec<String> = plan
         .env_set
         .iter()
-        .chain(plan.env_append.iter())
         .map(|(k, _)| k)
         .chain(plan.env_unset.iter())
         .filter(|k| shadowed(k))
@@ -372,7 +368,6 @@ fn drop_shadowed_env(plan: &mut Plan, assigned: &[&str]) {
         .collect();
 
     plan.env_set.retain(|(k, _)| !shadowed(k));
-    plan.env_append.retain(|(k, _)| !shadowed(k));
     plan.env_unset.retain(|k| !shadowed(k));
 
     for name in hit {
@@ -516,64 +511,35 @@ enum PytestNAnalysis {
 /// Scan the args that follow the `pytest` tool for a `-n` / `--numprocesses`
 /// flag and return how the classifier should respond.
 fn analyze_pytest_n(args: &[String]) -> PytestNAnalysis {
-    let mut i = 0;
-    while i < args.len() {
-        let arg = &args[i];
-
-        // Determine the value string, the index within `args` where the value
-        // token lives, and the prefix to use when building the replacement.
-        let (value_str, value_args_idx, prefix): (&str, usize, &str) = {
-            if arg == "-n" || arg == "--numprocesses" {
-                let Some(next) = args.get(i + 1) else {
-                    // Flag at end of args with no value — skip.
-                    i += 1;
-                    continue;
-                };
-                (next.as_str(), i + 1, "")
-            } else if let Some(rest) = arg.strip_prefix("--numprocesses=") {
-                if rest.is_empty() {
-                    i += 1;
-                    continue;
-                }
-                (rest, i, "--numprocesses=")
-            } else if let Some(rest) = arg.strip_prefix("-n=") {
-                if rest.is_empty() {
-                    i += 1;
-                    continue;
-                }
-                (rest, i, "-n=")
-            } else if arg.len() > 2 && arg.starts_with("-n") {
-                let rest = &arg[2..];
-                (rest, i, "-n")
-            } else {
-                i += 1;
-                continue;
+    for (i, arg) in args.iter().enumerate() {
+        let (prefix, value, at): (&str, &str, usize) = if arg == "-n" || arg == "--numprocesses" {
+            match args.get(i + 1) {
+                Some(v) => ("", v.as_str(), i + 1),
+                None => continue,
             }
+        } else if let Some(v) = arg.strip_prefix("--numprocesses=") {
+            ("--numprocesses=", v, i)
+        } else if let Some(v) = arg.strip_prefix("-n=") {
+            ("-n=", v, i)
+        } else if let Some(v) = arg.strip_prefix("-n") {
+            ("-n", v, i)
+        } else {
+            continue;
         };
 
-        // Build the replacement template: prefix + the placeholder.
-        let make_template = |placeholder: &str| -> String {
-            if prefix.is_empty() {
-                placeholder.to_string()
-            } else {
-                format!("{prefix}{placeholder}")
-            }
-        };
-
-        return match value_str {
-            "auto" | "logical" => PytestNAnalysis::AutoOrLogical {
-                args_idx: value_args_idx,
-                template: make_template("{cores}"),
-            },
-            s => match s.parse::<u32>() {
-                Ok(k) => PytestNAnalysis::Count(k),
-                // Unrecognised value (e.g. a plugin name): skip rather than match.
-                Err(_) => {
-                    i += 1;
-                    continue;
+        match value {
+            "auto" | "logical" => {
+                return PytestNAnalysis::AutoOrLogical {
+                    args_idx: at,
+                    template: format!("{prefix}{{cores}}"),
                 }
-            },
-        };
+            }
+            v => {
+                if let Ok(k) = v.parse::<u32>() {
+                    return PytestNAnalysis::Count(k);
+                }
+            }
+        }
     }
     PytestNAnalysis::Absent
 }

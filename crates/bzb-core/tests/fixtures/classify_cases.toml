@@ -13,8 +13,6 @@
 #   env_set_absent        names that must NOT be in env_set
 #   env_unset_contains    names that must be in env_unset
 #   env_unset_absent      names that must NOT be in env_unset
-#   env_append_contains   "NAME=suffix" entries that must be in env_append
-#   env_append_absent     names that must NOT be in env_append
 #   expect_argv           full expected Plan.argv (optional)
 #   notices_contain       substrings that must appear in some notice
 #   no_notices            true if the plan must carry no notices at all
@@ -241,7 +239,7 @@ argv = ["env", "PYTEST_ADDOPTS=-x", "pytest", "tests/"]
 class = "static"
 tool = "pytest"
 cores_wanted = 1
-env_append_absent = ["PYTEST_ADDOPTS"]
+env_set_absent = ["PYTEST_ADDOPTS"]
 no_notices = true
 
 [[case]]
@@ -370,7 +368,7 @@ argv = ["pytest", "tests/"]
 class = "static"
 tool = "pytest"
 cores_wanted = 1
-env_append_absent = ["PYTEST_ADDOPTS"]
+env_set_absent = ["PYTEST_ADDOPTS"]
 no_notices = true
 
 [[case]]

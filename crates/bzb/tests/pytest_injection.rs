@@ -57,18 +57,10 @@ fn args_from_record(path: &std::path::Path) -> Vec<String> {
         .collect()
 }
 
-fn addopts_from_record(path: &std::path::Path) -> String {
+fn field(path: &std::path::Path, key: &str) -> String {
     parse_record(path)
         .into_iter()
-        .find(|(k, _)| k == "ADDOPTS")
-        .map(|(_, v)| v)
-        .unwrap_or_else(|| "RECORD_MISSING".to_string())
-}
-
-fn cores_from_record(path: &std::path::Path) -> String {
-    parse_record(path)
-        .into_iter()
-        .find(|(k, _)| k == "CORES")
+        .find(|(k, _)| k == key)
         .map(|(_, v)| v)
         .unwrap_or_else(|| "RECORD_MISSING".to_string())
 }
@@ -107,15 +99,15 @@ fn pytest_without_xdist_runs() {
 
     let args = args_from_record(&record);
     assert!(
-        !args.iter().any(|a| a == "-n" || a.starts_with("-n")),
+        !args.iter().any(|a| a.starts_with("-n")),
         "plain pytest must not receive -n; got args: {:?}",
         args
     );
     assert_eq!(
-        addopts_from_record(&record),
+        field(&record, "ADDOPTS"),
         "",
         "PYTEST_ADDOPTS must be empty/unset for plain pytest; got: {:?}",
-        addopts_from_record(&record)
+        field(&record, "ADDOPTS")
     );
 }
 
@@ -143,7 +135,7 @@ fn pytest_auto_workers_get_the_grant() {
     );
 
     let args = args_from_record(&record);
-    let cores = cores_from_record(&record);
+    let cores = field(&record, "CORES");
 
     // Locate -n in the args the stub received.
     let n_pos = args
@@ -184,15 +176,15 @@ fn pytest_explicit_serial_stays_serial() {
     );
     let args = args_from_record(&record);
     assert!(
-        !args.iter().any(|a| a == "-n" || a.starts_with("-n")),
+        !args.iter().any(|a| a.starts_with("-n")),
         "--class none must not add -n; got: {:?}",
         args
     );
     assert_eq!(
-        addopts_from_record(&record),
+        field(&record, "ADDOPTS"),
         "",
         "--class none must not set PYTEST_ADDOPTS; got: {:?}",
-        addopts_from_record(&record)
+        field(&record, "ADDOPTS")
     );
 
     // Clear the record before the second run.
@@ -212,15 +204,15 @@ fn pytest_explicit_serial_stays_serial() {
     );
     let args = args_from_record(&record);
     assert!(
-        !args.iter().any(|a| a == "-n" || a.starts_with("-n")),
+        !args.iter().any(|a| a.starts_with("-n")),
         "--cores 1 must not add -n; got: {:?}",
         args
     );
     assert_eq!(
-        addopts_from_record(&record),
+        field(&record, "ADDOPTS"),
         "",
         "--cores 1 must not set PYTEST_ADDOPTS; got: {:?}",
-        addopts_from_record(&record)
+        field(&record, "ADDOPTS")
     );
 }
 
@@ -246,9 +238,9 @@ fn pytest_preserves_caller_addopts() {
         stderr(&out)
     );
     assert_eq!(
-        addopts_from_record(&record),
+        field(&record, "ADDOPTS"),
         "-x --tb=short",
         "PYTEST_ADDOPTS must arrive unchanged; got: {:?}",
-        addopts_from_record(&record)
+        field(&record, "ADDOPTS")
     );
 }

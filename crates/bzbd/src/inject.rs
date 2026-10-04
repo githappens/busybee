@@ -55,17 +55,6 @@ pub(crate) fn inject(
     for (name, value) in &plan.env_set {
         env.insert(name.clone(), fill(value));
     }
-    for (name, value) in &plan.env_append {
-        let value = fill(value);
-        env.entry(name.clone())
-            .and_modify(|existing| {
-                if !existing.is_empty() {
-                    existing.push(' ');
-                }
-                existing.push_str(&value);
-            })
-            .or_insert(value);
-    }
     // The classifier appends new tokens to argv and may also record specific
     // positions within the user-written prefix that need filling (e.g. pytest's
     // `-n auto` → `-n {cores}`).  Fill the appended suffix first, then apply
