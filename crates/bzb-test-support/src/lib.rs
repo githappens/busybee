@@ -5,12 +5,30 @@
 pub mod counter;
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread::sleep,
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
+
+/// Write a minimal pueue 4.x config into `dir`, creating `dir/shared/` for
+/// pueued's own state. Returns `(config_path, socket_path, shared_dir)`.
+/// Does not start pueued.
+pub fn pueue_config_in_dir(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let config_path = dir.join("pueue.yml");
+    let socket_path = dir.join("pueue.sock");
+    let shared_dir = dir.join("shared");
+    std::fs::create_dir_all(&shared_dir).unwrap();
+    let config = format!(
+        "shared:\n  pueue_directory: {shared}\n  runtime_directory: {shared}\
+         \n  use_unix_socket: true\n  unix_socket_path: {socket}\n",
+        socket = socket_path.display(),
+        shared = shared_dir.display(),
+    );
+    std::fs::write(&config_path, config).unwrap();
+    (config_path, socket_path, shared_dir)
+}
 
 /// An isolated `pueued` in a tempdir with its own socket, killed on `Drop`.
 pub struct PueuedFixture {
@@ -31,23 +49,7 @@ impl PueuedFixture {
     /// starts and never binds panics.
     fn start_program(program: &str, timeout: Duration) -> Option<Self> {
         let tmp = TempDir::new().expect("create tempdir");
-        let config_path = tmp.path().join("pueue.yml");
-        let socket_path = tmp.path().join("pueue.sock");
-        let shared_dir = tmp.path().join("shared");
-        std::fs::create_dir_all(&shared_dir).unwrap();
-
-        // Minimal pueue 4.x config; groups are runtime state, not config.
-        let config = format!(
-            r#"shared:
-  pueue_directory: {shared}
-  runtime_directory: {shared}
-  use_unix_socket: true
-  unix_socket_path: {socket}
-"#,
-            socket = socket_path.display(),
-            shared = shared_dir.display(),
-        );
-        std::fs::write(&config_path, config).unwrap();
+        let (config_path, socket_path, _shared_dir) = pueue_config_in_dir(tmp.path());
 
         let spawned = Command::new(program)
             .arg("--config")

@@ -14,7 +14,7 @@ use std::{
 };
 
 use bzb_core::{daemon::Connection, protocol::LeaseEvent};
-use common::{request_in, submit, Fixture, PATIENCE};
+use common::{file_mode, request_in, submit, Fixture, PATIENCE};
 use tempfile::TempDir;
 
 /// Whether `pueued` is on `PATH`, checked without starting a daemon.
@@ -35,20 +35,7 @@ fn pueued_available() -> bool {
 /// the temp dir that owns them (must live for the whole test).
 fn cold_pueue_config() -> (PathBuf, PathBuf, TempDir) {
     let tmp = TempDir::new().expect("pueue tempdir");
-    let socket = tmp.path().join("pueue.sock");
-    let shared = tmp.path().join("shared");
-    std::fs::create_dir_all(&shared).expect("create shared dir");
-    let config = tmp.path().join("pueue.yml");
-    std::fs::write(
-        &config,
-        format!(
-            "shared:\n  pueue_directory: {shared}\n  runtime_directory: {shared}\
-             \n  use_unix_socket: true\n  unix_socket_path: {socket}\n",
-            shared = shared.display(),
-            socket = socket.display(),
-        ),
-    )
-    .expect("write pueue config");
+    let (config, _socket, shared) = bzb_test_support::pueue_config_in_dir(tmp.path());
     (config, shared, tmp)
 }
 
@@ -86,14 +73,6 @@ fn kill_pueued_in(shared: &Path) {
             }
         }
     }
-}
-
-fn file_mode(path: &Path) -> u32 {
-    std::fs::metadata(path)
-        .unwrap_or_else(|err| panic!("stat {}: {err}", path.display()))
-        .permissions()
-        .mode()
-        & 0o777
 }
 
 /// A task creates a directory and a nested file inside it.
@@ -159,10 +138,7 @@ async fn cold_start_preserves_executable_task_output() {
 /// the cold path so the fixture cannot mask a state-dir permission regression.
 #[tokio::test]
 async fn daemon_control_surface_remains_private() {
-    if !pueued_available() {
-        return;
-    }
-    let (config, shared, _pueue_tmp) = cold_pueue_config();
+    let (config, _, _pueue_tmp) = cold_pueue_config();
     let daemon = cold_daemon(&config);
 
     assert_eq!(
@@ -185,6 +161,4 @@ async fn daemon_control_surface_remains_private() {
         0o600,
         "leases.json is not 0600"
     );
-
-    kill_pueued_in(&shared);
 }
