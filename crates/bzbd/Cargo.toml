@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+build = "build.rs"
 description = "busybee's broker daemon: unix-socket server that brokers CPU leases for resource-heavy local tasks."
 repository = "https://github.com/githappens/busybee"
 homepage = "https://github.com/githappens/busybee"
