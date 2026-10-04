@@ -1,6 +1,7 @@
 use std::{
     path::Path,
     process::{Command, Stdio},
+    sync::OnceLock,
     time::{Duration, Instant},
 };
 
@@ -11,6 +12,21 @@ pub use pueue_lib::Client;
 use tokio::time::sleep;
 
 use crate::errors::BusybeeError;
+
+/// The umask to restore in the pueued child before exec. bzbd records the
+/// caller's umask here before restricting its own, so tasks run under the
+/// user's mask, not the control-surface mask. Unset means no pre-exec
+/// adjustment — the child inherits whatever mask is in effect at spawn time.
+static SPAWN_UMASK: OnceLock<libc::mode_t> = OnceLock::new();
+
+/// Record the umask that pueued should inherit when bzbd spawns it. Call once,
+/// before `restrict_umask`, passing the value `restrict_umask` returns (the
+/// previous mask). Subsequent calls are ignored; the mask is fixed for the
+/// lifetime of the process.
+pub fn set_spawn_umask(mask: libc::mode_t) {
+    // Ignore a second set: bzbd calls this once, before any thread exists.
+    let _ = SPAWN_UMASK.set(mask);
+}
 
 /// One request/response round trip. pueued's `Failure` becomes
 /// [`BusybeeError::EnqueueRejected`]; every other response is the caller's.
@@ -85,15 +101,27 @@ async fn try_connect(socket_path: &Path, settings: &Settings) -> Result<Client, 
 }
 
 fn spawn_pueued() -> Result<(), BusybeeError> {
-    // Honours PUEUE_CONFIG_PATH, which the test fixture sets.
-    Command::new("pueued")
-        .arg("-d")
+    use std::os::unix::process::CommandExt;
+
+    let spawn_umask = SPAWN_UMASK.get().copied();
+    let mut cmd = Command::new("pueued");
+    cmd.arg("-d")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .map_err(|e| BusybeeError::DaemonUnreachable {
-            context: format!("pueued is not running and auto-start failed: {e}"),
-        })?;
+        .stdin(Stdio::null());
+    if let Some(mask) = spawn_umask {
+        // Restore the caller's umask in the child before exec, so pueued and
+        // the tasks it runs are not subject to bzbd's control-surface mask.
+        // SAFETY: `umask(2)` has no preconditions and is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(move || {
+                libc::umask(mask);
+                Ok(())
+            });
+        }
+    }
+    cmd.spawn().map_err(|e| BusybeeError::DaemonUnreachable {
+        context: format!("pueued is not running and auto-start failed: {e}"),
+    })?;
     Ok(())
 }

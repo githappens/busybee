@@ -43,7 +43,11 @@ use crate::leases::{Handle, Leases};
 pub fn run() -> Result<()> {
     let foreground = parse_args(std::env::args().skip(1))?;
 
-    restrict_umask(DIR_UMASK);
+    // Capture the caller's mask before restricting it for the control surface.
+    // pueued — spawned later, on the first task submission — must run under the
+    // caller's mask so its tasks can create directories and executables normally.
+    let original_umask = restrict_umask(DIR_UMASK);
+    bzb_core::client::set_spawn_umask(original_umask);
     let dir = state_dir()?;
     create_state_dir(&dir)?;
     restrict_umask(FILE_UMASK);
