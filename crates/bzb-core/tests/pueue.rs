@@ -121,7 +121,11 @@ async fn log_chunk_returns_plaintext_for_repetitive_output() {
         TaskSpec {
             command: format!("sh -c 'for i in $(seq 1 {repeats}); do echo {line}; done'"),
             cwd: std::env::current_dir().unwrap(),
-            env: Default::default(),
+            // The shell and seq must be on PATH inside the task; without PATH the
+            // shell runs with no search path and cannot find either on some systems.
+            env: [("PATH".into(), std::env::var("PATH").unwrap_or_default())]
+                .into_iter()
+                .collect(),
             label: None,
             start_immediately: false,
         },
