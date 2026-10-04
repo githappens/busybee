@@ -159,67 +159,120 @@ impl Jobserver {
     /// Body of [`acquire`](Self::acquire); `got` counts tokens read so far
     /// so the caller can return them when this fails.
     ///
-    /// Uses `poll(2)` to enforce the deadline, then reads from the blocking
-    /// handle `fd_b`.  A blocking `read` keeps the daemon in the kernel's
-    /// wait queue: if another reader (a jobserver build already blocked in
-    /// `read(2)`) takes the byte that triggered `POLLIN`, the daemon does not
-    /// have to restart the whole `poll` cycle — it stays queued and picks up
-    /// the next token when one arrives.
+    /// **Linux**: uses `poll(2)` to enforce the deadline, then reads from the
+    /// blocking handle `fd_b`.  Linux pipes use an exclusive `rd_wait` queue,
+    /// so a blocking `read` places the daemon there alongside make's own
+    /// readers and they compete on equal terms.
+    ///
+    /// **macOS**: FIFOs are BSD socket pairs.  `poll(2)` registers a
+    /// non-exclusive socket waiter that is woken *after* blocking readers
+    /// already in the receive-wait queue.  Skipping `poll` and using
+    /// `SO_RCVTIMEO` for deadline enforcement puts the daemon directly into
+    /// the socket receive-wait queue with all other readers.
     fn read_tokens(&self, n: u32, deadline: Duration, got: &mut u32) -> io::Result<()> {
         let end = Instant::now() + deadline;
         let mut buf = vec![0u8; n as usize];
         while *got < n {
-            let now = Instant::now();
-            // Use saturating_duration_since so an already-elapsed deadline
-            // yields timeout_ms = 0 rather than a panic.  poll(timeout=0) is
-            // an immediate availability check: it returns POLLIN if data is
-            // already in the pipe (e.g. drain_excess with Duration::ZERO), and
-            // 0 (timed out) if the pipe is empty — which breaks the loop.
-            let timeout_ms = end
-                .saturating_duration_since(now)
-                .as_micros()
-                .div_ceil(1000)
-                .min(i32::MAX as u128);
-            let mut pfd = libc::pollfd {
-                fd: self.fd_b.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            // SAFETY: pfd is a valid array of one pollfd.
-            let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms as i32) };
-            if ret < 0 {
-                let err = io::Error::last_os_error();
-                if err.kind() != io::ErrorKind::Interrupted {
-                    return Err(err);
-                }
-                continue;
-            }
-            if ret == 0 {
-                break; // deadline elapsed
-            }
-            // On macOS socket-pair FIFOs, poll can return with POLLHUP set
-            // and POLLIN clear when the pipe is empty even though fd_rw (the
-            // write end) is still open.  Do not break: more tokens may arrive
-            // later.  Only break when the deadline has actually elapsed.
-            if pfd.revents & libc::POLLIN == 0 {
-                if Instant::now() >= end {
+            let remaining = end.saturating_duration_since(Instant::now());
+
+            #[cfg(target_os = "macos")]
+            {
+                // On macOS FIFOs are socket pairs; poll(2) registers a
+                // non-exclusive waiter that is woken after blocking read()
+                // waiters.  Skip poll entirely: set SO_RCVTIMEO on fd_b so
+                // the blocking read times out at the deadline, keeping the
+                // daemon in the socket receive-wait queue alongside every
+                // other reader.
+                if remaining.is_zero() {
                     break;
                 }
-                continue;
-            }
-            // poll(2) reported POLLIN.  Read from the blocking handle so that
-            // if another reader consumed the byte first, we stay in the
-            // kernel's wait queue rather than restarting the poll cycle.
-            match (&self.fd_b).read(&mut buf[..(n - *got) as usize]) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "jobserver fifo reported EOF despite the held write end",
-                    ))
+                // SO_RCVTIMEO ignores timeval{0,0} (would block forever), so
+                // clamp to at least 1 µs; the is_zero() guard above handles
+                // the already-elapsed case.
+                let micros = remaining.as_micros().max(1);
+                let tv = libc::timeval {
+                    tv_sec: (micros / 1_000_000) as libc::time_t,
+                    tv_usec: (micros % 1_000_000) as libc::suseconds_t,
+                };
+                // SAFETY: fd_b is a valid open socket fd for the lifetime of
+                // self; setsockopt writes nothing back, the value is read-only.
+                if unsafe {
+                    libc::setsockopt(
+                        self.fd_b.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_RCVTIMEO,
+                        (&tv as *const libc::timeval).cast(),
+                        std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                    )
+                } != 0
+                {
+                    return Err(io::Error::last_os_error());
                 }
-                Ok(k) => *got += k as u32,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
+                match (&self.fd_b).read(&mut buf[..(n - *got) as usize]) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "jobserver fifo reported EOF despite the held write end",
+                        ))
+                    }
+                    Ok(k) => *got += k as u32,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    // SO_RCVTIMEO expired — deadline reached.
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                // Linux pipes use an exclusive rd_wait queue; poll + blocking
+                // read keeps the daemon competing fairly with make's readers.
+                //
+                // poll(timeout=0) is an immediate availability check: it
+                // returns POLLIN if data is already in the pipe (e.g.
+                // drain_excess with Duration::ZERO), and 0 (timed out) if
+                // the pipe is empty — which breaks the loop.
+                let timeout_ms = remaining.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32;
+                let mut pfd = libc::pollfd {
+                    fd: self.fd_b.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: pfd is a valid array of one pollfd.
+                let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+                if ret < 0 {
+                    let err = io::Error::last_os_error();
+                    if err.kind() != io::ErrorKind::Interrupted {
+                        return Err(err);
+                    }
+                    continue;
+                }
+                if ret == 0 {
+                    break; // deadline elapsed
+                }
+                // poll can return a non-POLLIN event (e.g. POLLERR/POLLHUP)
+                // without data available.  Retry rather than breaking so we
+                // don't exit early before the deadline.
+                if pfd.revents & libc::POLLIN == 0 {
+                    if Instant::now() >= end {
+                        break;
+                    }
+                    continue;
+                }
+                // poll(2) reported POLLIN.  Read from the blocking handle so
+                // that if another reader consumed the byte first, we stay in
+                // the kernel's wait queue rather than restarting the poll cycle.
+                match (&self.fd_b).read(&mut buf[..(n - *got) as usize]) {
+                    Ok(0) => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "jobserver fifo reported EOF despite the held write end",
+                        ))
+                    }
+                    Ok(k) => *got += k as u32,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
             }
         }
         Ok(())
