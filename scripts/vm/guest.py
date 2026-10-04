@@ -98,6 +98,16 @@ class Guest:
         return subprocess.Popen(self._ssh(extra) + [self._command(command)], stdin=stdin, stdout=stdout,
                                 stderr=stderr)
 
+    def local_forward(self, host_port, guest_port):
+        """Start an SSH local port forward owned by this process.
+        127.0.0.1:host_port on the host maps to 127.0.0.1:guest_port in the
+        guest, using the run's pinned host key. Returns a Popen the caller
+        kills when the forward is no longer needed."""
+        extra = ["-N", "-L", f"127.0.0.1:{host_port}:127.0.0.1:{guest_port}",
+                 "-o", "ExitOnForwardFailure=yes"]
+        return subprocess.Popen(self._ssh(extra), stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
     def wait(self, deadline):
         """Until the guest accepts a command, or the deadline passes."""
         last = "no attempt"
