@@ -38,10 +38,23 @@ impl Busybee {
             .parent()
             .expect("the client binary has a directory")
             .join("bzbd");
+        if !bzbd.is_file() {
+            // Targeted `cargo test -p bzb` does not build bzbd (a sibling
+            // crate).  Build it on demand so overlay and focused test runs work
+            // without requiring the caller to pre-build the whole workspace.
+            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+            let status = std::process::Command::new(&cargo)
+                .args(["build", "-p", "bzbd"])
+                .status()
+                .expect("spawning cargo to build bzbd");
+            assert!(
+                status.success(),
+                "cargo build -p bzbd failed; cannot run busybee e2e tests"
+            );
+        }
         assert!(
             bzbd.is_file(),
-            "{} is missing; build the whole workspace (cargo build --workspace) \
-             so the client has a daemon to start",
+            "{} is still missing after `cargo build -p bzbd`",
             bzbd.display()
         );
         let tmp = TempDir::new().expect("create tempdir");
