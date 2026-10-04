@@ -10,10 +10,11 @@
 //! `O_NONBLOCK` (so the open never hangs on macOS socket-pair FIFOs where an
 //! `O_RDWR` fd does not satisfy the "writer present" requirement for a
 //! blocking `O_RDONLY` open), then `fcntl(F_SETFL)` clears the flag so reads
-//! block.  A blocking `read` places the daemon in the kernel's exclusive
-//! `rd_wait` queue alongside the jobserver build's own readers, so they
-//! compete on equal terms.  The non-blocking handle (`fd_r`) is kept for
-//! `FIONREAD` only.
+//! block.  On Linux a blocking `read` enters the pipe's exclusive `rd_wait`
+//! queue; on macOS (where FIFOs are socket pairs) a pure blocking `read`
+//! enters the socket's exclusive receive-wait queue.  Both place the daemon
+//! alongside the build's own readers so they compete on equal terms.  The
+//! non-blocking handle (`fd_r`) is kept for `FIONREAD` only.
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -164,11 +165,13 @@ impl Jobserver {
     /// so a blocking `read` places the daemon there alongside make's own
     /// readers and they compete on equal terms.
     ///
-    /// **macOS**: FIFOs are BSD socket pairs.  `poll(2)` registers a
-    /// non-exclusive socket waiter that is woken *after* blocking readers
-    /// already in the receive-wait queue.  Skipping `poll` and using
-    /// `SO_RCVTIMEO` for deadline enforcement puts the daemon directly into
-    /// the socket receive-wait queue with all other readers.
+    /// **macOS**: FIFOs are BSD socket pairs.  Both `poll(2)` and
+    /// `SO_RCVTIMEO` register non-exclusive socket waiters that are woken
+    /// *after* blocking readers already in the receive-wait queue.  Skip both:
+    /// use a pure blocking `read` on `fd_b` (O_NONBLOCK cleared) to enter the
+    /// same exclusive receive-wait queue.  The deadline is checked at the top
+    /// of the loop between tokens; a read may overshoot it by at most one
+    /// token-wait but the drain normally completes well within a second.
     fn read_tokens(&self, n: u32, deadline: Duration, got: &mut u32) -> io::Result<()> {
         let end = Instant::now() + deadline;
         let mut buf = vec![0u8; n as usize];
@@ -177,36 +180,15 @@ impl Jobserver {
 
             #[cfg(target_os = "macos")]
             {
-                // On macOS FIFOs are socket pairs; poll(2) registers a
-                // non-exclusive waiter that is woken after blocking read()
-                // waiters.  Skip poll entirely: set SO_RCVTIMEO on fd_b so
-                // the blocking read times out at the deadline, keeping the
-                // daemon in the socket receive-wait queue alongside every
-                // other reader.
+                // On macOS FIFOs are socket pairs.  poll(2) and SO_RCVTIMEO
+                // both register non-exclusive socket waiters, woken after
+                // blocking readers in the receive-wait queue.  Use a pure
+                // blocking read on fd_b (O_NONBLOCK cleared in create()) so
+                // the daemon joins that exclusive queue alongside make's own
+                // readers.  The deadline is enforced between tokens above; a
+                // read that overshoots by one token-wait is acceptable.
                 if remaining.is_zero() {
                     break;
-                }
-                // SO_RCVTIMEO ignores timeval{0,0} (would block forever), so
-                // clamp to at least 1 µs; the is_zero() guard above handles
-                // the already-elapsed case.
-                let micros = remaining.as_micros().max(1);
-                let tv = libc::timeval {
-                    tv_sec: (micros / 1_000_000) as libc::time_t,
-                    tv_usec: (micros % 1_000_000) as libc::suseconds_t,
-                };
-                // SAFETY: fd_b is a valid open socket fd for the lifetime of
-                // self; setsockopt writes nothing back, the value is read-only.
-                if unsafe {
-                    libc::setsockopt(
-                        self.fd_b.as_raw_fd(),
-                        libc::SOL_SOCKET,
-                        libc::SO_RCVTIMEO,
-                        (&tv as *const libc::timeval).cast(),
-                        std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-                    )
-                } != 0
-                {
-                    return Err(io::Error::last_os_error());
                 }
                 match (&self.fd_b).read(&mut buf[..(n - *got) as usize]) {
                     Ok(0) => {
@@ -217,8 +199,6 @@ impl Jobserver {
                     }
                     Ok(k) => *got += k as u32,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                    // SO_RCVTIMEO expired — deadline reached.
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) => return Err(e),
                 }
             }
