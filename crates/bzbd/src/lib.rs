@@ -41,8 +41,16 @@ use tracing::Level;
 use crate::leases::{Handle, Leases};
 
 pub fn run() -> Result<()> {
-    let foreground = parse_args(std::env::args().skip(1))?;
+    match parse_args(std::env::args().skip(1))? {
+        Invocation::Version => {
+            println!("bzbd {}", env!("BUSYBEE_VERSION"));
+            Ok(())
+        }
+        Invocation::Daemon { foreground } => run_daemon(foreground),
+    }
+}
 
+fn run_daemon(foreground: bool) -> Result<()> {
     // Capture the caller's mask before restricting it for the control surface.
     // pueued — spawned later, on the first task submission — must run under the
     // caller's mask so its tasks can create directories and executables normally.
@@ -133,15 +141,22 @@ fn start(ready: &mut Ready, log: &Path) -> Result<()> {
     Ok(())
 }
 
-fn parse_args(args: impl Iterator<Item = String>) -> Result<bool> {
+#[derive(Debug)]
+enum Invocation {
+    Daemon { foreground: bool },
+    Version,
+}
+
+fn parse_args(args: impl Iterator<Item = String>) -> Result<Invocation> {
     let mut foreground = false;
     for arg in args {
         match arg.as_str() {
             "--foreground" => foreground = true,
-            other => bail!("unknown argument {other:?} (usage: bzbd [--foreground])"),
+            "--version" => return Ok(Invocation::Version),
+            other => bail!("unknown argument {other:?} (usage: bzbd [--foreground] [--version])"),
         }
     }
-    Ok(foreground)
+    Ok(Invocation::Daemon { foreground })
 }
 
 /// Serves until SIGTERM or SIGINT, then unlinks the socket.
@@ -618,8 +633,22 @@ pub(crate) mod tests {
 
     #[test]
     fn foreground_is_off_unless_asked_for() {
-        assert!(!parse_args(std::iter::empty()).unwrap());
-        assert!(parse_args(["--foreground".to_string()].into_iter()).unwrap());
+        assert!(matches!(
+            parse_args(std::iter::empty()).unwrap(),
+            Invocation::Daemon { foreground: false }
+        ));
+        assert!(matches!(
+            parse_args(["--foreground".to_string()].into_iter()).unwrap(),
+            Invocation::Daemon { foreground: true }
+        ));
+    }
+
+    #[test]
+    fn version_flag_is_recognized() {
+        assert!(matches!(
+            parse_args(["--version".to_string()].into_iter()).unwrap(),
+            Invocation::Version
+        ));
     }
 
     #[test]

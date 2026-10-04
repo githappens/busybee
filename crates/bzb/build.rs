@@ -1,5 +1,6 @@
 //! Sets `BUSYBEE_VERSION` from git: nearest semver tag plus commits since,
 //! `0.0.<commits>` with no tag, `CARGO_PKG_VERSION` with no `.git`.
+//! bzbd's manifest points at this script too, so both binaries share it.
 
 use std::path::Path;
 use std::process::Command;
