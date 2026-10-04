@@ -192,16 +192,8 @@ class Supervisor:
                 return
             state = worker._load(self._edir(name) / "state.json")
         proc = self.procs.get(name)
-        if proc:
-            done = proc.poll() is not None
-        else:
-            pid = state["ssh_pid"]
-            if not (pid and self.alive(pid)):
-                done = True
-            elif self._reused(name, pid, state):
-                done = True
-            else:
-                done = False
+        pid = state["ssh_pid"]
+        done = proc.poll() is not None if proc else not (pid and self.alive(pid)) or self._reused(name, pid, state)
         if done:
             self._finish(name, state)
         elif self.clock() > state["deadline_at"] + worker.HOST_MARGIN_S:
@@ -318,9 +310,8 @@ class Supervisor:
         if proc and proc.poll() is None:
             proc.kill()
             proc.wait()
-        elif not proc and pid and self.alive(pid):
-            if not self._reused(name, pid, state):
-                os.kill(pid, signal.SIGKILL)
+        elif not proc and pid and self.alive(pid) and not self._reused(name, pid, state):
+            os.kill(pid, signal.SIGKILL)
 
     # The worker
 
