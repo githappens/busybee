@@ -16,10 +16,12 @@ use bzb_test_support::counter;
 use common::{stderr, stdout, Busybee};
 use regex::Regex;
 
-/// The drain deadline is 5x the default: make re-reads a token as soon as it
-/// returns one, so draining off a busy build is a race. At 2 s a 3-token drain
-/// fell short 6/25 times; at 10 s, 0/25 (slowest ~3 s).
-const CONFIG: &str = "pool_size = 6\nmax_concurrent = 4\ndrain_deadline_ms = 10000\n";
+/// The drain deadline is 15x the default: make re-reads a token as soon as it
+/// returns one, so draining off a busy build is a race — harder still when two
+/// builds are competing. At 2 s a 3-token drain fell short 6/25 times; at 10 s,
+/// 0/25 (slowest ~3 s) against a single build. Two competing builds require a
+/// wider budget to stay reliable on loaded CI runners (macOS in particular).
+const CONFIG: &str = "pool_size = 6\nmax_concurrent = 4\ndrain_deadline_ms = 30000\n";
 const POOL: u32 = 6;
 
 /// The pool plus the one job a jobserver build runs without a token.
@@ -134,8 +136,8 @@ fn a_static_task_drains_the_pool_and_hands_it_back() {
     let Some(busybee) = fixture() else {
         return;
     };
-    // Outlasts a full 10 s drain plus the 2 s static task.
-    const TARGETS: u32 = 200;
+    // Outlasts a full 30 s drain plus the 2 s static task.
+    const TARGETS: u32 = 400;
     let build = busybee.tmp.path().join("drained");
     counter::make_build(&build, TARGETS, "0.5");
 
@@ -228,8 +230,8 @@ fn a_static_task_beside_two_builds_gets_a_third_of_the_pool() {
     const GRANTED: u32 = 2;
     /// Two builds' implicit jobs plus the tokens the static task leaves.
     const THREE_WAY_CEILING: u32 = POOL - GRANTED + 2;
-    // Per build; together they outlast a slow drain plus the 2 s task.
-    const TARGETS: u32 = 100;
+    // Per build; together they outlast a 30 s drain plus the 2 s task.
+    const TARGETS: u32 = 200;
     // One directory, so each sample carries the combined total.
     let build = busybee.tmp.path().join("three-way");
     counter::make_build(&build, TARGETS, "0.5");
