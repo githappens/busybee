@@ -4,7 +4,7 @@ mod common;
 
 use std::{
     fs,
-    os::{fd::AsRawFd, unix::fs::PermissionsExt},
+    os::fd::AsRawFd,
     path::Path,
     process::Command,
     time::{Duration, Instant},
@@ -14,7 +14,7 @@ use bzb_core::{
     daemon::Connection,
     protocol::{Request, Response, MAX_LINE_BYTES, PROTOCOL_VERSION},
 };
-use common::{isolated_config, sigterm, wait_for, Fixture, BZBD};
+use common::{file_mode, isolated_config, sigterm, wait_for, Fixture, BZBD};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -41,26 +41,18 @@ async fn the_state_directory_and_the_socket_are_owner_only() {
     let daemon = Fixture::start();
 
     assert_eq!(
-        mode(daemon.state_dir()),
+        file_mode(daemon.state_dir()),
         0o700,
         "the state directory {} is not owner-only",
         daemon.state_dir().display()
     );
     // The mode the spec names.
     assert_eq!(
-        mode(&daemon.socket_path()),
+        file_mode(&daemon.socket_path()),
         0o600,
         "the socket {} is not 0600",
         daemon.socket_path().display()
     );
-}
-
-fn mode(path: &Path) -> u32 {
-    fs::metadata(path)
-        .unwrap_or_else(|err| panic!("stat {}: {err}", path.display()))
-        .permissions()
-        .mode()
-        & 0o777
 }
 
 #[tokio::test]

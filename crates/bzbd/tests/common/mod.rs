@@ -6,6 +6,7 @@
 
 use std::{
     collections::BTreeMap,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Child, Command},
     time::{Duration, Instant},
@@ -23,6 +24,14 @@ use serde_json::Value;
 use tempfile::TempDir;
 
 pub const BZBD: &str = env!("CARGO_BIN_EXE_bzbd");
+
+pub fn file_mode(path: &Path) -> u32 {
+    std::fs::metadata(path)
+        .unwrap_or_else(|err| panic!("stat {}: {err}", path.display()))
+        .permissions()
+        .mode()
+        & 0o777
+}
 
 /// A poll tick plus latency, short enough to fail rather than hang.
 pub const PATIENCE: Duration = Duration::from_secs(15);

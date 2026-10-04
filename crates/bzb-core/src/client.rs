@@ -103,13 +103,12 @@ async fn try_connect(socket_path: &Path, settings: &Settings) -> Result<Client, 
 fn spawn_pueued() -> Result<(), BusybeeError> {
     use std::os::unix::process::CommandExt;
 
-    let spawn_umask = SPAWN_UMASK.get().copied();
     let mut cmd = Command::new("pueued");
     cmd.arg("-d")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .stdin(Stdio::null());
-    if let Some(mask) = spawn_umask {
+    if let Some(&mask) = SPAWN_UMASK.get() {
         // Restore the caller's umask in the child before exec, so pueued and
         // the tasks it runs are not subject to bzbd's control-surface mask.
         // SAFETY: `umask(2)` has no preconditions and is async-signal-safe.
