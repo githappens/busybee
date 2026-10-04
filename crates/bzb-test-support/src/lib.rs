@@ -101,6 +101,13 @@ impl Drop for PueuedFixture {
     }
 }
 
+/// Minimum task environment: the host `PATH` so that external commands a
+/// pueued task invokes are found on all platforms, including NixOS where the
+/// compiled-in fallback is `/no-such-path`.
+pub fn path_env() -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([("PATH".into(), std::env::var("PATH").unwrap_or_default())])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

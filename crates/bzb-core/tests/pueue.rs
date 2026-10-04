@@ -6,7 +6,7 @@ use bzb_core::{
     enqueue::{enqueue, TaskSpec},
     log::fetch_log_chunk,
 };
-use bzb_test_support::PueuedFixture;
+use bzb_test_support::{path_env, PueuedFixture};
 
 /// A connected client to a fresh isolated pueued with the `busybee` group in
 /// place, or `None` (skip) without pueued. `PUEUE_CONFIG_PATH` is
@@ -66,7 +66,7 @@ async fn enqueue_returns_a_task_id() {
     let spec = TaskSpec {
         command: "true".into(),
         cwd: std::env::current_dir().unwrap(),
-        env: Default::default(),
+        env: path_env(),
         label: Some("smoke".into()),
         start_immediately: false,
     };
@@ -85,7 +85,7 @@ async fn log_chunk_accumulates_across_polls() {
         TaskSpec {
             command: "printf one; printf two".into(),
             cwd: std::env::current_dir().unwrap(),
-            env: Default::default(),
+            env: path_env(),
             label: None,
             start_immediately: false,
         },
@@ -119,12 +119,9 @@ async fn log_chunk_returns_plaintext_for_repetitive_output() {
     let id = enqueue(
         &mut client,
         TaskSpec {
-            // pueued wraps the command in `sh -c`; avoid a nested sh invocation
-            // and use only POSIX built-ins so PATH is not required in the task's
-            // environment.
             command: format!("i=1; while [ $i -le {repeats} ]; do echo {line}; i=$((i+1)); done"),
             cwd: std::env::current_dir().unwrap(),
-            env: Default::default(),
+            env: path_env(),
             label: None,
             start_immediately: false,
         },
