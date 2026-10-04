@@ -91,12 +91,20 @@ class WatchGuest(TerminalGuest):
 
 class WatchTests(unittest.TestCase):
     def setUp(self):
+        import socket as _s, builtins
+        self._orig_create_connection = _s.create_connection
+        self._orig_print = builtins.print
         self.lab = Lab(self)
         import shutil
         shutil.copytree(REPO / "tests" / "scenarios", self.lab.repo / "tests" / "scenarios",
                         ignore=shutil.ignore_patterns("tests", "__pycache__"))
         self.lab.guest = WatchGuest()
         self.run_id = self.lab.create()
+
+    def tearDown(self):
+        import socket as _s, builtins
+        _s.create_connection = self._orig_create_connection
+        builtins.print = self._orig_print
 
     def open(self):
         result = terminal_ops.open_terminal(self.lab.workers(), self.run_id, ["busybee", "monitor"],
@@ -153,19 +161,12 @@ class WatchTests(unittest.TestCase):
         result_path = edir / "result.json"
         result_path.write_text(json.dumps({"status": "success", "data": {"exit_code": 0}}) + "\n")
 
-        import io, socket as smod
-        output = io.StringIO()
-        orig_cc = smod.create_connection
+        import socket as smod, builtins
         smod.create_connection = lambda addr, timeout=None: type("S", (), {"close": lambda s: None})()
-        try:
-            import builtins
-            orig_print = builtins.print
-            printed = []
-            builtins.print = lambda *a, **kw: printed.append(a)
-            result = terminal_ops.watch(self.lab.workers(), self.run_id, handle)
-            builtins.print = orig_print
-        finally:
-            smod.create_connection = orig_cc
+        printed = []
+        builtins.print = lambda *a, **kw: printed.append(a)
+        # tearDown restores socket.create_connection and builtins.print.
+        result = terminal_ops.watch(self.lab.workers(), self.run_id, handle)
 
         # watch() returns None (output was printed inline).
         self.assertIsNone(result)
@@ -199,14 +200,12 @@ class WatchTests(unittest.TestCase):
         edir = worker.run_dir(self.lab.state, self.run_id) / "exec" / handle
         (edir / "result.json").write_text(json.dumps({"status": "success", "data": {}}) + "\n")
 
-        import socket as smod, builtins, io
+        import socket as smod, builtins
         smod.create_connection = lambda addr, timeout=None: type("S", (), {"close": lambda s: None})()
         printed = []
-        orig_p = builtins.print
         builtins.print = lambda *a, **kw: printed.append(a)
         terminal_ops.watch(self.lab.workers(), self.run_id, handle)
-        builtins.print = orig_p
-        smod.create_connection = None  # restore later in tearDown is ok; it's process-wide
+        # tearDown restores socket.create_connection and builtins.print
 
         all_output = " ".join(str(a) for args in printed for a in args)
         # URL uses host loopback.
@@ -218,22 +217,21 @@ class WatchTests(unittest.TestCase):
         handle = self.open()
         workers = self.lab.workers()
         edir = worker.run_dir(self.lab.state, self.run_id) / "exec" / handle
-        # Watch with exec not yet finished
-        import socket as smod
+        import socket as smod, builtins
         smod.create_connection = lambda addr, timeout=None: type("S", (), {"close": lambda s: None})()
-        import builtins
         builtins.print = lambda *a, **kw: None
-        try:
-            # Finish the exec in a timer.
-            def _finish():
-                time.sleep(0.05)
-                (edir / "result.json").write_text(json.dumps({"status": "success", "data": {}}) + "\n")
-            t = threading.Thread(target=_finish, daemon=True)
-            t.start()
-            result = terminal_ops.watch(workers, self.run_id, handle)
-            t.join(timeout=5)
-        finally:
-            builtins.print = print
+        # Finish the exec in a timer; tearDown restores socket and print.
+        # Use atomic rename so _load never reads a partial file.
+        def _finish():
+            time.sleep(0.05)
+            content = json.dumps({"status": "success", "data": {}}) + "\n"
+            tmp = edir / "result.json.tmp"
+            tmp.write_text(content)
+            tmp.rename(edir / "result.json")
+        t = threading.Thread(target=_finish, daemon=True)
+        t.start()
+        result = terminal_ops.watch(workers, self.run_id, handle)
+        t.join(timeout=5)
         self.assertIsNone(result)
         # The token was revoked on exit.
         stop_cmds = [c for c, _ in self.lab.guest.commands
@@ -253,10 +251,8 @@ class WatchTests(unittest.TestCase):
         import socket as smod, builtins
         smod.create_connection = lambda addr, timeout=None: type("S", (), {"close": lambda s: None})()
         builtins.print = lambda *a, **kw: None
-        try:
-            result = terminal_ops.watch(workers, self.run_id, handle)
-        finally:
-            builtins.print = print
+        # tearDown restores socket.create_connection and builtins.print.
+        result = terminal_ops.watch(workers, self.run_id, handle)
         self.assertIsNone(result)
 
     def test_watch_setup_fails_on_bad_watch_start_reply(self):
