@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -82,6 +83,12 @@ class Prlctl:
         return [c for c in self.calls if c[1] == name and c[0] != "list"]
 
 
+def _find_pid_path(command):
+    """Extract the guest exec pid file path from a command string."""
+    m = re.search(r'/var/tmp/[^\s\']+\.pid', command)
+    return m.group(0) if m else None
+
+
 class FakeProc:
     """The ssh process of one exec: `chunks` reach its stdout one poll at a time."""
     pids = iter(range(50000, 60000))
@@ -92,6 +99,7 @@ class FakeProc:
         self.pid = next(self.pids)
         self.returncode = None
         fake.live.add(self.pid)
+        fake.start_times[self.pid] = self.pid  # pid is its own identity token
 
     def poll(self):
         if self.returncode is None and self.chunks:
@@ -130,6 +138,9 @@ class FakeGuest:
         self.live = set()
         self.procs = []
         self.elapse = lambda: None
+        self._pid_files = {}  # pid_path -> FakeProc: which pid files are "present"
+        self.kills = []  # pid_paths killed by _after_exec when status was missing
+        self.start_times = {}  # pid -> identity token (set by FakeProc)
 
     def run(self, command, timeout, stdin=None, tty=False, check=True, raw=False):
         self.commands.append((command, stdin))
@@ -140,9 +151,26 @@ class FakeGuest:
             return 255, b"" if raw else "", "ssh: connect to host port 22: Operation timed out"
         if "rev-parse HEAD" in command and "printf" not in command:
             out = self.head.encode()
-        elif command.startswith("printf \"status:"):
+        elif command.startswith("s=$(cat "):
+            # New _after_exec format: kill before removing pid file if status missing.
             status = "" if self.status is None else self.status
             self.status = None
+            pid_path = _find_pid_path(command)
+            if status == "" and pid_path and pid_path in self._pid_files:
+                self.kills.append(pid_path)
+                proc = self._pid_files.pop(pid_path)
+                proc.end(137)
+            elif pid_path:
+                self._pid_files.pop(pid_path, None)
+            out = (f"status: {status}\nhead: {self.head}\ndirty: 0\n"
+                   f"binary: {'a' * 64}  build/debug/busybee\n").encode()
+        elif command.startswith("printf \"status:"):
+            # Old _after_exec format (kept for compatibility): remove pid file.
+            status = "" if self.status is None else self.status
+            self.status = None
+            pid_path = _find_pid_path(command)
+            if pid_path:
+                self._pid_files.pop(pid_path, None)
             out = (f"status: {status}\nhead: {self.head}\ndirty: 0\n"
                    f"binary: {'a' * 64}  build/debug/busybee\n").encode()
         elif "git status --porcelain" in command:
@@ -152,7 +180,10 @@ class FakeGuest:
         elif command.startswith("ps "):
             out = b"    1     0 root     Ss       42 /run/current-system/systemd/lib/systemd/systemd\n"
         elif command.startswith("p=$(cat") and "kill -s KILL" in command:
-            for proc in self.procs:
+            # Standalone kill_command: only kills if the pid file is still present.
+            pid_path = _find_pid_path(command)
+            if pid_path and pid_path in self._pid_files:
+                proc = self._pid_files.pop(pid_path)
                 if proc.returncode is None:
                     proc.end(137)
             out = b""
@@ -169,6 +200,9 @@ class FakeGuest:
         self.elapse()
         proc = FakeProc(self, stdout.name, stderr.name, chunks, self.exit_code)
         self.procs.append(proc)
+        pid_path = _find_pid_path(command)
+        if pid_path:
+            self._pid_files[pid_path] = proc
         return proc
 
 
@@ -226,8 +260,10 @@ class Lab:
 
     def supervisor(self, run_id):
         if run_id not in self.supervisors:
-            self.supervisors[run_id] = supervisor.Supervisor(self.workers(), run_id,
-                                                             alive=lambda pid: pid in self.guest.live)
+            self.supervisors[run_id] = supervisor.Supervisor(
+                self.workers(), run_id,
+                alive=lambda pid: pid in self.guest.live,
+                start_time=lambda pid: self.guest.start_times.get(pid))
         return self.supervisors[run_id]
 
     def restart_supervisors(self):
@@ -556,6 +592,15 @@ class ExecTests(unittest.TestCase):
         result = self.lab.workers().exec(self.run_id, ["true"], "/", {}, 5)
         self.assertEqual(result["status"], "environment_failure")
 
+    def test_kill_after_missing_status_reaches_the_process(self):
+        # With a status-less ssh exit, _after_exec kills the process group
+        # while the pid file is still present (before rm -f removes it).
+        self.lab.guest.exit_code = ""
+        result = self.lab.workers().exec(self.run_id, ["true"], "/", {}, 5)
+        self.assertEqual(result["status"], "environment_failure")
+        # The pid file was present when the kill fired: FakeGuest records it.
+        self.assertGreater(len(self.lab.guest.kills), 0)
+
     def test_the_run_deadline_bounds_every_command(self):
         record_path = worker.run_dir(self.lab.state, self.run_id) / "worker.json"
         record = json.loads(record_path.read_text())
@@ -853,6 +898,31 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "artifact_budget_exceeded")
         self.assertIn("artifact_budget_exceeded", codes(self.lab.workers().collect(self.run_id)))
 
+    def test_adopted_pid_with_other_start_time_is_not_signalled(self):
+        # An adopted exec whose recorded start time no longer matches is treated
+        # as exited without sending a signal to the unrelated process at that pid.
+        self.lab.guest.hang = True
+        handle = self.lab.workers().exec(self.run_id, ["make"], "/", {}, 60, detach=True)["data"]
+        name = handle["exec"]
+
+        # Supervisor dies; its ssh child lives on.
+        self.lab.restart_supervisors()
+
+        # The pid is now held by an unrelated process: its start_time changed.
+        state_path = worker.run_dir(self.lab.state, self.run_id) / "exec" / name / "state.json"
+        state_data = json.loads(state_path.read_text())
+        pid = state_data["ssh_pid"]
+        self.lab.guest.start_times[pid] = "unrelated_process"
+
+        # New supervisor adopts and detects the mismatch.
+        self.lab.supervise(self.run_id)
+
+        # The exec was treated as exited (result recorded).
+        self.assertTrue((worker.run_dir(self.lab.state, self.run_id) / "exec" / name / "result.json").exists())
+        # The mismatch was logged as an event.
+        self.assertIn("adopted_pid_reused",
+                      [e["event"] for e in self.lab.workers().events(self.run_id)])
+
 
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
@@ -1015,6 +1085,21 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(manifest["observations"]["processes"][0]["pid"], 1)
         self.assertEqual(manifest["allocation"], CONFIG["worker"])
         self.assertTrue(contracts.evidence_errors({**manifest, "schema": "busybee.vm.evidence/v0"}))
+
+    def test_collect_halts_a_failed_worker(self):
+        # A worker in "failed" state (creation or reset interrupted before the source
+        # arrived) is treated like a frozen worker by collect: booted if needed,
+        # collected from, then halted — so it is not left running after the operation.
+        record_path = self.rdir / "worker.json"
+        record = json.loads(record_path.read_text())
+        record["status"] = "failed"
+        record_path.write_text(json.dumps(record))
+        # The VM is still running (the failed creation left it up).
+        self.assertEqual(self.lab.prlctl.vms[self.vm]["state"], "running")
+        result = self.lab.workers().collect(self.run_id)
+        self.assertEqual(result["status"], "success", result)
+        # collect halts the VM once it is done — same guarantee as frozen states.
+        self.assertEqual(self.lab.prlctl.vms[self.vm]["state"], "stopped")
 
 
 class LogTests(unittest.TestCase):

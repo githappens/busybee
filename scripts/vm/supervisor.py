@@ -21,6 +21,7 @@ outlives it.
 """
 import os
 from pathlib import Path
+import platform
 import signal
 import subprocess
 import sys
@@ -34,6 +35,29 @@ import template
 import worker
 
 KILL_WAIT_S = 5
+
+
+def _ssh_start_time(pid):
+    """Stable process identity token for `pid`: clock ticks since boot on
+    Linux (field 22 of /proc/{pid}/stat), or the formatted start timestamp
+    from ps on other platforms. Returns None when the process cannot be
+    queried — callers treat None as "identity unknown, skip the check"."""
+    if platform.system() == "Linux":
+        try:
+            text = Path(f"/proc/{pid}/stat").read_text()
+            idx = text.rfind(")")
+            if idx < 0:
+                return None
+            return int(text[idx + 2:].split()[19])
+        except (OSError, ValueError, IndexError):
+            return None
+    else:
+        try:
+            out = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                                 capture_output=True, text=True, timeout=2).stdout.strip()
+            return out or None
+        except Exception:
+            return None
 
 
 def ensure(state, run_id, argv, wait_s=10, lease=None):
@@ -98,10 +122,11 @@ def serve(workers, run_id, lease_fd=None):
 
 
 class Supervisor:
-    def __init__(self, workers, run_id, alive=lease.alive):
+    def __init__(self, workers, run_id, alive=lease.alive, start_time=_ssh_start_time):
         self.w, self.run_id = workers, run_id
         self.clock = workers.clock
         self.alive = alive
+        self.start_time = start_time
         self.rdir = worker.run_dir(workers.state, run_id)
         self.procs = {}  # exec name -> the ssh process this supervisor started
         self.g = None
@@ -128,7 +153,7 @@ class Supervisor:
         busy = worker.held(self.w._lock(self.run_id))
         if record["status"] == "provisioning" and not busy:
             self._interrupted()
-        if record["status"] in contracts.FROZEN_STATES:
+        if record["status"] in contracts.FROZEN_STATES or record["status"] == "failed":
             # Started again only to finish collecting: halt it once nothing holds it.
             running = self.w._running(record["worker"])
             if running and not busy:
@@ -148,6 +173,16 @@ class Supervisor:
             self.g = self.w._guest(self._record())
         return self.g
 
+    def _ident(self, pid, state):
+        """True if the process at `pid` is the recorded ssh process.
+        A None start time (no record, or unqueryable process) is not a
+        mismatch: callers conservatively assume the same process."""
+        recorded = state.get("ssh_start_time")
+        if recorded is None:
+            return True
+        current = self.start_time(pid)
+        return current is None or current == recorded
+
     def _step(self, name):
         state = worker._load(self._edir(name) / "state.json")
         if state is None:
@@ -159,7 +194,18 @@ class Supervisor:
                 return
             state = worker._load(self._edir(name) / "state.json")
         proc = self.procs.get(name)
-        done = proc.poll() is not None if proc else not (state["ssh_pid"] and self.alive(state["ssh_pid"]))
+        if proc:
+            done = proc.poll() is not None
+        else:
+            pid = state["ssh_pid"]
+            if not (pid and self.alive(pid)):
+                done = True
+            elif not self._ident(pid, state):
+                self.w.event(self.run_id, "adopted_pid_reused", exec=name, pid=pid,
+                             reason="start time does not match; pid was reused by another process")
+                done = True
+            else:
+                done = False
         if done:
             self._finish(name, state)
         elif self.clock() > state["deadline_at"] + worker.HOST_MARGIN_S:
@@ -186,7 +232,8 @@ class Supervisor:
             self._contain(worker._reason(err))
             return False
         self.procs[name] = proc
-        template._write_json(edir / "state.json", {**state, "ssh_pid": proc.pid})
+        template._write_json(edir / "state.json", {**state, "ssh_pid": proc.pid,
+                                                    "ssh_start_time": self.start_time(proc.pid)})
         return True
 
     def _after(self, name):
@@ -209,11 +256,9 @@ class Supervisor:
 
     def _finish(self, name, state):
         try:
+            # _after_exec kills the process group before removing the pid file when
+            # no exit status was recorded, so no separate kill_command is needed.
             after = self._after(name)
-            if after["exit_code"] is None:
-                # Its connection ended without a status: whatever it left running goes too.
-                self.g.run(worker.kill_command(worker.guest_file(self.run_id, name, "pid")),
-                           self.w._bound("command"))
         except (guest.GuestError, parallels.ParallelsError, template.DeadlineExceeded, worker.Refused) as err:
             self._contain(worker._reason(err))
             return
@@ -278,7 +323,11 @@ class Supervisor:
             proc.kill()
             proc.wait()
         elif not proc and pid and self.alive(pid):
-            os.kill(pid, signal.SIGKILL)
+            if not self._ident(pid, state):
+                self.w.event(self.run_id, "adopted_pid_reused", exec=name, pid=pid,
+                             reason="start time does not match; pid was reused by another process")
+            else:
+                os.kill(pid, signal.SIGKILL)
 
     # The worker
 

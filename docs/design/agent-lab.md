@@ -331,8 +331,11 @@ pid. The supervisor enforces, independently of the guest and of busybee:
   already on the host are kept and the VM is stopped (`guest_unresponsive`).
 
 A supervisor that dies leaves its ssh processes writing the logs; its
-successor adopts them and reads each exit status from the guest. Each finished
-command checkpoints the guest's source changes to `checkpoint/`.
+successor adopts them and reads each exit status from the guest. The adopted
+ssh pid is verified against the process's recorded start time before any
+signal is sent; a pid reused by an unrelated process is treated as exited
+(`adopted_pid_reused`). Each finished command checkpoints the guest's source
+changes to `checkpoint/`.
 
 `exec --detach` returns a handle. `status RUN EXEC` reports its state, elapsed
 time, last-output time and log sizes; quiet output alone is never treated as a
@@ -347,7 +350,10 @@ place is stopped and marked `failed`. Workers halted by the controller after a
 collection attempt (`stopped`, `retained`, `expired`) cannot have changed: an
 operation that starts one again hands it to the supervisor first, which halts
 it once no operation holds it, and reconciliation does the same for one found
-running. So a retried `collect`, `reset` or `destroy` completes that collection in place:
+running. `failed` workers share the same halting guarantee: `collect` boots one
+if needed, collects from it, then halts it; the supervisor halts a running one
+once no operation holds it. So a retried `collect`, `reset` or `destroy`
+completes that collection in place:
 artifacts already saved with a matching digest are acknowledged and only the
 rest is fetched. A repeated destroy, or one whose VM is already gone, succeeds.
 

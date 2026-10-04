@@ -175,9 +175,13 @@ def kill_command(pid_path):
 
 
 def _after_exec(status_path, pid_path, checkout=CHECKOUT):
-    """Read and remove the recorded status, then report source and binary provenance."""
+    """Read the recorded status, kill the process group if none was recorded
+    (while the pid file is still present), remove both files, then report
+    source and binary provenance."""
     binaries = " ".join(f"build/*/{b}" for b in BINARIES)
-    return (f'printf "status: %s\\n" "$(cat {status_path} 2>/dev/null)"; rm -f {status_path} {pid_path}; '
+    return (f's=$(cat {status_path} 2>/dev/null); '
+            f'[ -z "$s" ] && p=$(cat {pid_path} 2>/dev/null) && kill -s KILL -- -$p; true; '
+            f'printf "status: %s\\n" "$s"; rm -f {status_path} {pid_path}; '
             f'cd {checkout} || exit 0; printf "head: %s\\n" "$(git rev-parse HEAD)"; '
             f'printf "dirty: %s\\n" "$(git status --porcelain | wc -l)"; '
             f'for f in {binaries}; do [ -f "$f" ] && sha256sum "$f" | sed "s/^/binary: /"; done; true')
@@ -1032,7 +1036,7 @@ class Workers(template.Lab):
         if not complete and not reachable:
             missing.append("source: the guest is not answering")
         elif not complete:
-            if record["status"] in contracts.FROZEN_STATES:
+            if record["status"] in contracts.FROZEN_STATES or record["status"] == "failed":
                 self.supervise(record["run_id"])  # halts it again if this process dies while it runs
             try:
                 g = self._guest(record, boot=True)
@@ -1138,7 +1142,7 @@ class Workers(template.Lab):
         with locked(self._lock(run_id)):
             self._window("cleanup")
             manifest, path, missing = self.collect_run(record)
-            if record["status"] in contracts.FROZEN_STATES:
+            if record["status"] in contracts.FROZEN_STATES or record["status"] == "failed":
                 self.halt(record)  # it was started only to finish collecting
         data = {"run_id": run_id, "missing": missing}
         findings = [contracts.finding("artifact_missing", m) for m in missing]
