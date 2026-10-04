@@ -119,7 +119,10 @@ async fn log_chunk_returns_plaintext_for_repetitive_output() {
     let id = enqueue(
         &mut client,
         TaskSpec {
-            command: format!("sh -c 'for i in $(seq 1 {repeats}); do echo {line}; done'"),
+            // pueued wraps the command in `sh -c`; avoid a nested sh invocation
+            // and use only POSIX built-ins so PATH is not required in the task's
+            // environment.
+            command: format!("i=1; while [ $i -le {repeats} ]; do echo {line}; i=$((i+1)); done"),
             cwd: std::env::current_dir().unwrap(),
             env: Default::default(),
             label: None,
