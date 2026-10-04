@@ -396,15 +396,27 @@ async fn a_restarted_daemon_resends_sigterm_for_a_teardown_it_booked_but_never_s
     let Some(pueued) = PueuedFixture::try_start() else {
         return;
     };
-    let mut daemon = pool_of_four(&pueued.config_path);
+    // Patient kill: the Kill deadline starts at Leases::new() time, before
+    // resume_teardowns() sends SIGTERM. On a loaded machine, daemon startup
+    // can consume most of the default 1-second grace; a 30-second window
+    // keeps that from racing SIGKILL against the task's handler.
+    let mut daemon = pool_of_four_patient_kill(&pueued.config_path);
     let marker = daemon.state_dir().join("got-term");
+    let armed = daemon.state_dir().join("trap-armed");
     // The shell notes SIGTERM and leaves; a SIGKILL leaves no note.
+    // "trap-armed" proves the handler is in place before the daemon is
+    // killed: pueued reports Running before the shell has executed anything,
+    // so a SIGTERM sent in that window would kill the shell without
+    // triggering the trap.
     let script = format!(
-        "trap 'touch {}; exit 0' TERM; sleep 5 & wait",
-        marker.display()
+        "trap 'touch {}; exit 0' TERM; touch {}; sleep 5 & wait",
+        marker.display(),
+        armed.display()
     );
     let (conn, _, task) = run(&daemon, request(&["sh", "-c", &script])).await;
-    wait_for_task_to_run(&pueued.config_path, task, Duration::from_secs(5)).await;
+    // Block until the trap handler is installed, not just until pueued
+    // reports Running.
+    wait_for(&armed, true);
 
     daemon.kill();
     drop(conn);
@@ -420,7 +432,7 @@ async fn a_restarted_daemon_resends_sigterm_for_a_teardown_it_booked_but_never_s
     );
     daemon.restart();
 
-    wait_for_task_to_end(&pueued.config_path, task, Duration::from_secs(4)).await;
+    wait_for_task_to_end(&pueued.config_path, task, Duration::from_secs(10)).await;
     assert!(
         marker.exists(),
         "the task never saw SIGTERM: the restarted daemon went straight to SIGKILL"
