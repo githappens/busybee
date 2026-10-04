@@ -28,7 +28,7 @@ GNU make's jobserver protocol (fifo style, make ≥ 4.4) is a pool of tokens in 
 | xcodebuild | **no** | `-jobs N` argv only; no env knob |
 | go toolchain | no | `GOMAXPROCS=N` (bounds `-p`) |
 | ctest | no | `CTEST_PARALLEL_LEVEL=N` |
-| pytest (+xdist) | no | `PYTEST_ADDOPTS=-n N` |
+| pytest (+xdist) | no | `-n N` in argv (opt-in only; see §Classification) |
 
 So: one machine-wide fifo with `pool_size` tokens (default = logical cores). Every jobserver-aware build busybee runs gets `MAKEFLAGS` pointing at it and self-balances at compile-job granularity. Alone it drains all tokens; when a second build starts the two interleave token by token; when one finishes the other grows back within one compile unit's time. No daemon decision is involved in that rebalancing.
 
@@ -93,9 +93,25 @@ Operates on the argv the client received (the shell has already handled `|`, `&&
 | `xcodebuild` | static | argv `-jobs max(1, n−1)` | measured: `-jobs N` yields N+1 concurrent `clang -cc1` in steady state on a large legacy project; skip if argv already has `-jobs` |
 | `go` | static | `GOMAXPROCS=n` | |
 | `ctest` | static | `CTEST_PARALLEL_LEVEL=n` | |
-| `pytest` | static | `PYTEST_ADDOPTS` += `-n n` | effective only with xdist; harmless otherwise |
+| `pytest` | static | see opt-in table below | parallel mode is opt-in via the caller's `-n` |
 | `docker` with `build` | none | — | the VM has its own CPU cap |
 | everything else | none | — | |
+
+**pytest opt-in parallelism table.** busybee never adds `-n` to a pytest run
+that did not ask for it. Parallel pytest is opt-in via the caller's own `-n`:
+
+| caller's argv | class | `cores_wanted` | argv change |
+|---|---|---|---|
+| no `-n` / `--numprocesses` | static | 1 (serial, holds one token) | none |
+| `-n auto` / `-n logical` (or `--numprocesses=` either) | static | not set (fair share) | value replaced with `{cores}` in argv |
+| `-n K` with K ≥ 1 | static | K (clamped at admission) | none |
+| `-n 0` | static | 1 (serial) | none |
+
+`--class` and `--cores` keep precedence over this table.  `--class none` or
+`--cores 1` never adds or rewrites a `-n`.  busybee does not touch
+`PYTEST_ADDOPTS`; a caller-supplied value reaches pytest unchanged.  A `-n`
+in the caller's `PYTEST_ADDOPTS` is not seen by the pure classifier and is
+not accounted for.
 
 A required token (`--build`, `build`) counts only as the tool's *first* argument, the position that selects a mode. cmake dispatches on that position exactly — `--build`, `--install`, `--open`, `-E` — so a `--build` anywhere else is another mode's operand (`cmake --install --build` installs into a directory named `--build`) or an argument of a payload command (`cmake -E env ./x --build`). Those, and cmake's other non-build modes, are **none**.
 
@@ -104,9 +120,9 @@ For `make`/`gmake` the parallelism scan walks argv the way make's own option par
 3. Overrides: `--class jobserver|static|none`, `--cores N` (static target; ignored with a notice for jobserver class). A user-supplied parallelism flag always wins over injection and produces a one-line notice.
 4. Every task additionally gets `BUSYBEE_CLASS=<class>`, `BUSYBEE_CORES=<fair share>` and `BUSYBEE_LEASE=<id>` in its env. The first two are so opaque scripts can cooperate (`xcodebuild ... -jobs "${BUSYBEE_CORES:-8}"`). `BUSYBEE_LEASE` is how a nested `busybee` sees that it is already running under a lease and skips the queue (§Nesting). This is the only remedy for argv-only tools hidden inside scripts, and the only remedy for re-entrancy.
 
-The `Plan` is data: `{ class, tool: String, env_set: Vec<(String,String)>, env_append: Vec<(String,String)>, env_unset: Vec<String>, argv: Vec<String>, cores_wanted: Option<u32>, notices: Vec<String> }`. Executing it is a separate concern.
+The `Plan` is data: `{ class, tool: String, env_set: Vec<(String,String)>, env_append: Vec<(String,String)>, env_unset: Vec<String>, argv: Vec<String>, argv_replacements: Vec<(usize,String)>, cores_wanted: Option<u32>, notices: Vec<String> }`. Executing it is a separate concern.
 
-`classify` never reads the environment or the filesystem, so values it emits carry placeholders the daemon substitutes at dispatch: `{fifo}` (fifo path), `{cores}` (fair share), `{cores-1}` (`max(1, cores − 1)`). These three are the only substitution points. `{cores}` is the task's share of the pool at admission. For static/none it is the number of tokens the drain actually collected (minimum 1, the implicit token), whose upper bound is the admission target `clamp(cores_wanted, 1, ceil(pool_size / (admitted_count + 1)))`; substituting the target after a short drain would let concurrent static tasks demand more cores than the pool has. For jobserver it is `ceil(pool_size / (admitted_count + 1))`, since it holds no tokens of its own and there is nothing collected to count. Jobserver tasks get a number at all because the threads they spawn that *don't* speak the protocol (`RUST_TEST_THREADS`) need bounding, and pool_size there would let every concurrently admitted task claim the whole machine. `env_append` exists for `PYTEST_ADDOPTS`, which must extend the caller's value rather than replace it; the daemon joins the two with a space. `cores_wanted` carries `--cores` through to admission (never set for jobserver, which is where the notice comes from). `argv` is the whole command line as received, wrappers included, so the daemon runs it as-is. An override that forces `jobserver` on a row that has no fifo injection (an opaque script, a static tool) still gets `MAKEFLAGS`; forcing `static`/`none` keeps a core-count injection and drops a fifo one.
+`classify` never reads the environment or the filesystem, so values it emits carry placeholders the daemon substitutes at dispatch: `{fifo}` (fifo path), `{cores}` (fair share), `{cores-1}` (`max(1, cores − 1)`). These three are the only substitution points. `{cores}` is the task's share of the pool at admission. For static/none it is the number of tokens the drain actually collected (minimum 1, the implicit token), whose upper bound is the admission target `clamp(cores_wanted, 1, ceil(pool_size / (admitted_count + 1)))`; substituting the target after a short drain would let concurrent static tasks demand more cores than the pool has. For jobserver it is `ceil(pool_size / (admitted_count + 1))`, since it holds no tokens of its own and there is nothing collected to count. Jobserver tasks get a number at all because the threads they spawn that *don't* speak the protocol (`RUST_TEST_THREADS`) need bounding, and pool_size there would let every concurrently admitted task claim the whole machine. `env_append` exists for future per-tool env extensions that must extend the caller's value; the daemon joins the two with a space. `argv_replacements` records positions inside the user-written prefix of `argv` where the classifier placed a `{cores}` placeholder (e.g. pytest's `-n auto` → `-n {cores}`); the appended suffix is always filled. `cores_wanted` carries `--cores` through to admission (never set for jobserver, which is where the notice comes from). `argv` is the whole command line as received, wrappers included, so the daemon runs it as-is. An override that forces `jobserver` on a row that has no fifo injection (an opaque script, a static tool) still gets `MAKEFLAGS`; forcing `static`/`none` keeps a core-count injection and drops a fifo one.
 
 ## Client output contract
 

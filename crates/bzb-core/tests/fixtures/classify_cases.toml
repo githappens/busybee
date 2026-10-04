@@ -236,12 +236,13 @@ env_unset_absent = ["CMAKE_BUILD_PARALLEL_LEVEL"]
 notices_contain = ["CMAKE_BUILD_PARALLEL_LEVEL"]
 
 [[case]]
-name = "env assignment shadows an appended variable"
+name = "env PYTEST_ADDOPTS reaches pytest unchanged"
 argv = ["env", "PYTEST_ADDOPTS=-x", "pytest", "tests/"]
 class = "static"
 tool = "pytest"
+cores_wanted = 1
 env_append_absent = ["PYTEST_ADDOPTS"]
-notices_contain = ["PYTEST_ADDOPTS"]
+no_notices = true
 
 [[case]]
 name = "env with flags is opaque"
@@ -364,19 +365,21 @@ tool = "ctest"
 notices_contain = ["-j4"]
 
 [[case]]
-name = "pytest appends to PYTEST_ADDOPTS"
+name = "pytest without -n runs serially with one core"
 argv = ["pytest", "tests/"]
 class = "static"
 tool = "pytest"
-env_append_contains = ["PYTEST_ADDOPTS=-n {cores}"]
+cores_wanted = 1
+env_append_absent = ["PYTEST_ADDOPTS"]
 no_notices = true
 
 [[case]]
-name = "pytest -n is flagged"
+name = "pytest -n 4 sets cores_wanted to 4"
 argv = ["pytest", "-n", "4", "tests/"]
 class = "static"
 tool = "pytest"
-notices_contain = ["-n"]
+cores_wanted = 4
+no_notices = true
 
 # --- unknown / none ---------------------------------------------------------
 
