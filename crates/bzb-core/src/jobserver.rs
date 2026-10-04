@@ -198,10 +198,14 @@ impl Jobserver {
                 break; // deadline elapsed
             }
             // On macOS socket-pair FIFOs, poll can return with POLLHUP set
-            // and POLLIN clear when the pipe is empty.  Guard against that
-            // so we never attempt a blocking read with no data available.
+            // and POLLIN clear when the pipe is empty even though fd_rw (the
+            // write end) is still open.  Do not break: more tokens may arrive
+            // later.  Only break when the deadline has actually elapsed.
             if pfd.revents & libc::POLLIN == 0 {
-                break;
+                if Instant::now() >= end {
+                    break;
+                }
+                continue;
             }
             // poll(2) reported POLLIN.  Read from the blocking handle so that
             // if another reader consumed the byte first, we stay in the
