@@ -163,11 +163,15 @@ pub struct Plan {
     pub tool: String,
     /// Variables to set; values may contain `{fifo}` / `{cores}`.
     pub env_set: Vec<(String, String)>,
-    /// Variables to append to (space-separated); values may contain `{cores}`.
-    pub env_append: Vec<(String, String)>,
     pub env_unset: Vec<String>,
     /// Full command line to run, possibly with `{cores}` / `{cores-1}` tokens.
     pub argv: Vec<String>,
+    /// Classifier-placed replacements within the user-written prefix of `argv`.
+    /// Each `(index, template)` instructs the daemon to fill `template` (which
+    /// may contain `{cores}`) and store the result in `argv[index]`.  Only used
+    /// when the classifier rewrites a flag value the caller wrote (e.g. pytest's
+    /// `-n auto` → `-n {cores}`); the appended suffix of `argv` is always filled.
+    pub argv_replacements: Vec<(usize, String)>,
     /// Static core count the user asked for, for the scheduler to clamp.
     /// Never set for [`Class::Jobserver`], which rebalances on its own.
     pub cores_wanted: Option<u32>,
@@ -240,7 +244,7 @@ pub fn default_table() -> Table {
                 Inject::Ctest,
                 &["-j", "--parallel"],
             ),
-            rule("pytest", None, Class::Static, Inject::Pytest, &["-n"]),
+            rule("pytest", None, Class::Static, Inject::Pytest, &[]),
             rule("docker", Some("build"), Class::None, Inject::None, &[]),
         ],
     }
@@ -285,14 +289,20 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
         class,
         tool,
         env_set: Vec::new(),
-        env_append: Vec::new(),
         env_unset: Vec::new(),
         argv: argv.to_vec(),
+        argv_replacements: Vec::new(),
         cores_wanted: None,
         notices,
     };
 
     apply_injection(&mut plan, inject, user_flag.is_some());
+    // Pytest: inspect argv for -n / --numprocesses and update cores_wanted or
+    // argv_replacements accordingly.  Runs after apply_injection so the plan is
+    // otherwise complete; the overrides check below can still override it.
+    if matches!(inject, Inject::Pytest) {
+        apply_pytest_plan(&mut plan, args, overrides);
+    }
     // Before the row's own variables, so the collision guard covers these.
     plan.env_set
         .push(("BUSYBEE_CLASS".to_string(), class.as_str().to_string()));
@@ -332,7 +342,10 @@ pub fn classify(argv: &[String], overrides: &Overrides, table: &Table) -> Plan {
             "--cores is ignored for an exclusive command; it holds the whole pool until it ends"
                 .to_string(),
         ),
-        (_, cores) => plan.cores_wanted = cores,
+        (_, Some(cores)) => plan.cores_wanted = Some(cores),
+        // Explicit `--cores` was not given.  Keep whatever `apply_pytest_plan`
+        // (or future per-tool logic) set; for all other tools it stays `None`.
+        (_, None) => {}
     }
 
     drop_shadowed_env(&mut plan, &env_assigned);
@@ -348,7 +361,6 @@ fn drop_shadowed_env(plan: &mut Plan, assigned: &[&str]) {
     let hit: Vec<String> = plan
         .env_set
         .iter()
-        .chain(plan.env_append.iter())
         .map(|(k, _)| k)
         .chain(plan.env_unset.iter())
         .filter(|k| shadowed(k))
@@ -356,7 +368,6 @@ fn drop_shadowed_env(plan: &mut Plan, assigned: &[&str]) {
         .collect();
 
     plan.env_set.retain(|(k, _)| !shadowed(k));
-    plan.env_append.retain(|(k, _)| !shadowed(k));
     plan.env_unset.retain(|k| !shadowed(k));
 
     for name in hit {
@@ -396,9 +407,9 @@ fn apply_injection(plan: &mut Plan, inject: Inject, user_flag: bool) {
         Inject::CargoCores => set(plan, "RUST_TEST_THREADS", "{cores}"),
         Inject::Go => set(plan, "GOMAXPROCS", "{cores}"),
         Inject::Ctest => set(plan, "CTEST_PARALLEL_LEVEL", "{cores}"),
-        Inject::Pytest => plan
-            .env_append
-            .push(("PYTEST_ADDOPTS".to_string(), "-n {cores}".to_string())),
+        // Pytest injection is handled by `apply_pytest_plan` after this call,
+        // because it needs to inspect argv and may set `cores_wanted`.
+        Inject::Pytest => {}
     }
 }
 
@@ -482,6 +493,86 @@ fn make_long_option_matches(name: &str, arg: &str) -> bool {
     let option = arg.split_once('=').map_or(arg, |(option, _)| option);
     // `--` alone is the option terminator, not an abbreviation of everything.
     option.len() > 2 && name.starts_with(option)
+}
+
+/// Result of scanning a pytest argv for `-n` / `--numprocesses`.
+enum PytestNAnalysis {
+    /// No `-n` or `--numprocesses` flag found; run serially.
+    Absent,
+    /// Value is `auto` or `logical`.  `args_idx` is the index within the
+    /// *args* slice (i.e. relative to the tool, not the full argv) of the
+    /// token that holds the value; `template` is the replacement string to
+    /// store there (e.g. `"{cores}"` or `"-n{cores}"`).
+    AutoOrLogical { args_idx: usize, template: String },
+    /// Explicit numeric count; `0` is treated as serial by the caller.
+    Count(u32),
+}
+
+/// Scan the args that follow the `pytest` tool for a `-n` / `--numprocesses`
+/// flag and return how the classifier should respond.
+fn analyze_pytest_n(args: &[String]) -> PytestNAnalysis {
+    for (i, arg) in args.iter().enumerate() {
+        let (prefix, value, at): (&str, &str, usize) = if arg == "-n" || arg == "--numprocesses" {
+            match args.get(i + 1) {
+                Some(v) => ("", v.as_str(), i + 1),
+                None => continue,
+            }
+        } else if let Some(v) = arg.strip_prefix("--numprocesses=") {
+            ("--numprocesses=", v, i)
+        } else if let Some(v) = arg.strip_prefix("-n=") {
+            ("-n=", v, i)
+        } else if let Some(v) = arg.strip_prefix("-n") {
+            ("-n", v, i)
+        } else {
+            continue;
+        };
+
+        match value {
+            "auto" | "logical" => {
+                return PytestNAnalysis::AutoOrLogical {
+                    args_idx: at,
+                    template: format!("{prefix}{{cores}}"),
+                }
+            }
+            v => {
+                if let Ok(k) = v.parse::<u32>() {
+                    return PytestNAnalysis::Count(k);
+                }
+            }
+        }
+    }
+    PytestNAnalysis::Absent
+}
+
+/// Update `plan` with pytest's capability-aware, opt-in injection rules.
+///
+/// Called when the table matched pytest and produced `Inject::Pytest`.  The
+/// `args` slice is the portion of `argv` after the tool name (wrappers
+/// included up-front, but already consumed by `unwrap_wrappers`).
+fn apply_pytest_plan(plan: &mut Plan, args: &[String], overrides: &Overrides) {
+    // --class none or --cores 1: caller opted out of any -n injection.
+    if plan.class == Class::None || overrides.cores == Some(1) {
+        return;
+    }
+
+    // args_offset: first element of `args` lives at plan.argv[args_offset].
+    let args_offset = plan.argv.len() - args.len();
+
+    match analyze_pytest_n(args) {
+        PytestNAnalysis::Absent | PytestNAnalysis::Count(0) => {
+            // No -n, or -n 0: hold exactly one token (serial run).
+            plan.cores_wanted = Some(1);
+        }
+        PytestNAnalysis::AutoOrLogical { args_idx, template } => {
+            // Replace the value token with {cores} so the daemon fills it in.
+            plan.argv_replacements
+                .push((args_offset + args_idx, template));
+        }
+        PytestNAnalysis::Count(k) => {
+            // Caller specified an explicit count; respect it.
+            plan.cores_wanted = Some(k);
+        }
+    }
 }
 
 fn flag_notice(tool: &str, flag: &str, inject: Inject, class: Class) -> String {

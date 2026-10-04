@@ -55,27 +55,22 @@ pub(crate) fn inject(
     for (name, value) in &plan.env_set {
         env.insert(name.clone(), fill(value));
     }
-    for (name, value) in &plan.env_append {
-        let value = fill(value);
-        env.entry(name.clone())
-            .and_modify(|existing| {
-                if !existing.is_empty() {
-                    existing.push(' ');
-                }
-                existing.push_str(&value);
-            })
-            .or_insert(value);
-    }
-    // The classifier only appends, so the user's prefix is never filled.
+    // The classifier appends new tokens to argv and may also record specific
+    // positions within the user-written prefix that need filling (e.g. pytest's
+    // `-n auto` → `-n {cores}`).  Fill the appended suffix first, then apply
+    // any targeted replacements within the prefix.
     let (user, appended) = plan.argv.split_at(user_args);
-    Injected {
-        env,
-        argv: user
-            .iter()
-            .cloned()
-            .chain(appended.iter().map(|arg| fill(arg)))
-            .collect(),
+    let mut argv: Vec<String> = user
+        .iter()
+        .cloned()
+        .chain(appended.iter().map(|arg| fill(arg)))
+        .collect();
+    for (pos, template) in &plan.argv_replacements {
+        if let Some(slot) = argv.get_mut(*pos) {
+            *slot = fill(template);
+        }
     }
+    Injected { env, argv }
 }
 
 #[cfg(test)]
@@ -165,8 +160,10 @@ mod tests {
         assert!(!injected.env.contains_key("CMAKE_BUILD_PARALLEL_LEVEL"));
     }
 
+    /// busybee no longer touches PYTEST_ADDOPTS; a caller-supplied value passes
+    /// through unchanged.
     #[test]
-    fn pytest_extends_the_callers_addopts_rather_than_replacing_them() {
+    fn pytest_does_not_modify_caller_addopts() {
         let injected = inject(
             &plan(&["pytest"]),
             1,
@@ -176,29 +173,38 @@ mod tests {
         );
         assert_eq!(
             injected.env.get("PYTEST_ADDOPTS").map(String::as_str),
-            Some("-q -n 2")
-        );
-        assert_eq!(
-            inject(&plan(&["pytest"]), 1, env(&[]), "/run/js", 2)
-                .env
-                .get("PYTEST_ADDOPTS")
-                .map(String::as_str),
-            Some("-n 2")
+            Some("-q"),
+            "caller PYTEST_ADDOPTS must be unchanged"
         );
     }
 
+    /// When the caller did not set PYTEST_ADDOPTS, it must not appear at all.
     #[test]
-    fn appending_to_an_empty_value_adds_no_leading_space() {
+    fn pytest_does_not_inject_addopts_when_caller_omitted_it() {
+        let injected = inject(&plan(&["pytest"]), 1, env(&[]), "/run/js", 2);
+        assert!(
+            !injected.env.contains_key("PYTEST_ADDOPTS"),
+            "PYTEST_ADDOPTS must not be created by busybee; env: {:?}",
+            injected.env
+        );
+    }
+
+    /// pytest -n auto: argv_replacements causes the "auto" token to be filled
+    /// with the granted core count.
+    #[test]
+    fn pytest_n_auto_argv_replacement_is_filled() {
         let injected = inject(
-            &plan(&["pytest"]),
-            1,
-            env(&[("PYTEST_ADDOPTS", "")]),
+            &plan(&["pytest", "-n", "auto", "tests/"]),
+            4,
+            env(&[]),
             "/run/js",
-            2,
+            3,
         );
         assert_eq!(
-            injected.env.get("PYTEST_ADDOPTS").map(String::as_str),
-            Some("-n 2")
+            injected.argv,
+            ["pytest", "-n", "3", "tests/"],
+            "argv after filling; got {:?}",
+            injected.argv
         );
     }
 }
