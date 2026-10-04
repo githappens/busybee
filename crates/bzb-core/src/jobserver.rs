@@ -146,14 +146,21 @@ impl Jobserver {
                     if now >= end {
                         break;
                     }
-                    let timeout_ms = (end - now).as_micros().div_ceil(1000).min(i32::MAX as u128);
+                    // On macOS, poll() is backed by kqueue's edge-triggered
+                    // EVFILT_READ: a token that arrives and is consumed in the
+                    // brief window between this read() returning EAGAIN and the
+                    // next poll() registering its kevent goes unnoticed, causing
+                    // poll() to sleep for the full remaining deadline.  Capping
+                    // at 50 ms ensures we retry read() at least 10 times per
+                    // 500 ms job cycle, making the window practically invisible.
+                    let timeout_ms = (end - now).as_micros().div_ceil(1000).min(50) as i32;
                     let mut pfd = libc::pollfd {
                         fd: self.fd_r.as_raw_fd(),
                         events: libc::POLLIN,
                         revents: 0,
                     };
                     // SAFETY: pfd is a valid array of one pollfd.
-                    if unsafe { libc::poll(&mut pfd, 1, timeout_ms as i32) } < 0 {
+                    if unsafe { libc::poll(&mut pfd, 1, timeout_ms) } < 0 {
                         let err = io::Error::last_os_error();
                         if err.kind() != io::ErrorKind::Interrupted {
                             return Err(err);
