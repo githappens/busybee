@@ -6,6 +6,8 @@ use bzb_core::{
     enqueue::{enqueue, TaskSpec},
     log::fetch_log_chunk,
 };
+use std::collections::BTreeMap;
+
 use bzb_test_support::PueuedFixture;
 
 /// A connected client to a fresh isolated pueued with the `busybee` group in
@@ -19,6 +21,14 @@ async fn connected() -> Option<(PueuedFixture, Client)> {
         .await
         .expect("create the group");
     Some((p, client))
+}
+
+/// The host `PATH`, for tasks that run external commands: pueued hands a task
+/// exactly the environment it is given, and on NixOS a shell without PATH
+/// falls back to `/no-such-path`.
+fn path_env() -> BTreeMap<String, String> {
+    let path = std::env::var("PATH").expect("PATH is set for the test process");
+    BTreeMap::from([("PATH".into(), path)])
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -66,7 +76,7 @@ async fn enqueue_returns_a_task_id() {
     let spec = TaskSpec {
         command: "true".into(),
         cwd: std::env::current_dir().unwrap(),
-        env: Default::default(),
+        env: path_env(),
         label: Some("smoke".into()),
         start_immediately: false,
     };
@@ -85,7 +95,7 @@ async fn log_chunk_accumulates_across_polls() {
         TaskSpec {
             command: "printf one; printf two".into(),
             cwd: std::env::current_dir().unwrap(),
-            env: Default::default(),
+            env: path_env(),
             label: None,
             start_immediately: false,
         },
@@ -119,12 +129,9 @@ async fn log_chunk_returns_plaintext_for_repetitive_output() {
     let id = enqueue(
         &mut client,
         TaskSpec {
-            // pueued wraps the command in `sh -c`; avoid a nested sh invocation
-            // and use only POSIX built-ins so PATH is not required in the task's
-            // environment.
             command: format!("i=1; while [ $i -le {repeats} ]; do echo {line}; i=$((i+1)); done"),
             cwd: std::env::current_dir().unwrap(),
-            env: Default::default(),
+            env: path_env(),
             label: None,
             start_immediately: false,
         },
@@ -160,4 +167,38 @@ async fn log_chunk_returns_plaintext_for_repetitive_output() {
         String::from_utf8(last).expect("output is valid utf-8"),
         expected,
     );
+}
+
+/// A task can run an external binary (`seq`, not a shell built-in): issue #99.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial]
+async fn task_with_path_in_env_can_run_external_commands() {
+    let Some((_p, mut client)) = connected().await else {
+        return;
+    };
+
+    let id = enqueue(
+        &mut client,
+        TaskSpec {
+            command: "seq 1 5".into(),
+            cwd: std::env::current_dir().unwrap(),
+            env: path_env(),
+            label: None,
+            start_immediately: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    let expected = "1\n2\n3\n4\n5\n";
+    let mut last = String::new();
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (bytes, _) = fetch_log_chunk(&mut client, id, 0).await.unwrap();
+        last = String::from_utf8_lossy(&bytes).into_owned();
+        if last.len() >= expected.len() {
+            break;
+        }
+    }
+    assert_eq!(last, expected, "seq output should be 1..5, one per line");
 }
