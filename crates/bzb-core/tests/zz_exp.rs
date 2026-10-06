@@ -10,12 +10,12 @@ use bzb_test_support::counter;
 fn zz_exp() {
     unsafe {
         let mut prio = libc::getpriority(libc::PRIO_PROCESS, 0);
-        eprintln!("RESULT main qos={} nice={}", libc::qos_class_self() as u32, prio);
+        eprintln!("RESULT main qos={} nice={}", qos(), prio);
         prio = libc::getpriority(libc::PRIO_DARWIN_PROCESS, 0);
         eprintln!("RESULT darwin_bg={}", prio);
         std::thread::spawn(|| {
             let rc = libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0);
-            eprintln!("RESULT boosted rc={rc} qos={}", libc::qos_class_self() as u32);
+            eprintln!("RESULT boosted rc={rc} qos={}", qos());
         }).join().unwrap();
     }
     let hogs: usize = std::env::var("HOGS").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -73,4 +73,11 @@ fn qos_block(path: &std::path::Path, n: u32) -> u32 {
         while got < n { got += f.read(&mut buf[..(n - got) as usize]).unwrap() as u32; }
         got
     }).join().unwrap()
+}
+
+fn qos() -> String {
+    let mut q = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+    let mut rel = 0;
+    let rc = unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut q, &mut rel) };
+    format!("{:?}/rc{rc}", q as u32)
 }

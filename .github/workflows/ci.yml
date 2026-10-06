@@ -106,10 +106,10 @@ jobs:
           ps -o pid,ppid,pri,ni,comm -p $$ -p $PPID || true
           sysctl -n hw.ncpu machdep.cpu.brand_string || true
           cargo build -q --workspace
-          for mode in lib lib spin; do
-            case $mode in spin) export SPIN=pure;; *) unset SPIN;; esac
+          for mode in lib spin qos lib spin qos; do
+            unset SPIN QOS
+            case $mode in spin) export SPIN=pure;; qos) export QOS=1;; esac
+            echo "MODE $mode"
             HOGS=0 cargo test -q -p bzb-core --test zz_exp -- --ignored --nocapture 2>&1 | grep RESULT || true
           done
           HOGS=3 cargo test -q -p bzb-core --test zz_exp -- --ignored --nocapture 2>&1 | grep RESULT || true
-          cargo test -q -p bzb-core --test jobserver_contention 2>&1 | grep -E 'test result|short' || true
-          for i in 1 2 3; do cargo test -q -p bzb --test e2e_pool 2>&1 | grep -E 'test result|left:' || true; done
