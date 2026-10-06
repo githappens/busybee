@@ -27,8 +27,26 @@ class CIReviewTests(unittest.TestCase):
         candidates[5]["head"]["repo"]["full_name"] = "contributor/tool"
         with patch.object(ci, "trigger_allowed", return_value=True), \
                 patch.object(ci, "api", return_value=candidates), patch.object(ci, "output") as output:
-            ci.select(SimpleNamespace(repo="example/tool", pr=None))
+            ci.select(SimpleNamespace(repo="example/tool", pr=None, event_name="workflow_dispatch", event={}))
             output.assert_called_once_with("prs", "[1, 2, 3]")
+
+    def test_an_event_selects_only_the_prs_it_concerns(self):
+        candidates = [{"number": n, "state": "open", "draft": False,
+                       "head": {"sha": f"sha{n}", "repo": {"full_name": "example/tool"}},
+                       "base": {"repo": {"full_name": "example/tool"}}} for n in (7, 8, 9)]
+        closing = {40: [8, 9, 99]}.get
+        for name, event, expected in (
+                ("workflow_run", {"workflow_run": {"head_sha": "sha8"}}, [8]),
+                ("workflow_run", {"workflow_run": {"head_sha": "main-tip"}}, []),
+                ("issue_comment", {"issue": {"number": 7, "pull_request": {}}}, [7]),
+                ("issue_comment", {"issue": {"number": 40}}, [8, 9]),
+                ("issue_comment", {"issue": {"number": 41}}, []),
+                ("workflow_dispatch", {}, [7, 8, 9])):
+            with self.subTest(name=name, event=event):
+                got = ci.triggered(name, event, candidates, lambda issue: closing(issue, []))
+                self.assertEqual([pr["number"] for pr in got], expected)
+        with self.assertRaises(ValueError):
+            ci.triggered("schedule", {}, candidates, closing)
 
     def test_rejected_event_actors_cannot_create_cached_failures(self):
         for kind, permission, allowed in (("Bot", "write", False), ("User", "read", False),
@@ -45,10 +63,11 @@ class CIReviewTests(unittest.TestCase):
             read.assert_not_called()
 
     def test_only_default_branch_runs_of_the_trusted_workflow_supply_cache(self):
-        run = {"path": ci.WORKFLOW, "head_branch": "main", "event": "schedule"}
+        run = {"path": ci.WORKFLOW, "head_branch": "main", "event": "workflow_run"}
         self.assertTrue(ci.trusted_run(run, "main"))
         for field, value in (("path", ".github/workflows/ci.yml"), ("head_branch", "feature"),
-                             ("event", "pull_request"), ("event", "pull_request_target")):
+                             ("event", "pull_request"), ("event", "pull_request_target"),
+                             ("event", "schedule")):
             self.assertFalse(ci.trusted_run(dict(run, **{field: value}), "main"))
 
     def test_artifact_is_read_without_extracting_paths(self):
@@ -61,7 +80,7 @@ class CIReviewTests(unittest.TestCase):
     def test_malformed_newest_trusted_artifact_does_not_fall_back(self):
         artifacts = [{"id": i, "expired": False, "workflow_run": {"id": i}} for i in (2, 1)]
         with patch.object(ci, "paged_objects", return_value=artifacts), \
-                patch.object(ci, "api", return_value={"path": ci.WORKFLOW, "head_branch": "main", "event": "schedule"}), \
+                patch.object(ci, "api", return_value={"path": ci.WORKFLOW, "head_branch": "main", "event": "workflow_run"}), \
                 patch.object(ci, "download", side_effect=[b"invalid zip", b"old green"] ) as download:
             with self.assertRaises(zipfile.BadZipFile):
                 ci.cached_record("example/tool", "name", "main")

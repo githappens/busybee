@@ -71,9 +71,12 @@ builds use controller limits instead of the binary under test.
 
 ## CI authority, evidence, and bounds
 
-`.github/workflows/agent-review-gate.yml` reviews every open, ready,
-same-repository PR. Fork PRs require maintainer review. Linked closing issues
-provide the contract; a PR without one uses its description as the scope.
+`.github/workflows/agent-review-gate.yml` reviews open, ready,
+same-repository PRs, only the ones an event concerns: the PR whose CI just
+finished, the PR commented on, or the PRs closing a commented issue. A manual
+dispatch without a PR number checks all of them. Fork PRs require maintainer
+review. Linked closing issues provide the contract; a PR without one uses its
+description as the scope.
 
 Trust model:
 
@@ -81,7 +84,8 @@ Trust model:
   default-branch SHA. Candidate files are read as data, never executed.
 - Only human actors with write access can trigger a review; only
   owner/member/collaborator comments change the contract fingerprint. Other
-  events wait for the next scheduled run.
+  events are ignored until a trusted push, comment or manual dispatch. There is
+  no scheduled run, so a parked PR stays quiet.
 - Review sessions use restricted, read/search-only tools with candidate
   settings and skills disabled, and a read-only GitHub token. Only the separate
   deterministic publisher can submit reviews.

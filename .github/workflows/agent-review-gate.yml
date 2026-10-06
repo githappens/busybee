@@ -8,8 +8,6 @@ on:
     types: [completed]
   issue_comment:
     types: [created, edited, deleted]
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       pr:

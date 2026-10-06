@@ -10,7 +10,7 @@ import subprocess
 import sys
 import zipfile
 
-from reviews import (EFFORT, MODEL, SKILLS, api, checks_for, ci_errors,
+from reviews import (EFFORT, MODEL, SKILLS, api, checks_for, ci_errors, command,
                      collect_packet, input_id, lab_errors, paged_objects, publish_decision,
                      read_pr, result_errors, reviewable)
 
@@ -36,7 +36,7 @@ def trusted_run(run, default_branch):
     # These events load policy from the default branch. A candidate-ref dispatch,
     # pull_request workflow, or artifact from another workflow is not authority.
     return (run.get("path") == WORKFLOW and run.get("head_branch") == default_branch
-            and run.get("event") in ("schedule", "workflow_run", "issue_comment", "workflow_dispatch"))
+            and run.get("event") in ("workflow_run", "issue_comment", "workflow_dispatch"))
 
 
 def download(repo, artifact_id):
@@ -91,11 +91,32 @@ def bundle(packet, results):
 
 
 def trigger_allowed(repo):
-    # Untrusted events must not spend allowance; the next scheduled run picks the PR up.
+    # Untrusted events must not spend allowance; a trusted push, comment or dispatch picks the PR up.
     actor = os.environ["GITHUB_ACTOR"]
     if api(f"users/{actor}")["type"] != "User":
         return False
     return api(f"repos/{repo}/collaborators/{actor}/permission")["permission"] in ("admin", "write")
+
+
+def closing_prs(repo, issue):
+    prs = json.loads(command(["gh", "pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
+                              "--json", "number,closingIssuesReferences"]))
+    url = f"https://github.com/{repo}/issues/{issue}"
+    return [pr["number"] for pr in prs if any(ref["url"] == url for ref in pr["closingIssuesReferences"])]
+
+
+def triggered(event_name, event, candidates, closing):
+    """The open PRs an event concerns: the PR whose CI finished, the PR commented
+    on, or the PRs whose contract is the commented issue. A parked PR is left alone."""
+    if event_name == "workflow_dispatch":
+        return candidates
+    if event_name == "workflow_run":
+        return [pr for pr in candidates if pr["head"]["sha"] == event["workflow_run"]["head_sha"]]
+    if event_name == "issue_comment":
+        issue = event["issue"]
+        numbers = {issue["number"]} if "pull_request" in issue else set(closing(issue["number"]))
+        return [pr for pr in candidates if pr["number"] in numbers]
+    raise ValueError(f"Unexpected event {event_name}")
 
 
 def select(args):
@@ -106,7 +127,9 @@ def select(args):
     if args.pr:
         candidates = [read_pr(args.repo, args.pr)]
     else:
-        candidates = api(f"repos/{args.repo}/pulls?state=open&per_page=100", pages=True)
+        candidates = triggered(args.event_name, args.event,
+                               api(f"repos/{args.repo}/pulls?state=open&per_page=100", pages=True),
+                               lambda issue: closing_prs(args.repo, issue))
     output("prs", json.dumps([pr["number"] for pr in candidates if reviewable(pr)]))
 
 
@@ -179,6 +202,9 @@ def main():
     args = parser.parse_args()
     if not args.repo or (args.operation != "select" and not args.pr):
         parser.error("repo and positive PR number required")
+    if args.operation == "select":
+        args.event_name = os.environ["GITHUB_EVENT_NAME"]
+        args.event = json.loads(Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
     globals()[args.operation](args)
 
 
