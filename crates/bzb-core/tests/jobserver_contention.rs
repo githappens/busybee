@@ -2,7 +2,7 @@
 //! workers return a token and block in `read` for the next one straight away
 //! (`docs/design/bzbd.md` §Admission policy, the static drain).
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -84,8 +84,6 @@ fn static_drain_collects_its_grant_against_a_hot_reader() {
     for w in workers {
         w.join().expect("worker thread");
     }
-    drop(js);
-    let _ = fs::remove_dir_all(dir.path());
 
     assert!(
         short.is_empty(),
