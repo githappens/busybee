@@ -6,13 +6,16 @@
 //! macOS a fifo is a socket pair and `FIONREAD` on a read-write descriptor
 //! reports the always-empty write side.
 //!
-//! A drain waits for tokens in a blocking `read`, never in `poll`. A build's
-//! job slots wait for their next token blocked in `read`; the kernel hands a
-//! returned token to a reader it wakes in place, while a `poll` waiter has to
-//! come back out and read, and by then the byte is gone. A blocking read has
-//! no deadline, so it runs on a drainer thread and [`acquire`](Jobserver::acquire)
-//! waits for that thread's tokens up to its own deadline. A token the drainer
-//! reads after the caller stopped waiting goes straight back into the pipe.
+//! A drain competes with the builds for every token they return, and a make
+//! that returns one reads the next microseconds later from the same CPU. The
+//! drainer that waits for tokens therefore sits blocked in `read`, never in
+//! `poll` (a `poll` waiter has to come back out to read, and by then the byte
+//! is gone), and on macOS it runs at user-interactive QoS, without which the
+//! kernel wakes it too late to win against an otherwise idle build host. A
+//! blocking read has no deadline, so it runs on its own thread and
+//! [`acquire`](Jobserver::acquire) waits for that thread's tokens up to its
+//! own deadline. A token the drainer reads after the caller stopped waiting
+//! goes straight back into the pipe.
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -21,7 +24,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -231,9 +234,21 @@ impl Drain {
         });
         let shared = Arc::clone(&drain);
         let path = path.to_path_buf();
+        let (ready, started) = mpsc::sync_channel(1);
         thread::Builder::new()
             .name("jobserver-drain".into())
-            .spawn(move || shared.run(fd, &path))?;
+            .spawn(move || {
+                let boosted = boost();
+                let ok = boosted.is_ok();
+                // The receiver waits for this send, so it cannot fail.
+                let _ = ready.send(boosted);
+                if ok {
+                    shared.run(fd, &path);
+                }
+            })?;
+        started
+            .recv()
+            .map_err(|_| io::Error::other("the jobserver drainer exited before starting"))??;
         Ok(drain)
     }
 
@@ -340,6 +355,25 @@ impl Drain {
             self.changed.notify_all();
         }
     }
+}
+
+/// Run the drainer at user-interactive QoS (see the module docs). Linux
+/// needs no boost.
+#[cfg(target_os = "macos")]
+fn boost() -> io::Result<()> {
+    // SAFETY: sets the calling thread's own QoS class; no pointers involved.
+    let rc = unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
+    match rc {
+        0 => Ok(()),
+        rc => Err(io::Error::from_raw_os_error(rc)),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn boost() -> io::Result<()> {
+    Ok(())
 }
 
 /// Return `n` tokens through a write handle of their own: the drainer keeps no

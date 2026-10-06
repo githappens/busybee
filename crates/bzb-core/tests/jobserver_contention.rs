@@ -5,12 +5,14 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use bzb_core::jobserver::Jobserver;
+use bzb_test_support::counter;
 
 const POOL: u32 = 6;
 const WORKERS: u64 = 4;
@@ -85,6 +87,66 @@ fn static_drain_collects_its_grant_against_a_hot_reader() {
     drop(js);
     let _ = fs::remove_dir_all(dir.path());
 
+    assert!(
+        short.is_empty(),
+        "{} of {ROUNDS} drains came up short within {DEADLINE:?}:\n{}",
+        short.len(),
+        short.join("\n")
+    );
+}
+
+/// The same drain against two real GNU make builds sharing the pool. make
+/// returns a token and reads the next one at once from the same process, a
+/// race the simulated slots above do not reproduce.
+#[test]
+fn static_drain_collects_its_grant_against_two_make_builds() {
+    if !counter::available("make", (4, 4)) {
+        return;
+    }
+    const BUILD_GRANT: u32 = 2;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let build = dir.path().join("build");
+    // Enough 0.5 s targets to keep both builds busy through every round.
+    counter::make_build(&build, 600, "0.5");
+    let js = Jobserver::create(dir.path(), POOL).expect("create the jobserver");
+    let mut makes: Vec<_> = ["a", "b"]
+        .iter()
+        .map(|name| {
+            Command::new("make")
+                .current_dir(&build)
+                .env(
+                    "MAKEFLAGS",
+                    format!("--jobserver-auth=fifo:{}", js.path().display()),
+                )
+                .env("COUNTER_NAME", name)
+                .arg("run")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("start make")
+        })
+        .collect();
+    // Let both builds fill the pool.
+    thread::sleep(Duration::from_secs(1));
+
+    let mut short = Vec::new();
+    for round in 0..ROUNDS {
+        let start = Instant::now();
+        let got = js.acquire(BUILD_GRANT, DEADLINE).expect("acquire");
+        if got < BUILD_GRANT {
+            short.push(format!(
+                "round {round}: {got}/{BUILD_GRANT} after {:?}",
+                start.elapsed()
+            ));
+        }
+        js.release(got).expect("release");
+        thread::sleep(Duration::from_millis(300));
+    }
+
+    for make in &mut makes {
+        make.kill().expect("stop make");
+        make.wait().expect("reap make");
+    }
     assert!(
         short.is_empty(),
         "{} of {ROUNDS} drains came up short within {DEADLINE:?}:\n{}",
