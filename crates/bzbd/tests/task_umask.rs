@@ -39,14 +39,6 @@ fn cold_pueue_config() -> (PathBuf, PathBuf, TempDir) {
     (config, shared, tmp)
 }
 
-/// Start bzbd in the cold path: private config, no pre-started pueued.
-fn cold_daemon(pueue_config: &Path) -> Fixture {
-    Fixture::start_with(
-        Some("pool_size = 4\n"),
-        &[("PUEUE_CONFIG_PATH", pueue_config.display().to_string())],
-    )
-}
-
 /// Drain events until `Finished`; return its exit code.
 async fn wait_for_finished(conn: &mut Connection) -> i32 {
     loop {
@@ -87,15 +79,14 @@ async fn cold_start_creates_traversable_task_directories() {
     }
     let (config, shared, _pueue_tmp) = cold_pueue_config();
     let work = TempDir::new().expect("work dir");
-    let daemon = cold_daemon(&config);
+    let daemon = Fixture::start_with_pueue(&config);
 
     let req = request_in(&["sh", "-c", "mkdir d && touch d/f"], work.path());
     let mut conn = submit(&daemon, req).await;
-    let exit_code = tokio::time::timeout(PATIENCE, wait_for_finished(&mut conn))
-        .await
-        .expect("task timed out");
-
+    let finished = tokio::time::timeout(PATIENCE, wait_for_finished(&mut conn)).await;
+    // Before any assertion, so a timed-out task leaves no pueued behind.
     kill_pueued_in(&shared);
+    let exit_code = finished.expect("task timed out");
     assert_eq!(
         exit_code, 0,
         "task failed: directory was not traversable — umask reached pueued (exit {exit_code})"
@@ -119,15 +110,14 @@ async fn cold_start_preserves_executable_task_output() {
     std::fs::write(&tool, "#!/bin/sh\nexit 0\n").expect("write tool");
     std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod tool");
 
-    let daemon = cold_daemon(&config);
+    let daemon = Fixture::start_with_pueue(&config);
 
     let req = request_in(&["sh", "-c", "cp tool t && ./t"], work.path());
     let mut conn = submit(&daemon, req).await;
-    let exit_code = tokio::time::timeout(PATIENCE, wait_for_finished(&mut conn))
-        .await
-        .expect("task timed out");
-
+    let finished = tokio::time::timeout(PATIENCE, wait_for_finished(&mut conn)).await;
+    // Before any assertion, so a timed-out task leaves no pueued behind.
     kill_pueued_in(&shared);
+    let exit_code = finished.expect("task timed out");
     assert_eq!(
         exit_code, 0,
         "task failed: executable copy was not runnable — umask reached pueued (exit {exit_code})"
@@ -139,7 +129,7 @@ async fn cold_start_preserves_executable_task_output() {
 #[tokio::test]
 async fn daemon_control_surface_remains_private() {
     let (config, _, _pueue_tmp) = cold_pueue_config();
-    let daemon = cold_daemon(&config);
+    let daemon = Fixture::start_with_pueue(&config);
 
     assert_eq!(
         file_mode(daemon.state_dir()),

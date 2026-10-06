@@ -19,10 +19,9 @@ use crate::errors::BusybeeError;
 /// adjustment — the child inherits whatever mask is in effect at spawn time.
 static SPAWN_UMASK: OnceLock<libc::mode_t> = OnceLock::new();
 
-/// Record the umask that pueued should inherit when bzbd spawns it. Call once,
-/// before `restrict_umask`, passing the value `restrict_umask` returns (the
-/// previous mask). Subsequent calls are ignored; the mask is fixed for the
-/// lifetime of the process.
+/// Record the umask that pueued should inherit when bzbd spawns it: the
+/// caller's mask, which bzbd's first `restrict_umask` call returns. Call once,
+/// before pueued can be spawned; later calls are ignored.
 pub fn set_spawn_umask(mask: libc::mode_t) {
     // Ignore a second set: bzbd calls this once, before any thread exists.
     let _ = SPAWN_UMASK.set(mask);
