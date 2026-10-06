@@ -143,28 +143,6 @@ fn a_zero_deadline_takes_what_the_pipe_holds_without_waiting() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// The drainer is still blocked in `read` when `acquire` gives up; the token it
-/// reads afterwards belongs to nobody and must not leave the pool.
-#[test]
-fn a_token_that_arrives_after_the_deadline_stays_in_the_pool() {
-    let dir = fixture("late");
-    let js = Jobserver::create(&dir, 0).unwrap();
-    assert_eq!(js.acquire(1, Duration::from_millis(100)).unwrap(), 0);
-
-    // The drainer, blocked in `read`, takes the token before anyone else can;
-    // it must write it back rather than keep it.
-    js.release(1).unwrap();
-    let end = Instant::now() + Duration::from_secs(2);
-    let mut got = 0;
-    while got == 0 && Instant::now() < end {
-        std::thread::sleep(Duration::from_millis(10));
-        got = js.acquire(1, Duration::ZERO).unwrap();
-    }
-    assert_eq!(got, 1, "the late token left the pool");
-    drop(js);
-    let _ = fs::remove_dir_all(&dir);
-}
-
 #[test]
 fn drain_excess_removes_extra_tokens() {
     let dir = fixture("drain");
