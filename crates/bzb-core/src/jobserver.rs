@@ -5,6 +5,14 @@
 //! last build exits. Reads and `FIONREAD` use a separate read-only handle: on
 //! macOS a fifo is a socket pair and `FIONREAD` on a read-write descriptor
 //! reports the always-empty write side.
+//!
+//! A drain races the builds for every token they return, and a make that
+//! returns one reads the next microseconds later from the same process. A
+//! waiter the kernel has to wake, whether in `poll` or a blocking `read`,
+//! loses most of those races on macOS, so [`acquire`](Jobserver::acquire)
+//! spins on non-blocking reads until it has its tokens or its deadline
+//! passes. The spin occupies one core only while the pool's tokens are out
+//! with running builds.
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -108,8 +116,9 @@ impl Jobserver {
         Ok(n as u32)
     }
 
-    /// Take up to `n` tokens, sleeping in `poll(2)` until tokens arrive or
-    /// `deadline` elapses. Returns how many were taken (`0..=n`); the caller
+    /// Take up to `n` tokens, spinning on non-blocking reads until they
+    /// arrive or `deadline` elapses; a zero `deadline` takes only what the
+    /// pipe holds now. Returns how many were taken (`0..=n`); the caller
     /// owns them until it calls [`release`](Self::release). On error nothing
     /// is owned: tokens read before the failure are written back first.
     pub fn acquire(&self, n: u32, deadline: Duration) -> io::Result<u32> {
@@ -142,23 +151,10 @@ impl Jobserver {
                 Ok(k) => *got += k as u32,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let now = Instant::now();
-                    if now >= end {
+                    if Instant::now() >= end {
                         break;
                     }
-                    let timeout_ms = (end - now).as_micros().div_ceil(1000).min(i32::MAX as u128);
-                    let mut pfd = libc::pollfd {
-                        fd: self.fd_r.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    // SAFETY: pfd is a valid array of one pollfd.
-                    if unsafe { libc::poll(&mut pfd, 1, timeout_ms as i32) } < 0 {
-                        let err = io::Error::last_os_error();
-                        if err.kind() != io::ErrorKind::Interrupted {
-                            return Err(err);
-                        }
-                    }
+                    std::hint::spin_loop();
                 }
                 Err(e) => return Err(e),
             }

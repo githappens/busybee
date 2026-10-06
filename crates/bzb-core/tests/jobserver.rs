@@ -127,6 +127,23 @@ fn acquire_on_empty_pool_times_out() {
 }
 
 #[test]
+fn a_zero_deadline_takes_what_the_pipe_holds_without_waiting() {
+    let dir = fixture("zero");
+    let js = Jobserver::create(&dir, 2).unwrap();
+
+    let start = Instant::now();
+    assert_eq!(js.acquire(3, Duration::ZERO).unwrap(), 2);
+    assert!(
+        start.elapsed() < Duration::from_millis(100),
+        "a zero deadline waited {:?}",
+        start.elapsed()
+    );
+    assert_eq!(js.free().unwrap(), 0);
+    drop(js);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn drain_excess_removes_extra_tokens() {
     let dir = fixture("drain");
     let js = Jobserver::create(&dir, 4).unwrap();
