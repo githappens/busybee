@@ -59,35 +59,39 @@ LAB_BRANCH = "sortie-lab/"
 LAB_PASSING = ("verified", "preexisting_failures")
 
 
-def command(argv, stdin=None):
-    last_exc = None
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
+def command(argv, stdin=None, retry=True, text=True):
+    """Run argv and return its stdout, retrying transient failures when `retry`.
+    Writes pass retry=False: a timed-out write may have landed, and a retried
+    review post would skip the head recheck that precedes it."""
+    attempts = RETRY_ATTEMPTS if retry else 1
+    for attempt in range(1, attempts + 1):
         try:
-            result = subprocess.run(argv, input=stdin, text=True, capture_output=True, timeout=60)
+            result = subprocess.run(argv, input=stdin, text=text, capture_output=True, timeout=60)
             if result.returncode == 0:
                 return result.stdout
-            stderr = result.stderr.strip() or f"Command failed: {argv[0]}"
+            stderr = (result.stderr if text else result.stderr.decode()).strip()
+            error = RuntimeError(stderr or f"Command failed: {argv[0]}")
             if not is_transient_error(stderr):
-                raise RuntimeError(stderr)  # non-transient: fail immediately
-            last_exc = RuntimeError(stderr)
+                raise error
         except subprocess.TimeoutExpired as exc:
-            last_exc = exc
-        if attempt < RETRY_ATTEMPTS:
+            error = exc
+        if attempt < attempts:
             delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-            print(f"Transient GitHub API failure (attempt {attempt}/{RETRY_ATTEMPTS}): {last_exc}; "
+            print(f"Transient failure in {argv[0]} (attempt {attempt}/{attempts}): {error}; "
                   f"retrying in {delay}s", file=sys.stderr)
             time.sleep(delay)
-    raise last_exc
+    raise error
 
 
 def api(path, method="GET", data=None, pages=False):
     args = ["gh", "api", "--method", method, path]
     if pages:
         args += ["--paginate", "--slurp"]
+    retry = method == "GET"
     if data is None:
-        raw = command(args)
+        raw = command(args, retry=retry)
     else:
-        raw = command(args + ["--input", "-"], json.dumps(data))
+        raw = command(args + ["--input", "-"], json.dumps(data), retry=retry)
     result = json.loads(raw) if raw.strip() else None
     return [entry for page in result for entry in page] if pages else result
 

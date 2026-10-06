@@ -8,13 +8,11 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
-import time
 import zipfile
 
-from reviews import (EFFORT, MODEL, RETRY_ATTEMPTS, RETRY_BASE_DELAY, SKILLS, api,
-                     checks_for, ci_errors, collect_packet, command, input_id,
-                     is_transient_error, lab_errors, paged_objects, publish_decision, read_pr,
-                     result_errors, reviewable)
+from reviews import (EFFORT, MODEL, SKILLS, api, checks_for, ci_errors, command,
+                     collect_packet, input_id, lab_errors, paged_objects, publish_decision,
+                     read_pr, result_errors, reviewable)
 
 WORKFLOW = ".github/workflows/agent-review-gate.yml"
 SCHEMA = {
@@ -42,25 +40,7 @@ def trusted_run(run, default_branch):
 
 
 def download(repo, artifact_id):
-    last_exc = None
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        try:
-            result = subprocess.run(["gh", "api", f"repos/{repo}/actions/artifacts/{artifact_id}/zip"],
-                                    capture_output=True, timeout=60)
-            if result.returncode == 0:
-                return result.stdout
-            stderr = result.stderr.decode().strip()
-            if not is_transient_error(stderr):
-                raise RuntimeError(stderr)  # non-transient: fail immediately
-            last_exc = RuntimeError(stderr)
-        except subprocess.TimeoutExpired as exc:
-            last_exc = exc
-        if attempt < RETRY_ATTEMPTS:
-            delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-            print(f"Transient artifact download failure (attempt {attempt}/{RETRY_ATTEMPTS}): {last_exc}; "
-                  f"retrying in {delay}s", file=sys.stderr)
-            time.sleep(delay)
-    raise last_exc
+    return command(["gh", "api", f"repos/{repo}/actions/artifacts/{artifact_id}/zip"], text=False)
 
 
 def read_record(data):
