@@ -86,6 +86,9 @@ Trust model:
   owner/member/collaborator comments change the contract fingerprint. Other
   events are ignored until a trusted push, comment or manual dispatch. There is
   no scheduled run, so a parked PR stays quiet.
+- Runs queue per PR. GitHub keeps one pending run per concurrency group and a
+  newer one replaces it, so a shared queue would let an event for one PR drop
+  another's review. Comments from outside the repository queue separately.
 - Review sessions use restricted, read/search-only tools with candidate
   settings and skills disabled, and a read-only GitHub token. Only the separate
   deterministic publisher can submit reviews.
