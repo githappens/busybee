@@ -8,9 +8,44 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS = ("contract-review", "ponytail-review")
+# Retry configuration for transient GitHub API failures.
+# 4 total attempts; delays between attempts: 10 s, 20 s, 40 s (doubling from
+# RETRY_BASE_DELAY).  Maximum added wait: ~70 s; covers 1-2 min of transient
+# outages without holding a CI job for long.
+RETRY_ATTEMPTS = 4
+RETRY_BASE_DELAY = 10  # seconds
+
+_TRANSIENT_RE = re.compile(
+    r"No server is currently available"
+    r"|TLS handshake"
+    r"|connection (?:refused|reset|timed? out)"
+    r"|dial tcp"
+    r"|i/o timeout"
+    r"|unexpected EOF"
+    r"|HTTP 5\d\d"
+    r"|HTTP 429"
+    r"|\bstatus[\":\s]+5\d\d\b"
+    r"|\bstatus[\":\s]+429\b"
+    r"|secondary rate limit"
+    r"|rate limit exceeded",
+    re.IGNORECASE,
+)
+
+
+def is_transient_error(stderr):
+    """Whether a gh stderr message describes a transient failure worth retrying.
+
+    Matches: transport/TLS errors, HTTP 5xx, HTTP 429, secondary-rate-limit.
+    Does not match: other 4xx, auth failures, or malformed responses — those
+    fail immediately without retrying.
+    """
+    return bool(_TRANSIENT_RE.search(stderr))
+
+
 MODEL = "claude-opus-5-5"
 EFFORT = "high"
 GATE_MARKER = "busybee-agent-review-gate:v2 "
@@ -24,21 +59,39 @@ LAB_BRANCH = "sortie-lab/"
 LAB_PASSING = ("verified", "preexisting_failures")
 
 
-def command(argv, stdin=None):
-    result = subprocess.run(argv, input=stdin, text=True, capture_output=True, timeout=60)
-    if result.returncode:
-        raise RuntimeError(result.stderr.strip() or f"Command failed: {argv[0]}")
-    return result.stdout
+def command(argv, stdin=None, retry=True, text=True):
+    """Run argv and return its stdout, retrying transient failures when `retry`.
+    Writes pass retry=False: a timed-out write may have landed, and a retried
+    review post would skip the head recheck that precedes it."""
+    attempts = RETRY_ATTEMPTS if retry else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            result = subprocess.run(argv, input=stdin, text=text, capture_output=True, timeout=60)
+            if result.returncode == 0:
+                return result.stdout
+            stderr = (result.stderr if text else result.stderr.decode()).strip()
+            error = RuntimeError(stderr or f"Command failed: {argv[0]}")
+            if not is_transient_error(stderr):
+                raise error
+        except subprocess.TimeoutExpired as exc:
+            error = exc
+        if attempt < attempts:
+            delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+            print(f"Transient failure in {argv[0]} (attempt {attempt}/{attempts}): {error}; "
+                  f"retrying in {delay}s", file=sys.stderr)
+            time.sleep(delay)
+    raise error
 
 
 def api(path, method="GET", data=None, pages=False):
     args = ["gh", "api", "--method", method, path]
     if pages:
         args += ["--paginate", "--slurp"]
+    retry = method == "GET"
     if data is None:
-        raw = command(args)
+        raw = command(args, retry=retry)
     else:
-        raw = command(args + ["--input", "-"], json.dumps(data))
+        raw = command(args + ["--input", "-"], json.dumps(data), retry=retry)
     result = json.loads(raw) if raw.strip() else None
     return [entry for page in result for entry in page] if pages else result
 

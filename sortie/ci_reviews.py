@@ -40,11 +40,7 @@ def trusted_run(run, default_branch):
 
 
 def download(repo, artifact_id):
-    result = subprocess.run(["gh", "api", f"repos/{repo}/actions/artifacts/{artifact_id}/zip"],
-                            capture_output=True, timeout=60)
-    if result.returncode:
-        raise RuntimeError(result.stderr.decode().strip())
-    return result.stdout
+    return command(["gh", "api", f"repos/{repo}/actions/artifacts/{artifact_id}/zip"], text=False)
 
 
 def read_record(data):
