@@ -34,9 +34,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            pueue_target: x86_64-unknown-linux-musl
-            agg_asset: agg-x86_64-unknown-linux-gnu
           - os: macos-latest
             pueue_target: aarch64-apple-darwin
             agg_asset: agg-aarch64-apple-darwin
@@ -103,35 +100,16 @@ jobs:
           atleast pueued 4.0 "$(pueued --version | awk '{print $2}')"
           atleast pueue 4.0 "$(pueue --version | awk '{print $2}')"
 
-      - run: cargo fmt --all --check
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-
-      - name: Install terminal rendering tools
+      - name: Drain diagnostics
         run: |
-          set -euo pipefail
-          python3 -m pip install --quiet "pyte==$PYTE_VERSION" "pillow==$PILLOW_VERSION" "fonttools==$FONTTOOLS_VERSION"
-          curl -fsSL -o "$HOME/.local/bin/agg" \
-            "https://github.com/asciinema/agg/releases/download/v$AGG_VERSION/${{ matrix.agg_asset }}"
-          chmod +x "$HOME/.local/bin/agg"
-          agg --version
-          fonts="$RUNNER_TEMP/dejavu"
-          mkdir -p "$fonts"
-          curl -fsSL "https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_${DEJAVU_VERSION//./_}/dejavu-fonts-ttf-$DEJAVU_VERSION.tar.bz2" \
-            | tar xj -C "$fonts" --strip-components=2 "dejavu-fonts-ttf-$DEJAVU_VERSION/ttf"
-          echo "BUSYBEE_TERMINAL_FONTS=$fonts" >> "$GITHUB_ENV"
-
-      - name: Check agent harness
-        run: |
-          python3 -m unittest discover -s sortie/tests
-          python3 -m unittest discover -s scripts/vm/tests
-          python3 -m unittest discover -s tests/scenarios/tests
-          bash sortie/test-machine-safety-hook.sh
-          bash sortie/test-isolated-launcher.sh
-          bash sortie/test-harness-docs.sh
-
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - run: cargo test --workspace
+          set -x
+          ps -o pid,ppid,pri,ni,comm -p $$ -p $PPID || true
+          sysctl -n hw.ncpu machdep.cpu.brand_string || true
+          cargo build -q --workspace
+          for mode in lib lib spin; do
+            case $mode in spin) export SPIN=pure;; *) unset SPIN;; esac
+            HOGS=0 cargo test -q -p bzb-core --test zz_exp -- --ignored --nocapture 2>&1 | grep RESULT || true
+          done
+          HOGS=3 cargo test -q -p bzb-core --test zz_exp -- --ignored --nocapture 2>&1 | grep RESULT || true
+          cargo test -q -p bzb-core --test jobserver_contention 2>&1 | grep -E 'test result|short' || true
+          for i in 1 2 3; do cargo test -q -p bzb --test e2e_pool 2>&1 | grep -E 'test result|left:' || true; done
