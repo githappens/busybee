@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import ci_reviews
@@ -13,11 +13,7 @@ import reviews
 
 
 def _result(returncode, stdout="", stderr=""):
-    r = MagicMock(spec=["returncode", "stdout", "stderr"])
-    r.returncode = returncode
-    r.stdout = stdout
-    r.stderr = stderr
-    return r
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
 
 
 class RetryTests(unittest.TestCase):
