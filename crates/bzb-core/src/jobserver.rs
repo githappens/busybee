@@ -5,6 +5,14 @@
 //! last build exits. Reads and `FIONREAD` use a separate read-only handle: on
 //! macOS a fifo is a socket pair and `FIONREAD` on a read-write descriptor
 //! reports the always-empty write side.
+//!
+//! A drain waits for tokens in a blocking `read`, never in `poll`. A build's
+//! job slots wait for their next token blocked in `read`; the kernel hands a
+//! returned token to a reader it wakes in place, while a `poll` waiter has to
+//! come back out and read, and by then the byte is gone. A blocking read has
+//! no deadline, so it runs on a drainer thread and [`acquire`](Jobserver::acquire)
+//! waits for that thread's tokens up to its own deadline. A token the drainer
+//! reads after the caller stopped waiting goes straight back into the pipe.
 
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -13,6 +21,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Smallest pipe capacity on macOS and Linux; every token must fit at once.
@@ -23,8 +33,10 @@ pub struct Jobserver {
     /// Opened read-write so the fifo stays alive with zero clients; tokens
     /// are written back through it.
     fd_rw: File,
-    /// Read-only handle for `read` and `FIONREAD`.
+    /// Read-only handle for non-blocking `read` and `FIONREAD`.
     fd_r: File,
+    /// Shared with the drainer thread, which owns the blocking read handle.
+    drain: Arc<Drain>,
     /// Set by [`leave`](Self::leave): `Drop` keeps the fifo.
     left: bool,
 }
@@ -70,9 +82,10 @@ impl Jobserver {
         }
         let handles = open_nonblocking(&path, true).and_then(|rw| {
             let r = open_nonblocking(&path, false)?;
-            Ok((rw, r))
+            let drain = Drain::start(&path)?;
+            Ok((rw, r, drain))
         });
-        let (fd_rw, fd_r) = match handles {
+        let (fd_rw, fd_r, drain) = match handles {
             Ok(h) => h,
             Err(err) => {
                 return Err(match unlink(&path) {
@@ -87,6 +100,7 @@ impl Jobserver {
             path,
             fd_rw,
             fd_r,
+            drain,
             left: false,
         };
         js.release(pool_size)?;
@@ -108,10 +122,12 @@ impl Jobserver {
         Ok(n as u32)
     }
 
-    /// Take up to `n` tokens, sleeping in `poll(2)` until tokens arrive or
-    /// `deadline` elapses. Returns how many were taken (`0..=n`); the caller
-    /// owns them until it calls [`release`](Self::release). On error nothing
-    /// is owned: tokens read before the failure are written back first.
+    /// Take up to `n` tokens: those in the pipe now, then whatever the
+    /// drainer's blocking read collects before `deadline` elapses. A zero
+    /// `deadline` takes only what is in the pipe now. Returns how many were
+    /// taken (`0..=n`); the caller owns them until it calls
+    /// [`release`](Self::release). On error nothing is owned: tokens read
+    /// before the failure are written back first.
     pub fn acquire(&self, n: u32, deadline: Duration) -> io::Result<u32> {
         let mut got = 0u32;
         match self.read_tokens(n, deadline, &mut got) {
@@ -133,35 +149,15 @@ impl Jobserver {
         let mut buf = vec![0u8; n as usize];
         while *got < n {
             match (&self.fd_r).read(&mut buf[..(n - *got) as usize]) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "jobserver fifo reported EOF despite the held write end",
-                    ))
-                }
+                Ok(0) => return Err(eof()),
                 Ok(k) => *got += k as u32,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    let now = Instant::now();
-                    if now >= end {
-                        break;
-                    }
-                    let timeout_ms = (end - now).as_micros().div_ceil(1000).min(i32::MAX as u128);
-                    let mut pfd = libc::pollfd {
-                        fd: self.fd_r.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    // SAFETY: pfd is a valid array of one pollfd.
-                    if unsafe { libc::poll(&mut pfd, 1, timeout_ms as i32) } < 0 {
-                        let err = io::Error::last_os_error();
-                        if err.kind() != io::ErrorKind::Interrupted {
-                            return Err(err);
-                        }
-                    }
-                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) => return Err(e),
             }
+        }
+        if *got < n && !deadline.is_zero() {
+            self.drain.collect(n - *got, end, got)?;
         }
         Ok(())
     }
@@ -189,6 +185,174 @@ impl Jobserver {
     }
 }
 
+fn eof() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "jobserver fifo reported EOF despite the held write end",
+    )
+}
+
+/// The drainer thread's side of [`Jobserver::acquire`]: a request for tokens
+/// and what the blocking read has delivered against it.
+struct Drain {
+    state: Mutex<DrainState>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct DrainState {
+    /// Tokens the current `acquire` still waits for; 0 while none waits.
+    want: u32,
+    /// Tokens delivered to the current `acquire`.
+    got: u32,
+    /// A read or write-back failure, reported by the next `acquire`.
+    err: Option<io::Error>,
+    /// Set when the `Jobserver` is dropped.
+    shutdown: bool,
+}
+
+impl Drain {
+    /// Open a blocking read handle on the fifo at `path` and start the
+    /// drainer thread on it.
+    fn start(path: &Path) -> io::Result<Arc<Self>> {
+        // Opened non-blocking so the open never waits for a writer, then
+        // switched to blocking reads.
+        let fd = open_nonblocking(path, false)?;
+        // SAFETY: fd is open; F_GETFL/F_SETFL only read and set its status flags.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0
+            || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let drain = Arc::new(Self {
+            state: Mutex::new(DrainState::default()),
+            changed: Condvar::new(),
+        });
+        let shared = Arc::clone(&drain);
+        let path = path.to_path_buf();
+        thread::Builder::new()
+            .name("jobserver-drain".into())
+            .spawn(move || shared.run(fd, &path))?;
+        Ok(drain)
+    }
+
+    fn lock(&self) -> MutexGuard<'_, DrainState> {
+        self.state.lock().expect("jobserver drain state poisoned")
+    }
+
+    /// Wait until the drainer delivers `n` more tokens or `end` passes; adds
+    /// what it delivered to `got`.
+    fn collect(&self, n: u32, end: Instant, got: &mut u32) -> io::Result<()> {
+        let mut st = self.lock();
+        if let Some(err) = st.err.take() {
+            return Err(err);
+        }
+        st.want = n;
+        st.got = 0;
+        self.changed.notify_all();
+        loop {
+            let now = Instant::now();
+            if st.want == 0 || st.err.is_some() || now >= end {
+                break;
+            }
+            st = self
+                .changed
+                .wait_timeout(st, end - now)
+                .expect("jobserver drain state poisoned")
+                .0;
+        }
+        // From here a token the drainer reads is surplus and goes back.
+        st.want = 0;
+        *got += std::mem::take(&mut st.got);
+        match st.err.take() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// The drainer thread: while an `acquire` waits, block in `read` for its
+    /// tokens. Exits on shutdown once its read returns; the read returns EOF
+    /// when the last write end closes.
+    fn run(&self, mut fd: File, path: &Path) {
+        let mut buf = Vec::new();
+        loop {
+            let ask = {
+                let mut st = self.lock();
+                while st.want == 0 && !st.shutdown {
+                    st = self
+                        .changed
+                        .wait(st)
+                        .expect("jobserver drain state poisoned");
+                }
+                if st.shutdown {
+                    return;
+                }
+                st.want
+            };
+            buf.resize(ask as usize, 0);
+            let read = fd.read(&mut buf);
+            let mut st = self.lock();
+            if st.shutdown {
+                // A `left` fifo still serves builds, so its token goes back; an
+                // unlinked one has no pool to return to.
+                if let Ok(k @ 1..) = read {
+                    match write_back(path, k as u32) {
+                        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                            eprintln!("warning: jobserver drainer could not return {k} tokens: {e}")
+                        }
+                        _ => {}
+                    }
+                }
+                return;
+            }
+            let surplus = match read {
+                Ok(0) => {
+                    st.err = Some(eof());
+                    0
+                }
+                Ok(k) => {
+                    let k = k as u32;
+                    let take = k.min(st.want);
+                    st.got += take;
+                    st.want -= take;
+                    k - take
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    st.err = Some(e);
+                    0
+                }
+            };
+            if surplus > 0 {
+                if let Err(e) = write_back(path, surplus) {
+                    st.err = Some(io::Error::new(
+                        e.kind(),
+                        format!("the drainer could not return {surplus} late tokens: {e}"),
+                    ));
+                }
+            }
+            if st.err.is_some() {
+                // An error stops the drainer until the next request.
+                st.want = 0;
+            }
+            drop(st);
+            self.changed.notify_all();
+        }
+    }
+}
+
+/// Return `n` tokens through a write handle of their own: the drainer keeps no
+/// write end, so its read sees EOF once the `Jobserver` and every build close
+/// theirs.
+fn write_back(path: &Path, n: u32) -> io::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?
+        .write_all(&vec![b'+'; n as usize])
+}
+
 fn unlink(path: &Path) -> io::Result<()> {
     fs::remove_file(path)
         .map_err(|e| io::Error::new(e.kind(), format!("unlink {}: {e}", path.display())))
@@ -196,6 +360,8 @@ fn unlink(path: &Path) -> io::Result<()> {
 
 impl Drop for Jobserver {
     fn drop(&mut self) {
+        self.drain.lock().shutdown = true;
+        self.drain.changed.notify_all();
         if self.left {
             return;
         }
