@@ -396,10 +396,10 @@ async fn a_restarted_daemon_resends_sigterm_for_a_teardown_it_booked_but_never_s
     let Some(pueued) = PueuedFixture::try_start() else {
         return;
     };
-    // Patient kill: the Kill deadline starts at Leases::new() time, before
-    // resume_teardowns() sends SIGTERM. On a loaded machine, daemon startup
-    // can consume most of the default 1-second grace; a 30-second window
-    // keeps that from racing SIGKILL against the task's handler.
+    // The test asserts the order, SIGTERM before SIGKILL, not the grace's
+    // length: on a loaded runner the trap's `touch` can outlast the default
+    // second. A daemon that never re-sends SIGTERM still fails, because the
+    // task's `sleep 5` ends unsignalled and leaves no note.
     let mut daemon = pool_of_four_patient_kill(&pueued.config_path);
     let marker = daemon.state_dir().join("got-term");
     let armed = daemon.state_dir().join("trap-armed");
