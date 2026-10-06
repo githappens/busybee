@@ -8,8 +8,6 @@ on:
     types: [completed]
   issue_comment:
     types: [created, edited, deleted]
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       pr:
@@ -19,8 +17,16 @@ on:
 permissions:
   contents: read
 
+# A newer run replaces a pending one in its group, and a run reviews only the
+# PRs its event concerns, so the queue is per PR: an event for one PR cannot
+# drop another's review. Comments from outside the repo, which select nothing,
+# queue apart so they cannot replace a trusted run either.
 concurrency:
-  group: agent-review-gate
+  group: >-
+    agent-review-gate-${{ github.event.issue.number || github.event.workflow_run.pull_requests[0].number
+    || inputs.pr || github.event.workflow_run.head_sha || 'all' }}${{ github.event_name == 'issue_comment'
+    && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    && '-outside' || '' }}
   cancel-in-progress: false
 
 jobs:
