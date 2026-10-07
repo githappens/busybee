@@ -42,14 +42,18 @@ jobs:
           sysctl -n hw.ncpu hw.perflevel0.logicalcpu hw.perflevel1.logicalcpu 2>/dev/null || true
           cargo build --workspace --bins
           cargo test -p bzb --test e2e_pool --no-run
-      - name: Loop
+      - name: Loop the whole e2e_pool binary
         run: |
           bin=$(ls build/debug/deps/e2e_pool-* | grep -v '\.d$' | head -1)
-          for variant in base qos base qos base qos; do
-            for i in $(seq 1 10); do
-              if [ "$variant" = qos ]; then export DIAG_QOS=1; else unset DIAG_QOS; fi
-              if "$bin" a_static_task_beside_two_builds_gets_a_third_of_the_pool --exact --nocapture > run.log 2>&1; then r=pass; else r=FAIL; fi
-              echo "$variant $i $r $(grep -h 'DIAG drain lease=3' run.log | sed -E 's/.*drained=Ok\(([0-9])\).*elapsed_ms=([0-9]+).*/got=\1 ms=\2/')"
-            done
-          done | tee results.txt
-          for v in base qos; do echo "$v: $(grep -c "^$v .* pass" results.txt) pass / $(grep -c "^$v " results.txt)"; done
+          for i in $(seq 1 10); do
+            if "$bin" --nocapture > run.log 2>&1; then r=pass; else r=FAIL; fi
+            echo "binary $i $r $(grep -h 'DIAG drain lease=3' run.log | grep 'drain_target=2' | sed -E 's/.*drained=Ok\(([0-9])\).*elapsed_ms=([0-9]+).*/got=\1 ms=\2/' | tr '\n' ' ')"
+            grep -E 'panicked|left:' run.log | head -4
+          done
+      - name: Full workspace test runs
+        run: |
+          for i in 1 2 3; do
+            if cargo test --workspace -- --nocapture > ws.log 2>&1; then r=pass; else r=FAIL; fi
+            echo "workspace $i $r three-way drain: $(grep -h 'DIAG drain lease=3' ws.log | grep 'drain_target=2' | sed -E 's/.*drained=Ok\(([0-9])\).*elapsed_ms=([0-9]+).*/got=\1 ms=\2/' | tr '\n' ' ')"
+            grep -E 'panicked at|^test .* FAILED' ws.log | head -6
+          done
