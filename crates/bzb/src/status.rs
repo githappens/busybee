@@ -146,11 +146,19 @@ pub(crate) fn printable(text: &str) -> String {
 pub(crate) fn cores(lease: &LeaseView) -> String {
     match lease.ahead {
         Some(ahead) => format!("{ahead} ahead"),
-        // A jobserver count is the daemon's estimate.
-        None if lease.class == "jobserver" => format!("using ~{}", lease.cores),
         // A `none` lease owns the machine but drains no tokens.
         None if lease.class == "none" => "exclusive".to_string(),
-        None => format!("holding {}", lease.cores),
+        // Without per-process attribution a jobserver lease has no count of
+        // its own (spec §Observability).
+        None if lease.class == "jobserver" => match lease.cores {
+            Some(n) => format!("using ~{n}"),
+            None => "sharing".to_string(),
+        },
+        // A held count is never missing; if bzbd omits it, say so, not 0.
+        None => match lease.cores {
+            Some(n) => format!("holding {n}"),
+            None => "holding ?".to_string(),
+        },
     }
 }
 
@@ -173,7 +181,7 @@ mod tests {
                 label: "ui build".into(),
                 tool: "xcodebuild".into(),
                 class: "static".into(),
-                cores: 9,
+                cores: Some(9),
                 state: "running".into(),
                 elapsed_ms: 132_000,
                 ahead: None,
@@ -218,12 +226,40 @@ mod tests {
         reply.free = 18;
         reply.held = 0;
         reply.leases[0].class = "none".into();
-        reply.leases[0].cores = 0;
+        reply.leases[0].cores = Some(0);
 
         let rendered = render(&reply);
 
         assert!(rendered.contains("exclusive"), "rendered {rendered:?}");
         assert!(!rendered.contains("holding"), "rendered {rendered:?}");
+    }
+
+    #[test]
+    fn a_running_jobserver_lease_without_attribution_shows_sharing() {
+        let mut lease = reply().leases.remove(0);
+        lease.class = "jobserver".into();
+        lease.cores = None;
+        assert_eq!(cores(&lease), "sharing");
+    }
+
+    #[test]
+    fn a_jobserver_lease_with_attributed_cores_shows_using_n() {
+        let mut lease = reply().leases.remove(0);
+        lease.class = "jobserver".into();
+        lease.cores = Some(5);
+        assert_eq!(cores(&lease), "using ~5");
+    }
+
+    #[test]
+    fn a_running_static_lease_shows_holding_n() {
+        assert_eq!(cores(&reply().leases[0]), "holding 9");
+    }
+
+    #[test]
+    fn a_static_lease_without_a_count_is_not_reported_as_holding_zero() {
+        let mut lease = reply().leases.remove(0);
+        lease.cores = None;
+        assert_eq!(cores(&lease), "holding ?");
     }
 
     #[test]

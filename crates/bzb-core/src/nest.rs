@@ -32,7 +32,7 @@ mod tests {
             label: String::new(),
             tool: "true".into(),
             class: "none".into(),
-            cores: 0,
+            cores: Some(0),
             state: state.into(),
             elapsed_ms: 0,
             ahead: None,

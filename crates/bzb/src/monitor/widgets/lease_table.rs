@@ -116,7 +116,8 @@ mod tests {
             label: format!("lease {id}"),
             tool: "cargo".into(),
             class: class.into(),
-            cores: 9,
+            // Static leases hold a fixed count; jobserver leases carry None.
+            cores: (class != "jobserver").then_some(9),
             state: state.into(),
             elapsed_ms: 132_000,
             ahead: (state == "queued").then_some(2),
@@ -147,7 +148,7 @@ mod tests {
 
         assert!(lines[0].contains("#2"), "rows were {lines:?}");
         assert!(lines[0].contains("make"), "rows were {lines:?}");
-        assert!(lines[0].contains("using ~9"), "rows were {lines:?}");
+        assert!(lines[0].contains("sharing"), "rows were {lines:?}");
         assert!(lines[1].contains("#1"), "rows were {lines:?}");
         assert!(lines[1].contains("xcodebuild"), "rows were {lines:?}");
         assert!(lines[1].contains("holding 9"), "rows were {lines:?}");
@@ -257,7 +258,7 @@ mod tests {
     #[test]
     fn a_token_count_wider_than_the_column_widens_it() {
         let mut leases = vec![lease(1, "running", "static")];
-        leases[0].cores = 4096;
+        leases[0].cores = Some(4096);
 
         let lines = draw(&leases, 90, 1);
 

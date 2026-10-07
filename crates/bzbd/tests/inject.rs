@@ -228,7 +228,7 @@ async fn a_static_lease_holds_its_cores_for_its_lifetime() {
     let running = status(&daemon).await;
     assert_eq!(running.held, 3, "status was {running:?}");
     assert_eq!(running.free, 1, "status was {running:?}");
-    assert_eq!(running.leases[0].cores, 3, "status was {running:?}");
+    assert_eq!(running.leases[0].cores, Some(3), "status was {running:?}");
 
     assert_eq!(finished(&mut conn).await, 0);
     assert_eq!(

@@ -32,7 +32,7 @@ fn reply() -> StatusReply {
                 label: "ui build".into(),
                 tool: "xcodebuild".into(),
                 class: "static".into(),
-                cores: 9,
+                cores: Some(9),
                 state: "running".into(),
                 elapsed_ms: 132_000,
                 ahead: None,
@@ -43,7 +43,8 @@ fn reply() -> StatusReply {
                 label: "cmake --build build --target Tests".into(),
                 tool: "cmake".into(),
                 class: "jobserver".into(),
-                cores: 3,
+                // No per-process attribution yet; cores is absent/null.
+                cores: None,
                 state: "running".into(),
                 elapsed_ms: 40_000,
                 ahead: None,
@@ -54,7 +55,7 @@ fn reply() -> StatusReply {
                 label: "backend tests".into(),
                 tool: "cargo".into(),
                 class: "jobserver".into(),
-                cores: 0,
+                cores: None,
                 state: "queued".into(),
                 elapsed_ms: 5_000,
                 ahead: Some(1),
@@ -206,7 +207,7 @@ async fn the_table_has_the_pool_line_and_one_row_per_lease() {
         vec![
             "pool: 18 tokens, 6 free, 9 held by static leases   (approx. 3 in use by jobserver tasks)",
             "#41  running  2m12s  xcodebuild   static     holding 9     label: ui build",
-            "#42  running  0m40s  cmake        jobserver  using ~3      label: cmake --build build --target Tests",
+            "#42  running  0m40s  cmake        jobserver  sharing       label: cmake --build build --target Tests",
             "#43  queued   0m05s  cargo        jobserver  1 ahead       label: backend tests",
         ]
     );

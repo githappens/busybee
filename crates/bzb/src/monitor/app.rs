@@ -337,7 +337,7 @@ mod tests {
                 label: format!("lease {id}"),
                 tool: "cargo".into(),
                 class: "static".into(),
-                cores: 1,
+                cores: Some(1),
                 state: "queued".into(),
                 elapsed_ms: 1_000,
                 ahead: Some(id as usize),
