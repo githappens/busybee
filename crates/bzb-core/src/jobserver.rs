@@ -138,6 +138,16 @@ impl Jobserver {
     /// Body of [`acquire`](Self::acquire); `got` counts tokens read so far
     /// so the caller can return them when this fails.
     fn read_tokens(&self, n: u32, deadline: Duration, got: &mut u32) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
+        let _diag_qos = {
+            let mut cls = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+            let mut rel: libc::c_int = 0;
+            unsafe { libc::pthread_get_qos_class_np(libc::pthread_self(), &mut cls, &mut rel) };
+            if std::env::var_os("DIAG_QOS").is_some() {
+                unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0) };
+            }
+            DiagRestore(cls, rel)
+        };
         let end = Instant::now() + deadline;
         let mut buf = vec![0u8; n as usize];
         while *got < n {
@@ -197,6 +207,17 @@ impl Drop for Jobserver {
         }
         if let Err(e) = unlink(&self.path) {
             eprintln!("warning: jobserver fifo left behind: {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct DiagRestore(libc::qos_class_t, libc::c_int);
+#[cfg(target_os = "macos")]
+impl Drop for DiagRestore {
+    fn drop(&mut self) {
+        if std::env::var_os("DIAG_QOS").is_some() {
+            unsafe { libc::pthread_set_qos_class_self_np(self.0, self.1) };
         }
     }
 }

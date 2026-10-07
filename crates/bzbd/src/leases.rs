@@ -614,9 +614,12 @@ impl Leases {
         // tokens, old pool and all; collect the debt before anything reads them.
         self.collect_debt();
 
+        let diag_free = self.jobserver.free().ok();
+        let diag_t0 = std::time::Instant::now();
         let drained = tokio::task::block_in_place(|| {
             self.jobserver.acquire(drain_target, self.drain_deadline)
         });
+        tracing::info!(lease = id.0, drain_target, ?drained, ?diag_free, elapsed_ms = diag_t0.elapsed().as_millis() as u64, "DIAG drain");
         let got = match drained {
             Ok(got) => got,
             Err(err) => {

@@ -275,6 +275,10 @@ fn a_static_task_beside_two_builds_gets_a_third_of_the_pool() {
         .expect("run the static task");
 
     assert!(out.status.success(), "stderr: {}", stderr(&out));
+    if true {
+        eprintln!("DIAG client stderr:\n{}", stderr(&out));
+        eprintln!("DIAG bzbd.log:\n{}", std::fs::read_to_string(busybee.state_dir().join("bzbd.log")).unwrap_or_default());
+    }
     assert_eq!(
         stdout(&out),
         format!("{GRANTED}\n"),
