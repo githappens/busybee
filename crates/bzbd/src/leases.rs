@@ -21,6 +21,20 @@ use bzb_core::{
     protocol::{LeaseEvent, LeaseRequest, LeaseView, StatusReply},
     scheduler::{Action, Event, LeaseId, Params, Request as LeaseSpec, Scheduler},
 };
+
+/// Returned by a background pueued submission task.
+struct SubmitResult {
+    lease: LeaseId,
+    /// Tokens drained at admission; returned if the lease was cancelled before
+    /// the result arrived and the task never reached pueued.
+    cores_held: u32,
+    /// `{cores}` value for the `Admitted` event.
+    share: u32,
+    /// The client is carried back so the actor can pre-warm its cached
+    /// connection, replicating the behaviour of the former inline submit path
+    /// (see `Pueue::give_client`).
+    result: Result<(usize, pueue_lib::Client), BusybeeError>,
+}
 use pueue_lib::{message::Signal, task::Task, task::TaskStatus};
 use tokio::sync::{mpsc, oneshot};
 
@@ -192,6 +206,10 @@ pub(crate) struct Leases {
     /// Tokens owed to a shrunk pool; that many releases are withheld.
     debt: u32,
     leases_path: PathBuf,
+    /// Results from background pueued submission tasks; received in `run`.
+    submit_rx: tokio::sync::mpsc::UnboundedReceiver<SubmitResult>,
+    /// Cloned into each spawned submission task.
+    submit_tx: tokio::sync::mpsc::UnboundedSender<SubmitResult>,
 }
 
 struct Kill {
@@ -230,6 +248,7 @@ impl Leases {
             debt,
         } = recovered;
         let (tx, rx) = mpsc::channel(64);
+        let (submit_tx, submit_rx) = tokio::sync::mpsc::unbounded_channel::<SubmitResult>();
         let params = config.params();
         let mut actor = Self {
             scheduler: Scheduler::new(params),
@@ -248,6 +267,8 @@ impl Leases {
             deferred: VecDeque::new(),
             debt,
             leases_path,
+            submit_rx,
+            submit_tx,
         };
         for record in killing {
             let Some(task_id) = record.pueue_task_id else {
@@ -316,6 +337,11 @@ impl Leases {
                 command = commands.recv() => match command {
                     Some(command) => self.command(command).await,
                     None => break,
+                },
+                result = self.submit_rx.recv() => {
+                    if let Some(result) = result {
+                        self.handle_submit_result(result).await;
+                    }
                 },
                 _ = ticker.tick() => {
                     self.poll().await;
@@ -655,7 +681,6 @@ impl Leases {
             // The group is at `parallel_tasks = 0`; bzbd decides what starts.
             start_immediately: true,
         };
-        let class = lease.plan.class;
 
         // On record before the submission: pueued starts the task on arrival,
         // and a successor must find the grant and the submission time.
@@ -669,38 +694,23 @@ impl Leases {
                 format!("bzbd could not record the lease before starting it: {err:#}"),
             );
         }
-        let task_id = match self.pueue.add(spec).await {
-            Ok(task_id) => task_id,
-            Err(err) => {
-                tracing::error!(lease = id.0, "cannot submit to pueued: {err:#}");
-                let actions =
-                    self.drain_failed(id, format!("bzbd could not start the task: {err}"));
-                self.hold_unanswered(id);
-                return actions;
-            }
-        };
 
-        self.leases
-            .get_mut(&id)
-            .expect("checked above")
-            .pueue_task_id = Some(task_id);
-        self.persist();
-
-        self.send(
-            id,
-            LeaseEvent::Admitted {
-                id: id.0,
-                pueue_task_id: task_id,
-                class: class.as_str().to_string(),
-                cores: share,
-                pool_size: self.params.pool_size,
-                peers: self.scheduler.snapshot().admitted.len().saturating_sub(1),
-            },
-        );
-        self.scheduler.handle(Event::Started {
-            id,
-            cores_held: got,
-        })
+        // Spawn the submission off the actor loop so the actor can continue
+        // answering `status` and other commands while pueued starts up.
+        // The result comes back on `submit_rx` and is handled by
+        // `handle_submit_result`.
+        let tx = self.submit_tx.clone();
+        tokio::spawn(async move {
+            let result = crate::submit::submit_to_pueued(spec).await;
+            let _ = tx.send(SubmitResult {
+                lease: id,
+                cores_held: got,
+                share,
+                result,
+            });
+        });
+        // Caller will drive further actions when the result arrives.
+        vec![]
     }
 
     /// Tells the scheduler and the client; the caller ends the lease, since
@@ -733,6 +743,90 @@ impl Leases {
         self.unreconciled.push(lease.record(id, true));
         self.persist();
         lease.tell_finished(id, 1);
+    }
+
+    /// Handles the result of a background pueued submission spawned in
+    /// [`admit`].  The lease may still be alive (normal path) or may have been
+    /// cancelled while the submission was in flight.
+    async fn handle_submit_result(&mut self, result: SubmitResult) {
+        let SubmitResult {
+            lease: id,
+            cores_held,
+            share,
+            result,
+        } = result;
+
+        match result {
+            Ok((task_id, pueued_client)) => {
+                // Pre-warm the cached connection so the next poll detects a
+                // dead pueued on the wire rather than by calling
+                // `connect_or_spawn` (which could respawn pueued and find the
+                // task in the new instance's history).
+                self.pueue.give_client(pueued_client);
+                if let Some(lease) = self.leases.get_mut(&id) {
+                    // Normal case: submission succeeded and the lease is alive.
+                    let class = lease.plan.class;
+                    lease.pueue_task_id = Some(task_id);
+                    self.persist();
+                    self.send(
+                        id,
+                        LeaseEvent::Admitted {
+                            id: id.0,
+                            pueue_task_id: task_id,
+                            class: class.as_str().to_string(),
+                            cores: share,
+                            pool_size: self.params.pool_size,
+                            peers: self.scheduler.snapshot().admitted.len().saturating_sub(1),
+                        },
+                    );
+                    let actions = self.scheduler.handle(Event::Started { id, cores_held });
+                    self.drive(actions).await;
+                } else {
+                    // The lease was cancelled while the submission was in
+                    // flight.  pueued started the task; stop it and return the
+                    // tokens when pueued confirms it gone.
+                    tracing::warn!(
+                        lease = id.0,
+                        task = task_id,
+                        "lease cancelled during submission; stopping the pueued task"
+                    );
+                    let record = Record {
+                        id: id.0,
+                        label: String::new(),
+                        argv: Vec::new(),
+                        class: Class::None,
+                        cores_held,
+                        pueue_task_id: Some(task_id),
+                        started_at_unix_ms: 0,
+                        submitted_at_unix_ms: None,
+                        fifo: None,
+                        killing: true,
+                    };
+                    self.kill_task(task_id, Some(record)).await;
+                }
+            }
+            Err(err) => {
+                if self.leases.contains_key(&id) {
+                    // Submission failed and the lease is still alive: same
+                    // behaviour as the former inline path.
+                    tracing::error!(lease = id.0, "cannot submit to pueued: {err:#}");
+                    let actions =
+                        self.drain_failed(id, format!("bzbd could not start the task: {err}"));
+                    self.hold_unanswered(id);
+                    self.drive(actions).await;
+                } else if cores_held > 0 {
+                    // The lease was cancelled AND submission failed: the task
+                    // never reached pueued, so the tokens go straight back.
+                    tracing::info!(
+                        lease = id.0,
+                        cores_held,
+                        "submission failed for a cancelled lease; releasing tokens"
+                    );
+                    self.release(cores_held);
+                    self.persist();
+                }
+            }
+        }
     }
 
     async fn drop_lease(&mut self, id: LeaseId) {

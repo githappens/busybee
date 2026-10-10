@@ -19,10 +19,13 @@ pub(crate) struct Pueue {
 }
 
 impl Pueue {
-    pub(crate) async fn add(&mut self, spec: TaskSpec) -> Result<usize, BusybeeError> {
-        let result = enqueue::enqueue(self.client().await?, spec).await;
-        self.forget_on_error(&result);
-        result
+    /// Pre-warms the cached connection with a client obtained by the
+    /// background submission task.  The next poll uses this connection
+    /// and detects a dead pueued by failure on the wire rather than by
+    /// calling `connect_or_spawn` (which could respawn pueued and find the
+    /// task in the new instance's history).
+    pub(crate) fn give_client(&mut self, client: Client) {
+        self.client = Some(client);
     }
 
     pub(crate) async fn status(&mut self) -> Result<State, BusybeeError> {
@@ -58,6 +61,16 @@ impl Pueue {
             self.client = None;
         }
     }
+}
+
+/// Connects to pueued (spawning it if needed) and submits a task.
+/// Returns both the pueue task id and the connected client so the actor can
+/// cache the connection in [`Pueue`] for subsequent polling.
+pub(crate) async fn submit_to_pueued(spec: TaskSpec) -> Result<(usize, Client), BusybeeError> {
+    let mut client = client::connect_or_spawn().await?;
+    group::ensure_busybee_group(&mut client).await?;
+    let task_id = enqueue::enqueue(&mut client, spec).await?;
+    Ok((task_id, client))
 }
 
 async fn status(client: &mut Client) -> Result<State, BusybeeError> {
