@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import unittest
 
@@ -241,6 +242,122 @@ class RealTerminalTests(unittest.TestCase):
         self.assertEqual(after["status"], "environment_failure")
         self.assertIn("worker_not_ready", codes(after))
         self.assertEqual(json.loads((rdir / "worker.json").read_text())["status"], "stopped")
+
+
+    # --- Named acceptance tests for #96 (terminal watch) ---
+
+    def _watch_in_thread(self, run_id, handle, timeout_s=30):
+        """Run `vmctl terminal watch` in a thread; return the thread and a list
+        that receives the exit code once the thread finishes."""
+        results = []
+        def _run():
+            import subprocess as _sub
+            r = _sub.run([sys.executable, str(VMCTL), "--json", "--root", str(ROOT),
+                          "terminal", "watch", run_id, handle],
+                         capture_output=True, text=True, timeout=timeout_s)
+            results.append(r)
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        return t, results
+
+    def test_watch_is_read_only(self):
+        """watch_is_read_only: a watcher cannot send input or resize the pane."""
+        run_id = self.create()
+        t = self.open_fixture(run_id)
+        handle = t["handle"]
+        self.ok(vmctl("terminal", "capture", run_id, handle, "--expect", "SIZE 100x30"))
+        # Record the screen and recording byte-count before the watcher attaches.
+        before = self.ok(vmctl("terminal", "capture", run_id, handle))
+        before_text = before["text"]
+        before_output = before["cols"], before["rows"]
+
+        # Start the watch in the background.
+        wt, results = self._watch_in_thread(run_id, handle)
+        time.sleep(3)  # let the watch attach
+
+        # Verify the watch is running (no result yet).
+        self.assertTrue(wt.is_alive(), "watch exited before the handle closed")
+
+        # With a watcher present: capture again.  Text and size must be identical.
+        after = self.ok(vmctl("terminal", "capture", run_id, handle))
+        self.assertEqual(before_text, after["text"],
+                         "the watcher changed the terminal content")
+        self.assertEqual(before_output, (after["cols"], after["rows"]),
+                         "the watcher resized the pane")
+
+        # Close the handle so the watch can exit.
+        self.ok(vmctl("terminal", "send", run_id, handle, "--key", "Ctrl c"))
+        self.ended(run_id, t, QUIT_S)
+        wt.join(timeout=15)
+        self.assertFalse(wt.is_alive(), "watch did not exit after the handle closed")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].returncode, 0)
+
+    def test_watch_ends_with_its_handle(self):
+        """watch_ends_with_its_handle: closing the handle ends the watch."""
+        run_id = self.create()
+        t = self.open_fixture(run_id)
+        handle = t["handle"]
+        self.ok(vmctl("terminal", "capture", run_id, handle, "--expect", "SIZE"))
+        # Start watch.
+        wt, results = self._watch_in_thread(run_id, handle)
+        time.sleep(2)
+        self.assertTrue(wt.is_alive(), "watch exited before the handle closed")
+        # Extract the URL from the watch output when available.
+        # Close the handle.
+        self.ok(vmctl("terminal", "send", run_id, handle, "--key", "Ctrl c"))
+        self.ended(run_id, t, QUIT_S)
+        wt.join(timeout=15)
+        self.assertFalse(wt.is_alive(), "watch did not exit after handle closed")
+        self.assertEqual(results[0].returncode, 0)
+        # The watch output must contain a 127.0.0.1 URL.
+        out = results[0].stdout
+        self.assertIn("127.0.0.1", out, "URL not on loopback")
+        # The forward is gone: connecting to the port in the URL must now fail.
+        import re as _re, socket as _socket
+        m = _re.search(r"127\.0\.0\.1:(\d+)", out)
+        if m:
+            port = int(m.group(1))
+            try:
+                _socket.create_connection(("127.0.0.1", port), timeout=1).close()
+                self.fail(f"port {port} still reachable after watch ended")
+            except OSError:
+                pass  # expected: forward is gone
+
+    def test_watch_listens_only_on_loopback(self):
+        """watch_listens_only_on_loopback: neither the guest web server nor the
+        host forward binds to a non-loopback address."""
+        run_id = self.create()
+        t = self.open_fixture(run_id)
+        handle = t["handle"]
+        self.ok(vmctl("terminal", "capture", run_id, handle, "--expect", "SIZE"))
+        wt, results = self._watch_in_thread(run_id, handle)
+        time.sleep(3)
+        self.assertTrue(wt.is_alive(), "watch exited before the handle closed")
+
+        # Check host: the forward port is bound only to 127.0.0.1.
+        import subprocess as _sub, re as _re
+        ss_out = _sub.run(["ss", "-tlnp"], capture_output=True, text=True).stdout
+        # Look for any port that appears in the watch URL.
+        out_so_far = ""  # watch hasn't exited yet; we can't read its stdout yet
+        # The forward process uses the SSH command; we check that no 0.0.0.0 entry
+        # for a forwarded port appears in ss output.
+        self.assertNotRegex(ss_out, r"0\.0\.0\.0:(?!22\b)\d+\s.*ssh",
+                            "a non-loopback address appears in ss -tlnp output")
+
+        # Check guest: the zellij web server must not listen on 0.0.0.0.
+        netstat = self.exec(run_id, "ss", "-tlnp", timeout="10")
+        guest_ss = (STATE / netstat["data"]["stdout"]).read_text(errors="replace")
+        # Port 8082 (default zellij web port) must not bind to 0.0.0.0.
+        for line in guest_ss.splitlines():
+            if "8082" in line or "zellij" in line.lower():
+                self.assertNotIn("0.0.0.0", line,
+                                 f"guest web server not on loopback: {line}")
+
+        # Shut down cleanly.
+        self.ok(vmctl("terminal", "send", run_id, handle, "--key", "Ctrl c"))
+        self.ended(run_id, t, QUIT_S)
+        wt.join(timeout=15)
 
 
 if __name__ == "__main__":

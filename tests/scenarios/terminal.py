@@ -86,6 +86,20 @@ mouse_mode false
 web_server false
 """
 
+# Token format: token_N: <UUID>[ (read-only)]
+_TOKEN_RE = re.compile(r"^(token_\d+):\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+                       re.IGNORECASE)
+
+
+def _parse_web_token(output):
+    """Parse (name, value) from `zellij web --create-*-token` output.
+    Format: 'token_N: <UUID>[ (read-only)]'  Returns (None, None) on failure."""
+    for line in output.splitlines():
+        m = _TOKEN_RE.match(line.strip())
+        if m:
+            return m.group(1), m.group(2)
+    return None, None
+
 
 class TerminalError(Exception):
     """The terminal could not be provided as asked: never a product result."""
@@ -392,6 +406,49 @@ class Terminal:
 
     # Input and size
 
+    def _zellij_web(self, *args, timeout=ACTION_S, check=True):
+        """Run a `zellij web` subcommand in this terminal's environment."""
+        argv = [*self.user, "zellij", "web", *args]
+        try:
+            done = self.run(argv, env=self._zellij_env(), capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as err:
+            raise TerminalError("zellij_unresponsive",
+                                f"zellij web {args[0] if args else ''!r} took over {timeout}s") from err
+        if check and done.returncode != 0:
+            raise TerminalError("zellij_failed", f"zellij web {' '.join(args[:2])} exited {done.returncode}: "
+                                f"{done.stderr.strip()[-500:]}")
+        return done
+
+    def watch_start(self, preferred_port):
+        """Start the zellij web server on loopback and create a read-only token.
+        Returns (port, token_value, token_name). The server listens on 127.0.0.1
+        only; if one is already running its port is reused."""
+        # Check whether the web server is already running (short timeout: best-effort).
+        status_done = self._zellij_web("--status", "--timeout", "2", check=False)
+        existing_port = None
+        if "running" in status_done.stdout.lower():
+            m = re.search(r":(\d+)", status_done.stdout)
+            if m:
+                existing_port = int(m.group(1))
+        if existing_port is None:
+            # Start on preferred_port; loopback binding is the default but made explicit.
+            self._zellij_web("--start", "--ip", "127.0.0.1", "--port", str(preferred_port), "-d")
+            port = preferred_port
+        else:
+            port = existing_port
+        # Create a read-only token.  --token-name is mutually exclusive with
+        # --create-read-only-token in zellij 0.45, so auto-naming is used.
+        token_done = self._zellij_web("--create-read-only-token")
+        token_name, token_value = _parse_web_token(token_done.stdout)
+        if not token_value:
+            raise TerminalError("token_parse_failed",
+                                f"could not parse token from: {token_done.stdout[:200]!r}")
+        return port, token_value, token_name
+
+    def watch_stop(self, token_name):
+        """Revoke a watch token; best-effort so a gone guest does not raise."""
+        self._zellij_web("--revoke-token", token_name, check=False)
+
     def send_bytes(self, data):
         self._zellij("action", "write", "-p", self._pane_id(), *(str(b) for b in data))
 
@@ -549,6 +606,27 @@ def _hold(args):
     return 2 if closed["remaining"] or lost else 0
 
 
+def _watch_start(args):
+    """Start the zellij web server and mint a read-only token for this handle."""
+    t = Terminal.attach(args.dir)
+    # Ask the OS for a free loopback port in the guest.
+    import socket as _socket
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 0))
+    preferred_port = s.getsockname()[1]
+    s.close()
+    port, token, token_name = t.watch_start(preferred_port)
+    return {"port": port, "token": token, "token_name": token_name}
+
+
+def _watch_stop(args):
+    """Revoke the watch token; run on cleanup regardless of terminal state."""
+    t = Terminal.attach(args.dir)
+    t.watch_stop(args.token_name)
+    return {"revoked": args.token_name}
+
+
 def _op(args):
     t = Terminal.attach(args.dir)
     if args.command == "send":
@@ -590,7 +668,10 @@ def main(argv=None):
     capture = sub.add_parser("capture")
     capture.add_argument("--expect")
     capture.add_argument("--timeout", type=float, default=ACTION_S)
-    for p in (hold, send, resize, capture):
+    watch_start = sub.add_parser("watch_start")
+    watch_stop = sub.add_parser("watch_stop")
+    watch_stop.add_argument("--token-name", required=True)
+    for p in (hold, send, resize, capture, watch_start, watch_stop):
         p.add_argument("--dir", required=True)
     argv = sys.argv[1:] if argv is None else argv
     split = argv.index("--") if "--" in argv else len(argv)
@@ -601,6 +682,12 @@ def main(argv=None):
             parser.error("hold needs the command after --")
         return _hold(args)
     try:
+        if args.command == "watch_start":
+            print(json.dumps(_watch_start(args)))
+            return 0
+        if args.command == "watch_stop":
+            print(json.dumps(_watch_stop(args)))
+            return 0
         print(json.dumps(_op(args)))
         return 0
     except TerminalError as err:

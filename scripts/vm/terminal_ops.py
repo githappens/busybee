@@ -21,6 +21,8 @@ import re
 import secrets
 import shlex
 import shutil
+import socket
+import sys
 
 import contracts
 import scenario
@@ -235,3 +237,134 @@ def _final_capture(workers, hdir):
                "cols": size["cols"], "rows": size["rows"], "screen": None, "ansi": None, "pane": None}
     (hdir / "captures" / f"{name}.json").write_text(json.dumps(capture, indent=2) + "\n")
     return capture
+
+
+# How long to wait for the SSH local forward to accept a connection.
+FORWARD_READY_S = 10
+# Seconds between forward-ready polls.
+FORWARD_POLL_S = 0.2
+
+
+def _free_host_port():
+    """A free loopback port on the host, released just before being returned."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def watch(workers, run_id, handle, json_output=False):
+    """Start a read-only live view of an open terminal handle.
+
+    Starts the zellij web server in the guest (127.0.0.1 only), creates a
+    read-only token, and opens an SSH local forward from the host's loopback to
+    the guest's web server.  Prints the access URL, then blocks until the
+    handle's exec ends, the worker is no longer ready, or the run deadline
+    passes.  Revokes the token and kills the forward on exit.
+
+    Returns a contracts result on setup failure, or None (already printed) on a
+    normal watch cycle that ended cleanly or was interrupted.
+    """
+    op = "terminal watch"
+    hdir = _handle_dir(workers, run_id, handle)
+    meta = json.loads((hdir / "handle.json").read_text())
+    if "python" not in meta:
+        raise worker.Refused("terminal_not_ready", f"terminal {handle} never became ready")
+    record = _ready(workers, run_id)
+    workers._window()
+    g = workers._guest(record)
+
+    # Step 1: Start web server in guest and create a read-only token.
+    start_cmd = shlex.join([meta["python"], f"{meta['stage']}/terminal.py",
+                            "watch_start", "--dir", meta["guest_dir"]])
+    status, out, err = g.run(start_cmd, workers._bound("command"), check=False)
+    try:
+        reply = json.loads(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        reply = {"error": "terminal_unavailable",
+                 "message": f"terminal.py watch_start exited {status}: {err.strip()[-500:]}"}
+    if "error" in reply:
+        return _failed(op, handle, reply)
+
+    guest_port = reply["port"]
+    token = reply["token"]
+    token_name = reply["token_name"]
+
+    # Step 2: Open an SSH local forward on the host's loopback.
+    host_port = _free_host_port()
+    fwd = g.local_forward(host_port, guest_port)
+
+    # Wait for the forward to accept connections.
+    deadline = workers.clock() + FORWARD_READY_S
+    while workers.clock() < deadline:
+        if fwd.poll() is not None:
+            err_tail = fwd.stderr.read().decode(errors="replace")[-500:]
+            return contracts.result(op, "environment_failure",
+                                    f"SSH forward for terminal {handle} failed",
+                                    [contracts.finding("forward_failed", err_tail)],
+                                    {"handle": handle})
+        try:
+            socket.create_connection(("127.0.0.1", host_port), timeout=1).close()
+            break
+        except OSError:
+            workers.sleep(FORWARD_POLL_S)
+    else:
+        fwd.kill()
+        fwd.wait()
+        return contracts.result(op, "timeout",
+                                f"SSH forward for terminal {handle} did not come up in {FORWARD_READY_S}s",
+                                [contracts.finding("forward_timeout",
+                                                   "the local forward was not ready in time")],
+                                {"handle": handle})
+
+    # Step 3: Print the access URL immediately.
+    url = f"http://127.0.0.1:{host_port}/?token={token}&session={meta['session']}"
+    result = contracts.result(op, "success",
+                              f"terminal {handle}: watching at http://127.0.0.1:{host_port}/",
+                              data={"url": url, "host_port": host_port, "guest_port": guest_port,
+                                    "token_name": token_name, "session": meta["session"],
+                                    "handle": handle, "run_id": run_id})
+    print(json.dumps(result, indent=2) if json_output else
+          f"{result['operation']}: {result['status']} ({result['summary']})\n  url: {url}")
+    sys.stdout.flush()
+
+    # Step 4: Block until the handle, worker or deadline ends.
+    run_dl = worker.run_deadline(record)
+    ended_by = "unknown"
+    try:
+        while True:
+            if workers.clock() >= run_dl:
+                ended_by = "run_deadline"
+                break
+            try:
+                _, record_now = workers._owned(run_id)
+                if record_now["status"] != "ready":
+                    ended_by = "worker_not_ready"
+                    break
+            except worker.Refused:
+                ended_by = "worker_gone"
+                break
+            if workers._handle(run_id, meta["exec"])["state"] == "finished":
+                ended_by = "handle_closed"
+                break
+            if fwd.poll() is not None:
+                ended_by = "forward_died"
+                break
+            workers.sleep(worker.POLL_S)
+    except KeyboardInterrupt:
+        ended_by = "cancelled"
+
+    # Step 5: Clean up — revoke the token and kill the forward.
+    fwd.kill()
+    fwd.wait()
+    try:
+        stop_cmd = shlex.join([meta["python"], f"{meta['stage']}/terminal.py",
+                               "watch_stop", "--dir", meta["guest_dir"],
+                               "--token-name", token_name])
+        g.run(stop_cmd, workers._bound("command"), check=False)
+    except Exception:  # best-effort; guest may be gone
+        pass
+
+    return None  # output was already printed; caller should exit 0

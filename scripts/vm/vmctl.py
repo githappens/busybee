@@ -335,6 +335,8 @@ def worker_operation(repo, args, host, operation):
             return terminal_ops.resize(workers, args.run_id, args.handle, args.cols, args.rows)
         if operation == "terminal capture":
             return terminal_ops.capture(workers, args.run_id, args.handle, args.expect, args.timeout)
+        if operation == "terminal watch":
+            return terminal_ops.watch(workers, args.run_id, args.handle, args.json)
         method = {"worker reset": workers.reset, "worker destroy": workers.destroy, "inspect": workers.inspect,
                   "collect": workers.collect, "console capture": workers.console_capture,
                   "export": workers.export}[operation]
@@ -514,6 +516,8 @@ def parser():
                                help="settled screen text, cells and image, and the recording so far")
     tcapture.add_argument("--expect", help="wait until the screen shows this text first")
     tcapture.add_argument("--timeout", type=int, default=10, help="seconds to wait and settle")
+    term.add_parser("watch", parents=[terminal_handle],
+                    help="read-only live view: print the URL and block until the handle closes")
     return root
 
 
@@ -533,7 +537,7 @@ def main(argv=None):
     else:
         operation = " ".join(filter(None, (args.operation, getattr(args, "action", None))))
         outcome = worker_operation(args.root, args, Host(), operation)
-        if outcome is None:  # the supervisor, which reports through the run's events
+        if outcome is None:  # supervise and terminal watch manage their own output
             return EXIT_OK
         if operation == "session agent":
             # stdout carries the agent's own protocol; the turn's status is the exit code.

@@ -213,6 +213,7 @@ CLI usable by different agent runners.
 | `worker create` | Clone an explicit baseline, allocate a run ID, and return the worker identity and deadline, waiting in line while the configured number of Linux workers is active. For macOS, wait for and lease the single guest instead of cloning (§macOS workers). |
 | `exec` | Run argv in the guest with a working directory, environment, deadline, separate stdout/stderr, and exit status. |
 | `terminal open`, `send`, `resize`, `capture` | Operate a real PTY; expose input, dimensions, screen cells, images, and a timestamped terminal recording. |
+| `terminal watch` | Read-only live view: start the zellij web server in the guest (loopback only), mint a read-only token, and open an SSH local forward from the host's loopback to the guest's web server. Prints the access URL, then blocks until the handle closes, the worker is destroyed, or the run deadline passes; revokes the token and kills the forward on exit. |
 | `inspect`, `signal` | Read process and daemon state and signal processes belonging to the worker. |
 | `console capture` | Capture the VM display through Parallels, including when command access is unavailable. |
 | `collect` | Export source changes and evidence, then acknowledge which artifacts were saved durably. |
@@ -745,7 +746,14 @@ deadlines bound the terminal like any command, and returns a handle. `terminal
 send RUN H (--text T | --key K... | --bytes HEX)`, `terminal resize RUN H
 --cols C --rows R` and `terminal capture RUN H [--expect TEXT] [--timeout S]`
 act on it; capturing a terminal whose program has exited replays the whole
-recording. The terminal ends with its program, at its timeout, or when the
+recording. `terminal watch RUN H` starts a read-only live view: the zellij web
+server is started in the guest on 127.0.0.1 only, a read-only token is minted,
+and an SSH local forward from the host's 127.0.0.1 to the guest's web server is
+opened by the controller process. The command prints the access URL and blocks
+until the handle closes, the worker is destroyed, or the run deadline passes;
+it then revokes the token and kills the forward. The token is read-only and
+never gives the watcher the ability to send input or resize the pane. The
+terminal ends with its program, at its timeout, or when the
 agent sends the holder pid that `open` reports a `signal`. Artifacts go to
 `runs/<run>/terminal/<handle>/`: the controller's `handle.json`, the guest's
 `state.json`, `recording/{output,input,timing}` and per capture `NNNN.json`
